@@ -327,6 +327,25 @@ describe("session-start hook", () => {
       assert.equal(noEofResult.code, 0);
       const parsed = JSON.parse(noEofResult.stdout);
       assert.match(parsed?.injectSteps?.[0]?.systemMessage?.systemMessage ?? "", /agy-fast startup snapshot/);
+
+      // Verify SessionStart git snapshot does NOT execute untrusted .git/config core.fsmonitor
+      const untrustedGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hook-fsmon-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: untrustedGitDir });
+        execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: untrustedGitDir });
+        execFileSync("git", ["config", "user.name", "Test"], { cwd: untrustedGitDir });
+        await fs.writeFile(path.join(untrustedGitDir, "a.txt"), "1\n", "utf8");
+        execFileSync("git", ["add", "."], { cwd: untrustedGitDir });
+        execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: untrustedGitDir });
+        const markerFs = path.join(untrustedGitDir, "pwn_hook_fs");
+        const touchCmd = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(markerFs)},'1')`)}`;
+        execFileSync("git", ["config", "core.fsmonitor", touchCmd], { cwd: untrustedGitDir });
+        const snapRes = await runHook(JSON.stringify({ cwd: untrustedGitDir }));
+        assert.equal(snapRes.code, 0);
+        assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
+      } finally {
+        await fs.rm(untrustedGitDir, { recursive: true, force: true });
+      }
     } finally {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }

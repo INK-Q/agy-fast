@@ -234,7 +234,7 @@ ${serialized}`);
           buffer = buffer.subarray(offset);
           if (buffer.length === 0) break;
         }
-        const headerProbe = buffer.subarray(0, 16).toString("ascii").toLowerCase();
+        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
         if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
           const crlfEnd = buffer.indexOf("\r\n\r\n");
           const lfEnd = buffer.indexOf("\n\n");
@@ -248,13 +248,34 @@ ${serialized}`);
             sepLen = 2;
           }
           if (sepIdx === -1) break;
-          const headerText = buffer.subarray(0, sepIdx).toString("ascii");
-          const match = /content-length:\s*(\d+)/i.exec(headerText);
-          if (!match) {
+          const headerText = buffer.subarray(0, sepIdx).toString("latin1");
+          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
+          const maxFrameBytes = 64 * 1024 * 1024;
+          if (clMatches.length !== 1) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
+              },
+              true
+            );
             buffer = buffer.subarray(sepIdx + sepLen);
             continue;
           }
-          const contentLength = Number.parseInt(match[1], 10);
+          const contentLength = Number(clMatches[0][1]);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
+              },
+              true
+            );
+            buffer = Buffer.alloc(0);
+            break;
+          }
           const bodyStart = sepIdx + sepLen;
           if (buffer.length < bodyStart + contentLength) {
             break;
@@ -754,15 +775,17 @@ function normalizeTerminalOutput(raw) {
 }
 var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
   let bytes = 0;
   let endIndex = 0;
   for (let i = 0; i < text.length; ) {
     const cp = text.codePointAt(i);
     const unitLen = cp > 65535 ? 2 : 1;
     const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
-    if (bytes + chBytes > maxBytes) break;
+    if (bytes + chBytes > limit) break;
     bytes += chBytes;
     i += unitLen;
     endIndex = i;
@@ -770,19 +793,21 @@ function sliceUtf8Bytes(text, maxBytes) {
   return text.slice(0, endIndex);
 }
 function truncateWithByteNotice(text, maxBytes) {
-  if (maxBytes <= 0) return "";
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
-  if (totalBytes <= maxBytes) return text;
-  if (maxBytes < 56) {
-    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
-    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  if (totalBytes <= limit) return text;
+  if (limit < 56) {
+    if (limit <= 3) return sliceUtf8Bytes(text, limit);
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
   }
   const maxNoticeBytes = Buffer.byteLength(
     `
 ... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
     "utf8"
   );
-  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -791,11 +816,12 @@ function truncateWithByteNotice(text, maxBytes) {
   const shownBytes = Buffer.byteLength(slice, "utf8");
   const result = `${slice}
 ... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
-  return Buffer.byteLength(result, "utf8") <= maxBytes ? result : sliceUtf8Bytes(result, maxBytes);
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
 }
 function sliceSafeChars(text, maxChars) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
   if (text.length <= limit) return text;
   let end = limit;
   const lastCode = text.charCodeAt(end - 1);
@@ -807,6 +833,7 @@ function sliceSafeChars(text, maxChars) {
 function truncateWithNotice(text, maxChars) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
   if (text.length <= limit) return text;
   if (limit < 48) {
     if (limit <= 3) return sliceSafeChars(text, limit);
@@ -825,7 +852,7 @@ function truncateWithNotice(text, maxChars) {
   return result.length <= limit ? result : sliceSafeChars(result, limit);
 }
 function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
-  if (sections.length === 0 || maxChars <= 0) return "";
+  if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
   const joined = sections.join(separator);
   if (joined.length <= maxChars) return joined;
   const sepTotal = separator.length * (sections.length - 1);
@@ -857,7 +884,11 @@ function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
 }
 function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n") {
   const charFitted = fitSectionsToBudget(sections, maxChars, separator);
-  if (maxBytes === void 0 || Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
+  if (maxBytes === void 0) {
+    return charFitted;
+  }
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  if (Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
     return charFitted;
   }
   const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
@@ -1296,6 +1327,12 @@ async function commitPlannedWrites(plans) {
         } catch {
         }
         written.push(plan);
+        if (plan.originalSymlinkTarget) {
+          try {
+            await fs2.unlink(target);
+          } catch {
+          }
+        }
         await fs2.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
@@ -1864,7 +1901,6 @@ var ALLOWED_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
 var ALLOWED_BRANCH_SHORT_CHARS = /* @__PURE__ */ new Set(["a", "r", "v", "l", "q", "i"]);
 var ALLOWED_TAG_BOOL_FLAGS = /* @__PURE__ */ new Set([
   "--list",
-  "--verify",
   "--no-color",
   "--ignore-case",
   "--omit-empty",
@@ -1890,7 +1926,7 @@ var ALLOWED_TAG_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--sort",
   "--format"
 ]);
-var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "v", "i"]);
+var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "i"]);
 var ALLOWED_REMOTE_SUBCOMMANDS = /* @__PURE__ */ new Set(["show", "get-url"]);
 function tokenizeArgs(input) {
   const tokens = [];
@@ -1977,9 +2013,12 @@ function validateReadonlyGitArgs(pattern) {
       }
       if (expectNonFlagCommit) {
         expectNonFlagCommit = false;
-        if (!arg.startsWith("-")) {
-          continue;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`
+          );
         }
+        continue;
       }
       if (arg === "--") {
         if (!hasListFlag) {
@@ -2034,14 +2073,17 @@ function validateReadonlyGitArgs(pattern) {
       }
       if (expectNonFlagCommit) {
         expectNonFlagCommit = false;
-        if (!arg.startsWith("-")) {
-          continue;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`
+          );
         }
+        continue;
       }
       if (arg === "--") {
         if (!allowsPositionals) {
           throw new Error(
-            "Positional tag arguments are only allowed with --list or --verify in read-only mode"
+            "Positional tag arguments are only allowed with --list in read-only mode"
           );
         }
         break;
@@ -2064,7 +2106,7 @@ function validateReadonlyGitArgs(pattern) {
         } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName) && !ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS.has(flagName)) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
         }
-        if (flagName === "--list" || flagName === "--verify" || ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName) || ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)) {
+        if (flagName === "--list" || ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName) || ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)) {
           allowsPositionals = true;
         }
       } else if (arg.startsWith("-") && arg.length > 1) {
@@ -2075,7 +2117,7 @@ function validateReadonlyGitArgs(pattern) {
             if (!ALLOWED_TAG_SHORT_CHARS.has(ch)) {
               throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
             }
-            if (ch === "l" || ch === "v") allowsPositionals = true;
+            if (ch === "l") allowsPositionals = true;
           }
         }
       } else if (!allowsPositionals) {
@@ -2476,6 +2518,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     };
   };
   const batchSize = 16;
+  let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
@@ -2530,7 +2573,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
         continue;
       }
       if (item.fileTruncated) {
-        truncated = true;
+        anyFileTruncated = true;
       }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
@@ -2546,7 +2589,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       totalMatches += item.matchedIndices.length;
     }
   }
-  return { files, totalMatches, truncated: truncated || (summary || query.multiline === true) && discoveryTruncated };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+  };
 }
 function buildGlobFallbackPlan(pattern) {
   if (!pattern.includes("{") && pattern.includes("|")) {
@@ -2757,6 +2804,7 @@ function hardenGitExecArgs(validatedArgs) {
     if (!hasRev) {
       subArgs = dashDashIdx === -1 ? [...rest, "HEAD"] : [...rest.slice(0, dashDashIdx), "HEAD", ...rest.slice(dashDashIdx)];
     }
+    subArgs = ["--no-ext-diff", "--no-textconv", ...subArgs];
   }
   return [
     "--no-optional-locks",
@@ -2764,6 +2812,14 @@ function hardenGitExecArgs(validatedArgs) {
     "core.fsmonitor=false",
     "-c",
     "diff.external=",
+    "-c",
+    "gpg.program=false",
+    "-c",
+    "gpg.openpgp.program=false",
+    "-c",
+    "gpg.ssh.program=false",
+    "-c",
+    "gpg.x509.program=false",
     "--no-pager",
     ...subcmd ? [subcmd, ...subArgs] : subArgs
   ];
@@ -2971,6 +3027,13 @@ function isRegexStartContext(line, slashIdx) {
   const word = line.slice(k + 1, j + 1);
   return word === "return" || word === "case" || word === "throw" || word === "in" || word === "of" || word === "typeof" || word === "void" || word === "delete" || word === "new";
 }
+function isJsxSelfClosingSlash(line, slashIdx) {
+  if (line[slashIdx + 1] !== ">") return false;
+  let j = slashIdx - 1;
+  while (j >= 0 && /\s/.test(line[j])) j--;
+  if (j >= 0 && line[j] !== "}") return false;
+  return line[slashIdx + 2] !== "/";
+}
 function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = false, alreadySeenOpen = false) {
   let open = 0;
   let close = 0;
@@ -3049,7 +3112,7 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       i++;
       continue;
     }
-    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && next !== ">" && line[i - 1] !== "<" && isRegexStartContext(line, i)) {
+    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && !isJsxSelfClosingSlash(line, i) && line[i - 1] !== "<" && isRegexStartContext(line, i)) {
       inRegex = true;
       inRegexClass = false;
       continue;

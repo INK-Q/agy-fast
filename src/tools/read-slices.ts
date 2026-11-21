@@ -63,6 +63,16 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
   );
 }
 
+function isJsxSelfClosingSlash(line: string, slashIdx: number): boolean {
+  if (line[slashIdx + 1] !== ">") return false;
+  let j = slashIdx - 1;
+  while (j >= 0 && /\s/.test(line[j]!)) j--;
+  // JSX self-closing `/>` only reaches regex-start context after `}` (e.g. `<Icon s={1} />`)
+  // or on a continuation line (`  />`); regex literals like `/>/g` or `/>}/` follow `(`, `=`, `return`, etc.
+  if (j >= 0 && line[j] !== "}") return false;
+  return line[slashIdx + 2] !== "/";
+}
+
 function scanBracesOnLine(
   line: string,
   state: ScanState,
@@ -174,7 +184,7 @@ function scanBracesOnLine(
       ch === "/" &&
       next !== "/" &&
       next !== "*" &&
-      next !== ">" &&
+      !isJsxSelfClosingSlash(line, i) &&
       line[i - 1] !== "<" &&
       isRegexStartContext(line, i)
     ) {

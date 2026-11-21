@@ -119,7 +119,6 @@ const ALLOWED_BRANCH_SHORT_CHARS = new Set(["a", "r", "v", "l", "q", "i"]);
 
 const ALLOWED_TAG_BOOL_FLAGS = new Set([
   "--list",
-  "--verify",
   "--no-color",
   "--ignore-case",
   "--omit-empty",
@@ -150,7 +149,7 @@ const ALLOWED_TAG_VALUE_FLAGS = new Set([
   "--format",
 ]);
 
-const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "v", "i"]);
+const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "i"]);
 
 const ALLOWED_REMOTE_SUBCOMMANDS = new Set(["show", "get-url"]);
 
@@ -252,9 +251,12 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
       }
       if (expectNonFlagCommit) {
         expectNonFlagCommit = false;
-        if (!arg.startsWith("-")) {
-          continue;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`,
+          );
         }
+        continue;
       }
       if (arg === "--") {
         if (!hasListFlag) {
@@ -320,14 +322,17 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
       }
       if (expectNonFlagCommit) {
         expectNonFlagCommit = false;
-        if (!arg.startsWith("-")) {
-          continue;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`,
+          );
         }
+        continue;
       }
       if (arg === "--") {
         if (!allowsPositionals) {
           throw new Error(
-            "Positional tag arguments are only allowed with --list or --verify in read-only mode",
+            "Positional tag arguments are only allowed with --list in read-only mode",
           );
         }
         break;
@@ -359,7 +364,6 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         }
         if (
           flagName === "--list" ||
-          flagName === "--verify" ||
           ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName) ||
           ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)
         ) {
@@ -373,7 +377,7 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
             if (!ALLOWED_TAG_SHORT_CHARS.has(ch)) {
               throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
             }
-            if (ch === "l" || ch === "v") allowsPositionals = true;
+            if (ch === "l") allowsPositionals = true;
           }
         }
       } else if (!allowsPositionals) {
@@ -865,6 +869,7 @@ async function runTextOrRegexWithNode(
   };
 
   const batchSize = 16;
+  let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
@@ -920,7 +925,7 @@ async function runTextOrRegexWithNode(
         continue;
       }
       if (item.fileTruncated) {
-        truncated = true;
+        anyFileTruncated = true;
       }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
@@ -937,7 +942,11 @@ async function runTextOrRegexWithNode(
     }
   }
 
-  return { files, totalMatches, truncated: truncated || ((summary || query.multiline === true) && discoveryTruncated) };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || ((summary || query.multiline === true) && discoveryTruncated),
+  };
 }
 
 interface GlobFallbackPlan {
@@ -1213,6 +1222,7 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
           ? [...rest, "HEAD"]
           : [...rest.slice(0, dashDashIdx), "HEAD", ...rest.slice(dashDashIdx)];
     }
+    subArgs = ["--no-ext-diff", "--no-textconv", ...subArgs];
   }
 
   return [
@@ -1221,6 +1231,14 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
     "core.fsmonitor=false",
     "-c",
     "diff.external=",
+    "-c",
+    "gpg.program=false",
+    "-c",
+    "gpg.openpgp.program=false",
+    "-c",
+    "gpg.ssh.program=false",
+    "-c",
+    "gpg.x509.program=false",
     "--no-pager",
     ...(subcmd ? [subcmd, ...subArgs] : subArgs),
   ];

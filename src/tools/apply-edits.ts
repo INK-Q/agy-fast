@@ -478,6 +478,14 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
           // ignore cleanup failure
         }
         written.push(plan);
+        if (plan.originalSymlinkTarget) {
+          // Replace dangling symlink itself instead of following it on fallback write
+          try {
+            await fs.unlink(target);
+          } catch {
+            // ignore unlink failure
+          }
+        }
         await fs.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {

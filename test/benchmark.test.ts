@@ -9,6 +9,7 @@ import {
   analyzePathsByUsage,
   analyzeTranscriptSessions,
   collectTranscriptFiles,
+  filterStepsByTime,
   parseTranscriptJsonl,
 } from "../src/benchmark-core.js";
 
@@ -1048,11 +1049,39 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(edgeMetrics.agyTruncatedCalls, 1); // `[truncated; showing 30 files]`
     assert.equal(edgeMetrics.consecutiveSingleChainsExtraTurns, 0); // read_slices -> apply_edits are different tools
 
-    // 3. --since slicing after coordinator's initial USER_INPUT must NOT misclassify coordinator as a swarm worker
+    // 3. --since slicing after coordinator's initial USER_INPUT must NOT misclassify coordinator as a swarm worker,
+    //    and direct filterStepsByTime also preserves worker + startup-snapshot identity
     const coordFile = path.join(tmpDir, "resumed-coord.jsonl");
     await fs.writeFile(coordFile, edgeSteps.map((s) => JSON.stringify(s)).join("\n") + "\n", "utf8");
     const slicedCoord = await analyzePaths([coordFile], { sinceMs: Date.parse("2026-11-20T09:30:00Z") });
     assert.equal(slicedCoord.sessions, 1);
     assert.equal(slicedCoord.swarmWorkerSessions, 0);
+
+    const workerSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-20T09:00:00Z",
+          content: "[agy-fast startup snapshot] Workspace: /tmp/repo",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T09:05:00Z",
+          output_tokens: 50,
+          tool_calls: [{ name: "read_board", args: {} }],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:00Z",
+          output_tokens: 80,
+          tool_calls: [{ name: "read_file", args: { Path: "/tmp/a.ts" } }],
+        }),
+      ].join("\n"),
+    );
+    const directSlicedWorker = filterStepsByTime(workerSteps, Date.parse("2026-11-20T09:30:00Z"));
+    const directWorkerMetrics = analyzeTranscriptSessions([directSlicedWorker]);
+    assert.equal(directWorkerMetrics.sessions, 1);
+    assert.equal(directWorkerMetrics.swarmWorkerSessions, 1);
+    assert.equal(directWorkerMetrics.sessionsWithSnapshot, 1);
   });
 });

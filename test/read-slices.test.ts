@@ -617,6 +617,26 @@ describe("read_slices", () => {
       ["A:1-3", "B:4-4"],
     );
 
+    // JS/TS regex literals starting with `>` (e.g. `/>/g`, `/>}/`) must still enter regex mode
+    for (const fname of ["escape.ts", "escape.tsx"]) {
+      const gtRegex = extractSymbols(
+        fname,
+        [
+          "export function escapeHtml(s: string) {",
+          '  return s.replace(/>/g, "&gt;").replace(/{/g, "&#123;");',
+          "}",
+          "export function closeBraceRegex(s: string) {",
+          "  return />}/.test(s);",
+          "}",
+          "export function after() { return 1; }",
+        ].join("\n"),
+      );
+      assert.deepEqual(
+        gtRegex.map((s) => `${s.name}:${s.startLine}-${s.endLine}`),
+        ["escapeHtml:1-3", "closeBraceRegex:4-6", "after:7-7"],
+      );
+    }
+
     // 2. TS multiline backtick template must not emit fake symbols or swallow real classes below
     const tplSyms = extractSymbols(
       "tpl.ts",

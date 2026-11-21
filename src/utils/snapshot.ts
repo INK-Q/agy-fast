@@ -10,27 +10,44 @@ export interface SnapshotOptions {
   gitTimeoutMs?: number;
 }
 
+const HARDENED_GIT_BASE_ARGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false",
+  "--no-pager",
+] as const;
+
 async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
 ): Promise<string | null> {
   const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096,
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096,
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "status", "--porcelain=v1"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 32_768,
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "log", "-n", "3", "--format=%h %s"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192,
@@ -449,12 +466,14 @@ function fitSectionToChars(
   budget: number,
   marker: string,
 ): string {
-  if (budget <= 0) return "";
-  if (section.length <= budget) return section;
-  if (budget <= marker.length + 1) {
-    return sliceSafeChars(section, budget);
+  if (!Number.isFinite(budget) || budget <= 0) return "";
+  const limit = Math.trunc(budget);
+  if (limit <= 0) return "";
+  if (section.length <= limit) return section;
+  if (limit <= marker.length + 1) {
+    return sliceSafeChars(section, limit);
   }
-  const cutoff = budget - marker.length - 1;
+  const cutoff = limit - marker.length - 1;
   let trimmed = sliceSafeChars(section, cutoff);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
@@ -468,30 +487,38 @@ function fitSectionToBytes(
   budgetBytes: number,
   marker: string,
 ): string {
-  if (budgetBytes <= 0) return "";
-  if (Buffer.byteLength(section, "utf8") <= budgetBytes) return section;
+  if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return "";
+  const limit = Math.trunc(budgetBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(section, "utf8") <= limit) return section;
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  if (budgetBytes <= markerBytes + 1) {
-    return sliceUtf8Bytes(section, budgetBytes);
+  if (limit <= markerBytes + 1) {
+    return sliceUtf8Bytes(section, limit);
   }
-  const cutoffBytes = budgetBytes - markerBytes - 1;
+  const cutoffBytes = limit - markerBytes - 1;
   let trimmed = sliceUtf8Bytes(section, cutoffBytes);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
     trimmed = trimmed.slice(0, lastNl);
   }
   const result = `${trimmed}\n${marker}`;
-  return Buffer.byteLength(result, "utf8") <= budgetBytes
+  return Buffer.byteLength(result, "utf8") <= limit
     ? result
-    : sliceUtf8Bytes(result, budgetBytes);
+    : sliceUtf8Bytes(result, limit);
 }
 
 export async function buildWorkspaceSnapshot(
   workspaceDir: string,
   options: SnapshotOptions = {},
 ): Promise<string | null> {
-  const maxChars = options.maxChars ?? 1500;
-  const maxBytes = options.maxBytes ?? maxChars;
+  const maxChars =
+    typeof options.maxChars === "number" && Number.isFinite(options.maxChars)
+      ? Math.max(0, Math.trunc(options.maxChars))
+      : 1500;
+  const maxBytes =
+    typeof options.maxBytes === "number" && Number.isFinite(options.maxBytes)
+      ? Math.max(0, Math.trunc(options.maxBytes))
+      : maxChars;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
 
   try {

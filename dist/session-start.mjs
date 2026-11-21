@@ -8,15 +8,17 @@ import { fileURLToPath } from "node:url";
 
 // src/utils/output-filter.ts
 function sliceUtf8Bytes(text, maxBytes) {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
   let bytes = 0;
   let endIndex = 0;
   for (let i = 0; i < text.length; ) {
     const cp = text.codePointAt(i);
     const unitLen = cp > 65535 ? 2 : 1;
     const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
-    if (bytes + chBytes > maxBytes) break;
+    if (bytes + chBytes > limit) break;
     bytes += chBytes;
     i += unitLen;
     endIndex = i;
@@ -24,19 +26,21 @@ function sliceUtf8Bytes(text, maxBytes) {
   return text.slice(0, endIndex);
 }
 function truncateWithByteNotice(text, maxBytes) {
-  if (maxBytes <= 0) return "";
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
-  if (totalBytes <= maxBytes) return text;
-  if (maxBytes < 56) {
-    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
-    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  if (totalBytes <= limit) return text;
+  if (limit < 56) {
+    if (limit <= 3) return sliceUtf8Bytes(text, limit);
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
   }
   const maxNoticeBytes = Buffer.byteLength(
     `
 ... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
     "utf8"
   );
-  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -45,11 +49,12 @@ function truncateWithByteNotice(text, maxBytes) {
   const shownBytes = Buffer.byteLength(slice, "utf8");
   const result = `${slice}
 ... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
-  return Buffer.byteLength(result, "utf8") <= maxBytes ? result : sliceUtf8Bytes(result, maxBytes);
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
 }
 function sliceSafeChars(text, maxChars) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
   if (text.length <= limit) return text;
   let end = limit;
   const lastCode = text.charCodeAt(end - 1);
@@ -236,24 +241,40 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
 ]);
 
 // src/utils/snapshot.ts
+var HARDENED_GIT_BASE_ARGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false",
+  "--no-pager"
+];
 async function getGitSummary(workspaceDir, timeoutMs) {
   const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "status", "--porcelain=v1"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 32768
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "log", "-n", "3", "--format=%h %s"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192
@@ -581,12 +602,14 @@ async function getProjectManifestSummary(workspaceDir) {
 ${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
 function fitSectionToChars(section, budget, marker) {
-  if (budget <= 0) return "";
-  if (section.length <= budget) return section;
-  if (budget <= marker.length + 1) {
-    return sliceSafeChars(section, budget);
+  if (!Number.isFinite(budget) || budget <= 0) return "";
+  const limit = Math.trunc(budget);
+  if (limit <= 0) return "";
+  if (section.length <= limit) return section;
+  if (limit <= marker.length + 1) {
+    return sliceSafeChars(section, limit);
   }
-  const cutoff = budget - marker.length - 1;
+  const cutoff = limit - marker.length - 1;
   let trimmed = sliceSafeChars(section, cutoff);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
@@ -596,13 +619,15 @@ function fitSectionToChars(section, budget, marker) {
 ${marker}`;
 }
 function fitSectionToBytes(section, budgetBytes, marker) {
-  if (budgetBytes <= 0) return "";
-  if (Buffer.byteLength(section, "utf8") <= budgetBytes) return section;
+  if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return "";
+  const limit = Math.trunc(budgetBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(section, "utf8") <= limit) return section;
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  if (budgetBytes <= markerBytes + 1) {
-    return sliceUtf8Bytes(section, budgetBytes);
+  if (limit <= markerBytes + 1) {
+    return sliceUtf8Bytes(section, limit);
   }
-  const cutoffBytes = budgetBytes - markerBytes - 1;
+  const cutoffBytes = limit - markerBytes - 1;
   let trimmed = sliceUtf8Bytes(section, cutoffBytes);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
@@ -610,11 +635,11 @@ function fitSectionToBytes(section, budgetBytes, marker) {
   }
   const result = `${trimmed}
 ${marker}`;
-  return Buffer.byteLength(result, "utf8") <= budgetBytes ? result : sliceUtf8Bytes(result, budgetBytes);
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
 }
 async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
-  const maxChars = options.maxChars ?? 1500;
-  const maxBytes = options.maxBytes ?? maxChars;
+  const maxChars = typeof options.maxChars === "number" && Number.isFinite(options.maxChars) ? Math.max(0, Math.trunc(options.maxChars)) : 1500;
+  const maxBytes = typeof options.maxBytes === "number" && Number.isFinite(options.maxBytes) ? Math.max(0, Math.trunc(options.maxBytes)) : maxChars;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
   try {
     const stat = await fs.stat(workspaceDir);
@@ -904,6 +929,8 @@ async function readStdin(timeoutMs = 1500) {
     };
     const onEnd = () => finish();
     const onError = () => finish();
+    const ignoreLateError = () => {
+    };
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -911,6 +938,7 @@ async function readStdin(timeoutMs = 1500) {
       process.stdin.off("data", onData);
       process.stdin.off("end", onEnd);
       process.stdin.off("error", onError);
+      process.stdin.on("error", ignoreLateError);
       process.stdin.pause();
       if (typeof process.stdin.unref === "function") {
         process.stdin.unref();

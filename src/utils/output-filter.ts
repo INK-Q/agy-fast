@@ -33,15 +33,17 @@ export function normalizeTerminalOutput(raw: string): string {
 export const DEFAULT_INLINE_MAX_BYTES = 8_800;
 
 export function sliceUtf8Bytes(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
   let bytes = 0;
   let endIndex = 0;
   for (let i = 0; i < text.length; ) {
     const cp = text.codePointAt(i)!;
     const unitLen = cp > 0xffff ? 2 : 1;
     const chBytes = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
-    if (bytes + chBytes > maxBytes) break;
+    if (bytes + chBytes > limit) break;
     bytes += chBytes;
     i += unitLen;
     endIndex = i;
@@ -50,20 +52,22 @@ export function sliceUtf8Bytes(text: string, maxBytes: number): string {
 }
 
 export function truncateWithByteNotice(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
-  if (totalBytes <= maxBytes) return text;
+  if (totalBytes <= limit) return text;
 
-  if (maxBytes < 56) {
-    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
-    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  if (limit < 56) {
+    if (limit <= 3) return sliceUtf8Bytes(text, limit);
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
   }
 
   const maxNoticeBytes = Buffer.byteLength(
     `\n... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
     "utf8",
   );
-  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -71,14 +75,15 @@ export function truncateWithByteNotice(text: string, maxBytes: number): string {
   }
   const shownBytes = Buffer.byteLength(slice, "utf8");
   const result = `${slice}\n... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
-  return Buffer.byteLength(result, "utf8") <= maxBytes
+  return Buffer.byteLength(result, "utf8") <= limit
     ? result
-    : sliceUtf8Bytes(result, maxBytes);
+    : sliceUtf8Bytes(result, limit);
 }
 
 export function sliceSafeChars(text: string, maxChars: number): string {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
   if (text.length <= limit) return text;
   let end = limit;
   const lastCode = text.charCodeAt(end - 1);
@@ -91,6 +96,7 @@ export function sliceSafeChars(text: string, maxChars: number): string {
 export function truncateWithNotice(text: string, maxChars: number): string {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
   if (text.length <= limit) return text;
 
   if (limit < 48) {
@@ -119,7 +125,7 @@ export function fitSectionsToBudget(
   maxChars: number,
   separator = "\n\n",
 ): string {
-  if (sections.length === 0 || maxChars <= 0) return "";
+  if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
   const joined = sections.join(separator);
   if (joined.length <= maxChars) return joined;
 
@@ -170,7 +176,11 @@ export function fitSectionsToByteBudget(
   separator = "\n\n",
 ): string {
   const charFitted = fitSectionsToBudget(sections, maxChars, separator);
-  if (maxBytes === undefined || Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
+  if (maxBytes === undefined) {
+    return charFitted;
+  }
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  if (Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
     return charFitted;
   }
 

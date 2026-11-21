@@ -887,7 +887,8 @@ function extractAgyFastToolName(call: TranscriptToolCall): string | null {
 }
 
 function sessionHasStartupSnapshot(steps: TranscriptStep[]): boolean {
-  for (const step of steps) {
+  const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
+  for (const step of identitySteps) {
     if (typeof step.content !== "string") continue;
     if (!step.content.includes("[agy-fast startup snapshot]")) continue;
     if (step.type === "SYSTEM_MESSAGE") return true;
@@ -1028,8 +1029,6 @@ function isSwarmWorkerSession(steps: TranscriptStep[]): boolean {
         hasUserRequest = true;
       }
     }
-  }
-  for (const step of steps) {
     if (step.type === "PLANNER_RESPONSE" && Array.isArray(step.tool_calls)) {
       for (const tc of step.tool_calls) {
         const n = tc.name ?? "";
@@ -1068,6 +1067,7 @@ export function filterStepsByTime(
     if (untilMs !== undefined && ms > untilMs) continue;
     out.push(step);
   }
+  fullSessionStepsMap.set(out, fullSessionStepsMap.get(steps) ?? steps);
   return out;
 }
 

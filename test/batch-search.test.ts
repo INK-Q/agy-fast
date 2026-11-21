@@ -667,7 +667,13 @@ describe("batch_search", () => {
     for (const bad of [
       "branch --merged -D victim",
       "branch --merged --delete victim",
+      "branch --points-at -- --no-points-at -D victim",
+      "branch --merged -- -D victim",
       "tag --merged -d v1.0",
+      "tag --points-at -- --no-points-at -d v1.0",
+      "tag --contains -- -d v1.0",
+      "tag -v v1.0",
+      "tag --verify v1.0",
       "remote show ssh://git@127.0.0.1:2222/repo.git",
       "remote show https://example.com/repo.git",
     ]) {
@@ -689,11 +695,13 @@ describe("batch_search", () => {
       const markerExt = path.join(untrustedRepo, "pwn_ext");
       const markerTc = path.join(untrustedRepo, "pwn_tc");
       const markerFs = path.join(untrustedRepo, "pwn_fs");
+      const markerGpg = path.join(untrustedRepo, "pwn_gpg");
       const touchCmd = (p: string) =>
         `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(p)},'1')`)}`;
       execFileSync("git", ["config", "diff.external", touchCmd(markerExt)], { cwd: untrustedRepo });
       execFileSync("git", ["config", "diff.evil.textconv", touchCmd(markerTc)], { cwd: untrustedRepo });
       execFileSync("git", ["config", "core.fsmonitor", touchCmd(markerFs)], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "gpg.program", touchCmd(markerGpg)], { cwd: untrustedRepo });
       execFileSync("git", ["remote", "add", "show", "https://example.invalid/repo.git"], { cwd: untrustedRepo });
 
       const gRes = await runBatchSearch({
@@ -703,6 +711,8 @@ describe("batch_search", () => {
           { type: "git", pattern: "diff" },
           { type: "git", pattern: "blame doc.txt" },
           { type: "git", pattern: "shortlog -sn" },
+          { type: "git", pattern: "shortlog -S v1 HEAD" },
+          { type: "git", pattern: "log --show-signature -n 1" },
           { type: "git", pattern: "remote get-url show" },
         ],
       });
@@ -712,6 +722,7 @@ describe("batch_search", () => {
       assert.equal(await fs.access(markerExt).then(() => true, () => false), false);
       assert.equal(await fs.access(markerTc).then(() => true, () => false), false);
       assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
+      assert.equal(await fs.access(markerGpg).then(() => true, () => false), false);
 
       // Prefix abbreviations of --ext-diff / --textconv are also rejected
       assert.throws(() => validateReadonlyGitArgs("diff --textc"), /not allowed/i);
@@ -730,6 +741,10 @@ describe("batch_search", () => {
       );
       await fs.writeFile(path.join(edgeDir, "b-ctx.txt"), "before-ctx-line\nneedle\nafter-ctx-line\n", "utf8");
       await fs.writeFile(path.join(edgeDir, "nonempty.txt"), "line1\nline2\n", "utf8");
+      for (let i = 0; i < 18; i++) {
+        await fs.writeFile(path.join(edgeDir, `m-pad-${String(i).padStart(2, "0")}.txt`), "filler\n", "utf8");
+      }
+      await fs.writeFile(path.join(edgeDir, "z-batch2.txt"), "batch2-before\nneedle\nbatch2-after\n", "utf8");
       for (const forceNodeFallback of [false, true]) {
         const res = await runBatchSearch(
           {
@@ -755,6 +770,7 @@ describe("batch_search", () => {
         );
         assert.match(sections[3]!, /\(no matches\)/);
         assert.match(sections[4]!, /before-ctx-line/);
+        assert.match(sections[4]!, /z-batch2\.txt/);
       }
     } finally {
       await fs.rm(edgeDir, { recursive: true, force: true });

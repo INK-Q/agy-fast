@@ -62,6 +62,7 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
 
     const onEnd = () => finish();
     const onError = () => finish();
+    const ignoreLateError = () => {};
 
     const finish = () => {
       if (settled) return;
@@ -70,6 +71,8 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
       process.stdin.off("data", onData);
       process.stdin.off("end", onEnd);
       process.stdin.off("error", onError);
+      // Keep a no-op error listener so late pipe resets never crash fail-open exit
+      process.stdin.on("error", ignoreLateError);
       // Release stdin handle so a parent that omits EOF never hangs the hook process
       process.stdin.pause();
       if (typeof (process.stdin as { unref?: () => void }).unref === "function") {
