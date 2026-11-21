@@ -1644,17 +1644,28 @@ async function commitPlannedWrites(plans) {
     throw err;
   }
 }
+function corruptedEditsError(items) {
+  return {
+    text: formatCorruptedArrayError({
+      header: "Validation failed (0 files modified)",
+      toolName: "apply_edits",
+      items,
+      fallbackAdvice: "immediately fall back to parallel built-in edit_file / write_file calls for these file(s)."
+    }),
+    isError: true
+  };
+}
 async function runApplyEdits(input) {
   const parsedEdits = parseMaybeJsonArray(input?.edits);
   if (!parsedEdits.ok) {
     if (parsedEdits.kind === "wrong_type" && (typeof input?.edits === "boolean" || input?.edits === null)) {
+      return corruptedEditsError([
+        { label: "edits", value: input.edits, expected: "an array of edit objects" }
+      ]);
+    }
+    if (parsedEdits.kind === "invalid_json") {
       return {
-        text: formatCorruptedArrayError({
-          header: "Validation failed (0 files modified)",
-          toolName: "apply_edits",
-          items: [{ label: "edits", value: input.edits, expected: "an array of edit objects" }],
-          fallbackAdvice: "immediately fall back to parallel built-in edit_file / write_file calls for these file(s)."
-        }),
+        text: `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
         isError: true
       };
     }
@@ -1665,10 +1676,9 @@ async function runApplyEdits(input) {
   }
   const rawEdits = parsedEdits.value;
   if (rawEdits.length === 0) {
-    return {
-      text: "Error: 'edits' must be a non-empty array of file edit objects.",
-      isError: true
-    };
+    return corruptedEditsError([
+      { label: "edits", value: input.edits, expected: "a non-empty array of edit objects" }
+    ]);
   }
   if (rawEdits.length > 50) {
     return {
@@ -1717,15 +1727,7 @@ async function runApplyEdits(input) {
     });
   }
   if (corruptedItems.length > 0) {
-    return {
-      text: formatCorruptedArrayError({
-        header: "Validation failed (0 files modified)",
-        toolName: "apply_edits",
-        items: corruptedItems,
-        fallbackAdvice: "immediately fall back to parallel built-in edit_file / write_file calls for these file(s)."
-      }),
-      isError: true
-    };
+    return corruptedEditsError(corruptedItems);
   }
   let validatedVerify = null;
   if (input.verify !== void 0) {
@@ -5146,7 +5148,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+      description: "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command. Pass 'edits' as one JSON array string.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5155,50 +5157,8 @@ function createAgyFastServer() {
             description: "Base directory for relative file paths and verify command."
           },
           edits: {
-            type: "array",
-            minItems: 1,
-            maxItems: 50,
-            description: "Files to edit or create.",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string" },
-                hunks: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      target: { type: "string", description: "Exact text to replace." },
-                      replacement: { type: "string", description: "Replacement text." },
-                      startLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based start line to narrow matching."
-                      },
-                      endLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based end line to narrow matching."
-                      },
-                      replaceAll: {
-                        type: "boolean",
-                        description: "Replace every occurrence in range (default false)."
-                      }
-                    },
-                    required: ["target", "replacement"]
-                  }
-                },
-                create: {
-                  type: "string",
-                  description: "Create file with this full content instead of hunks."
-                },
-                overwrite: {
-                  type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'."
-                }
-              },
-              required: ["path"]
-            }
+            type: "string",
+            description: 'JSON array string of 1-50 files to edit or create: [{"path", "hunks"?: [{"target", "replacement", "startLine"?, "endLine"?, "replaceAll"?}], "create"?, "overwrite"?}]. A hunk replaces exact target text (optional 1-based line window; replaceAll replaces every occurrence in it); "create" writes the whole file instead of hunks, and "overwrite" allows replacing an existing file. A native array is also accepted, but agy can deliver a long array of objects in call_mcp_tool Arguments as [] while a string arrives intact.'
           },
           dryRun: {
             type: "boolean",
