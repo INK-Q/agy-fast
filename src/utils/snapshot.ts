@@ -2,9 +2,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { execBinaryAsync } from "./exec-utils.js";
 import { DEFAULT_IGNORE_DIRS } from "./fs-utils.js";
+import { sliceSafeChars, sliceUtf8Bytes, truncateWithByteNotice } from "./output-filter.js";
 
 export interface SnapshotOptions {
   maxChars?: number;
+  maxBytes?: number;
   gitTimeoutMs?: number;
 }
 
@@ -82,7 +84,7 @@ async function getGitSummary(
     let currentLen = prefix.length;
     for (let i = 0; i < Math.min(statusLines.length, maxItems); i++) {
       const raw = statusLines[i]!.trim();
-      const item = raw.length > 100 ? `${raw.slice(0, 97)}...` : raw;
+      const item = raw.length > 100 ? `${sliceSafeChars(raw, 97)}...` : raw;
       const sepLen = shown.length > 0 ? 2 : 0;
       const remainingAfter = statusLines.length - (i + 1);
       const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
@@ -100,7 +102,7 @@ async function getGitSummary(
   }
   if (logLines.length > 0) {
     parts.push(
-      `Recent commits:\n${logLines.map((l) => `  - ${l.slice(0, 72)}`).join("\n")}`,
+      `Recent commits:\n${logLines.map((l) => `  - ${sliceSafeChars(l, 72)}`).join("\n")}`,
     );
   }
   return parts.join("\n");
@@ -160,7 +162,7 @@ const MANIFEST_SKIP_SUBDIRS = new Set([
 ]);
 
 function shortEntryName(name: string, maxLen = 28): string {
-  return name.length > maxLen ? `${name.slice(0, maxLen - 3)}...` : name;
+  return name.length > maxLen ? `${sliceSafeChars(name, maxLen - 3)}...` : name;
 }
 
 async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
@@ -450,10 +452,10 @@ function fitSectionToChars(
   if (budget <= 0) return "";
   if (section.length <= budget) return section;
   if (budget <= marker.length + 1) {
-    return section.slice(0, budget);
+    return sliceSafeChars(section, budget);
   }
   const cutoff = budget - marker.length - 1;
-  let trimmed = section.slice(0, cutoff);
+  let trimmed = sliceSafeChars(section, cutoff);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
     trimmed = trimmed.slice(0, lastNl);
@@ -461,11 +463,35 @@ function fitSectionToChars(
   return `${trimmed}\n${marker}`;
 }
 
+function fitSectionToBytes(
+  section: string,
+  budgetBytes: number,
+  marker: string,
+): string {
+  if (budgetBytes <= 0) return "";
+  if (Buffer.byteLength(section, "utf8") <= budgetBytes) return section;
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (budgetBytes <= markerBytes + 1) {
+    return sliceUtf8Bytes(section, budgetBytes);
+  }
+  const cutoffBytes = budgetBytes - markerBytes - 1;
+  let trimmed = sliceUtf8Bytes(section, cutoffBytes);
+  const lastNl = trimmed.lastIndexOf("\n");
+  if (lastNl > 0) {
+    trimmed = trimmed.slice(0, lastNl);
+  }
+  const result = `${trimmed}\n${marker}`;
+  return Buffer.byteLength(result, "utf8") <= budgetBytes
+    ? result
+    : sliceUtf8Bytes(result, budgetBytes);
+}
+
 export async function buildWorkspaceSnapshot(
   workspaceDir: string,
   options: SnapshotOptions = {},
 ): Promise<string | null> {
   const maxChars = options.maxChars ?? 1500;
+  const maxBytes = options.maxBytes ?? maxChars;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
 
   try {
@@ -489,15 +515,23 @@ export async function buildWorkspaceSnapshot(
   if (sections.length <= 1) return null;
 
   const full = sections.join("\n");
-  if (full.length <= maxChars) return full;
-
-  const suffix = "... [snapshot capped]";
-  if (maxChars <= header.length + suffix.length + 4) {
-    return fitSectionToChars(full, maxChars, suffix);
+  if (full.length <= maxChars && Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
   }
 
-  // Allocate per-section budgets so a large dirty git status cannot erase Project or Layout
-  const remainingAfterHeader = maxChars - header.length;
+  const suffix = "... [snapshot capped]";
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  if (maxChars <= header.length + suffix.length + 4 || maxBytes <= headerBytes + suffixBytes + 4) {
+    const charCapped = fitSectionToChars(full, maxChars, suffix);
+    return Buffer.byteLength(charCapped, "utf8") <= maxBytes
+      ? charCapped
+      : truncateWithByteNotice(charCapped, maxBytes);
+  }
+
+  // Allocate per-section UTF-8 byte budgets so a large dirty git status or CJK paths
+  // cannot erase Project or Layout while keeping total output <= maxBytes and <= maxChars.
+  const remainingAfterHeader = maxBytes - headerBytes;
   const nonEmptyCount =
     (gitSummary ? 1 : 0) + (projectSummary ? 1 : 0) + (treeSummary ? 1 : 0);
   const availableForBodies = remainingAfterHeader - nonEmptyCount; // reserve \n separators
@@ -509,37 +543,44 @@ export async function buildWorkspaceSnapshot(
 
   if (projectSummary) {
     const otherPresent = Boolean(gitSummary || treeSummary);
+    const projectBytes = Buffer.byteLength(projectSummary, "utf8");
     const projectCap = otherPresent
-      ? Math.min(projectSummary.length, Math.max(80, Math.floor(availableForBodies * 0.25)))
+      ? Math.min(projectBytes, Math.max(80, Math.floor(availableForBodies * 0.25)))
       : budgetLeft;
-    projectPart = fitSectionToChars(
+    projectPart = fitSectionToBytes(
       projectSummary,
       Math.min(budgetLeft, projectCap),
       "  ... [project capped]",
     );
-    budgetLeft -= projectPart.length;
+    budgetLeft -= Buffer.byteLength(projectPart, "utf8");
   }
 
   if (gitSummary && budgetLeft > 0) {
+    const gitBytes = Buffer.byteLength(gitSummary, "utf8");
     const gitCap = treeSummary
-      ? Math.min(gitSummary.length, Math.max(100, Math.floor(budgetLeft * 0.48)))
+      ? Math.min(gitBytes, Math.max(100, Math.floor(budgetLeft * 0.48)))
       : budgetLeft;
-    gitPart = fitSectionToChars(
+    gitPart = fitSectionToBytes(
       gitSummary,
       Math.min(budgetLeft, gitCap),
       "  ... [git capped]",
     );
-    budgetLeft -= gitPart.length;
+    budgetLeft -= Buffer.byteLength(gitPart, "utf8");
   }
 
   if (treeSummary && budgetLeft > 0) {
-    treePart = fitSectionToChars(treeSummary, budgetLeft, suffix);
-    budgetLeft -= treePart.length;
+    treePart = fitSectionToBytes(treeSummary, budgetLeft, suffix);
+    budgetLeft -= Buffer.byteLength(treePart, "utf8");
   }
 
-  const assembled = [header, gitPart, projectPart, treePart]
+  let assembled = [header, gitPart, projectPart, treePart]
     .filter(Boolean)
     .join("\n");
-  if (assembled.length <= maxChars) return assembled;
-  return fitSectionToChars(assembled, maxChars, suffix);
+  if (assembled.length > maxChars) {
+    assembled = fitSectionToChars(assembled, maxChars, suffix);
+  }
+  if (Buffer.byteLength(assembled, "utf8") > maxBytes) {
+    assembled = fitSectionToBytes(assembled, maxBytes, suffix);
+  }
+  return assembled;
 }
