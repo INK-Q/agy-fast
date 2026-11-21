@@ -2,6 +2,7 @@
 
 
 // src/protocol/mcp.ts
+import { fileURLToPath } from "node:url";
 var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2025-11-25",
   "2025-06-18",
@@ -16,9 +17,33 @@ var McpStdioServer = class {
   inFlight = 0;
   stdinEnded = false;
   onDrainExit;
+  onWorkspaceRoots;
+  sendToClient;
+  clientSupportsRoots = false;
+  rootsRequestCount = 0;
+  pendingRootsRequest;
+  rootsReady = Promise.resolve();
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
+    this.onWorkspaceRoots = options.onWorkspaceRoots;
+  }
+  // Tool calls wait for the answer, so the first call already sees the roots.
+  requestRoots() {
+    if (!this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) return;
+    this.rootsRequestCount += 1;
+    const id = `agy-fast-roots-${this.rootsRequestCount}`;
+    this.rootsReady = new Promise((resolve) => {
+      this.pendingRootsRequest = { id, resolve };
+    });
+    this.sendToClient({ jsonrpc: "2.0", id, method: "roots/list" });
+  }
+  receiveRoots(result) {
+    const roots = result?.roots ?? [];
+    const paths = roots.map((root) => root.uri).filter((uri) => typeof uri === "string" && uri.startsWith("file:")).map((uri) => fileURLToPath(uri));
+    if (paths.length > 0) {
+      this.onWorkspaceRoots?.(paths);
+    }
   }
   registerTool(definition, handler) {
     this.tools.set(definition.name, { definition, handler });
@@ -35,6 +60,13 @@ var McpStdioServer = class {
     const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
     const id = hasId ? msg.id ?? null : null;
     const method = typeof msg.method === "string" ? msg.method : "";
+    if (!method && this.pendingRootsRequest?.id === id) {
+      const { resolve } = this.pendingRootsRequest;
+      this.pendingRootsRequest = void 0;
+      this.receiveRoots(msg.result);
+      resolve();
+      return null;
+    }
     if (!method) {
       return {
         jsonrpc: "2.0",
@@ -43,11 +75,16 @@ var McpStdioServer = class {
       };
     }
     if (!hasId) {
+      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
+        this.requestRoots();
+      }
       return null;
     }
     if (method === "initialize") {
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
+      const capabilities = msg.params?.capabilities;
+      this.clientSupportsRoots = Boolean(capabilities?.roots);
       return {
         jsonrpc: "2.0",
         id,
@@ -131,6 +168,7 @@ var McpStdioServer = class {
         };
       }
       try {
+        await this.rootsReady;
         const res = await tool.handler(args);
         return {
           jsonrpc: "2.0",
@@ -161,6 +199,7 @@ var McpStdioServer = class {
   listen(input = process.stdin, output = process.stdout, onExit) {
     this.onDrainExit = onExit;
     let buffer = Buffer.alloc(0);
+    let clientUsesContentLength = false;
     const writeResponse = (payload, useContentLength) => {
       const serialized = JSON.stringify(payload);
       if (useContentLength) {
@@ -173,7 +212,9 @@ ${serialized}`);
 `);
       }
     };
+    this.sendToClient = (request) => writeResponse(request, clientUsesContentLength);
     const dispatchRawJson = (jsonText, useContentLength) => {
+      clientUsesContentLength = useContentLength;
       let parsed;
       try {
         parsed = JSON.parse(jsonText);
@@ -321,68 +362,6 @@ ${serialized}`);
   }
 };
 
-// src/tools/apply-edits.ts
-import { promises as fs2 } from "node:fs";
-import path3 from "node:path";
-
-// src/utils/arg-validation.ts
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function describeValueType(value) {
-  if (value === null) return "null";
-  if (value === void 0) return "undefined";
-  if (Array.isArray(value)) return `array (len=${value.length})`;
-  if (typeof value === "boolean") return `boolean (${String(value)})`;
-  if (typeof value === "number") return `number (${String(value)})`;
-  if (typeof value === "string") return `string (len=${value.length})`;
-  return typeof value;
-}
-function parseMaybeJsonArray(value) {
-  if (value === void 0) {
-    return { ok: false, kind: "missing", detail: "undefined" };
-  }
-  if (Array.isArray(value)) {
-    return { ok: true, value };
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (trimmed.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) {
-          return { ok: true, value: parsed };
-        }
-      } catch (err) {
-        return {
-          ok: false,
-          kind: "invalid_json",
-          detail: err instanceof Error ? err.message : String(err)
-        };
-      }
-    }
-  }
-  return {
-    ok: false,
-    kind: "wrong_type",
-    detail: describeValueType(value)
-  };
-}
-function formatCorruptedArrayError(options) {
-  const details = options.items.slice(0, 8).map(
-    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
-  );
-  if (options.items.length > 8) {
-    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
-  }
-  return [
-    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
-    ...details,
-    "",
-    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans or null. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
-  ].join("\n");
-}
-
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
@@ -489,6 +468,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     }
   }
 }
+var MCP_CALL_BUDGET_SEC = 170;
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -817,6 +797,68 @@ async function isRipgrepAvailable() {
   });
   cachedRgAvailable = !res.error && res.exitCode === 0;
   return cachedRgAvailable;
+}
+
+// src/tools/apply-edits.ts
+import { promises as fs2 } from "node:fs";
+import path3 from "node:path";
+
+// src/utils/arg-validation.ts
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function describeValueType(value) {
+  if (value === null) return "null";
+  if (value === void 0) return "undefined";
+  if (Array.isArray(value)) return `array (len=${value.length})`;
+  if (typeof value === "boolean") return `boolean (${String(value)})`;
+  if (typeof value === "number") return `number (${String(value)})`;
+  if (typeof value === "string") return `string (len=${value.length})`;
+  return typeof value;
+}
+function parseMaybeJsonArray(value) {
+  if (value === void 0) {
+    return { ok: false, kind: "missing", detail: "undefined" };
+  }
+  if (Array.isArray(value)) {
+    return { ok: true, value };
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return { ok: true, value: parsed };
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          kind: "invalid_json",
+          detail: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+  }
+  return {
+    ok: false,
+    kind: "wrong_type",
+    detail: describeValueType(value)
+  };
+}
+function formatCorruptedArrayError(options) {
+  const details = options.items.slice(0, 8).map(
+    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
+  );
+  if (options.items.length > 8) {
+    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
+  }
+  return [
+    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
+    ...details,
+    "",
+    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans or null. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
+  ].join("\n");
 }
 
 // src/utils/fs-utils.ts
@@ -1990,7 +2032,7 @@ ${summaryLines.join("\n")}`];
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
     const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
-    const timeoutMs = (Number.isFinite(rawTimeoutSec) ? Math.max(1, Math.min(300, Math.trunc(rawTimeoutSec))) : 60) * 1e3;
+    const timeoutMs = (Number.isFinite(rawTimeoutSec) ? Math.max(1, Math.min(MCP_CALL_BUDGET_SEC, Math.trunc(rawTimeoutSec))) : 60) * 1e3;
     const rawMaxVerifyChars = Number(input.maxVerifyChars ?? 4e3);
     const maxVerifyChars = Number.isFinite(rawMaxVerifyChars) ? Math.max(300, Math.min(7500, Math.trunc(rawMaxVerifyChars))) : 4e3;
     const res = await runShellCommandAsync(verifySpec.command, {
@@ -2498,13 +2540,6 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const args = ["--no-messages", "--max-filesize", "2M"];
   if (summary || typeGlobs || query.multiline) args.push("--no-config");
   if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
-  if (query.outputMode === "count") {
-    args.push(query.multiline ? "--count-matches" : "--count", "--with-filename", "--null");
-  } else if (query.outputMode === "files_with_matches") {
-    args.push("--files-with-matches", "--null");
-  } else {
-    args.push("--json");
-  }
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
     args.push("--type", "agyfilter");
@@ -2514,9 +2549,6 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   }
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
-  }
-  if (!summary && contextLines > 0) {
-    args.push("-C", String(contextLines));
   }
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
@@ -2537,22 +2569,31 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  if (!summary && !query.multiline) args.push("--max-count", String(perFileCap + 1));
-  args.push("--", query.pattern, searchRoot);
-  const res = await execBinaryAsync("rg", args, {
-    cwd: baseCwd,
-    timeoutMs: 15e3,
-    maxOutputBytes: 2 * 1024 * 1024
-  });
-  if (res.error) {
-    throw new Error(`rg spawn error: ${res.error}`);
-  }
-  if (res.exitCode === 2) {
-    throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
-  }
+  const runRg = async (runArgs) => {
+    const res2 = await execBinaryAsync("rg", runArgs, {
+      cwd: baseCwd,
+      timeoutMs: 15e3,
+      maxOutputBytes: 2 * 1024 * 1024
+    });
+    if (res2.error) {
+      throw new Error(`rg spawn error: ${res2.error}`);
+    }
+    if (res2.exitCode === 2) {
+      throw new Error(res2.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
+    }
+    return res2;
+  };
+  const cutShort = (res2) => res2.truncated || res2.timedOut || res2.exitCode === null;
   if (summary) {
+    const res2 = await runRg([
+      ...args,
+      ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
     const files2 = [];
-    const out = res.stdout;
+    const out = res2.stdout;
     let pos = 0;
     while (pos < out.length) {
       const nul = out.indexOf("\0", pos);
@@ -2575,31 +2616,51 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files2.length > maxResults || res.truncated || res.timedOut || res.exitCode === null
+      truncated: files2.length > maxResults || cutShort(res2)
     };
   }
+  const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
+  const counts = await runRg([
+    ...args,
+    ...maxCountArgs,
+    "--count",
+    "--with-filename",
+    "--null",
+    "--",
+    query.pattern,
+    searchRoot
+  ]);
+  const counted = [];
+  for (const record of counts.stdout.split("\n").slice(0, -1)) {
+    const sep = record.lastIndexOf("\0");
+    const count = Number(record.slice(sep + 1));
+    if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
+    const rawFile = record.slice(0, sep);
+    if (!matchesType(rawFile)) continue;
+    counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+  }
+  counted.sort((a, b) => a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0);
+  const chosen = [];
+  let coveredMatches = 0;
+  for (const item of counted) {
+    if (coveredMatches >= maxResults) break;
+    chosen.push(item);
+    coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+  }
+  let truncated = cutShort(counts) || chosen.length < counted.length;
+  if (chosen.length === 0) {
+    return { files: [], totalMatches: 0, truncated };
+  }
+  const res = await runRg([
+    ...args,
+    ...maxCountArgs,
+    "--json",
+    ...contextLines > 0 ? ["-C", String(contextLines)] : [],
+    "--",
+    query.pattern,
+    ...chosen.map((item) => item.rawFile)
+  ]);
   const byFile = /* @__PURE__ */ new Map();
-  const matchCountByFile = /* @__PURE__ */ new Map();
-  let totalMatches = 0;
-  let truncated = false;
-  let pendingBeforeContext = [];
-  let lastKeptMatchFile = "";
-  let lastKeptMatchLine = -1;
-  const upsertLine = (relFile, entry) => {
-    let lineMap = byFile.get(relFile);
-    if (!lineMap) {
-      lineMap = /* @__PURE__ */ new Map();
-      byFile.set(relFile, lineMap);
-    }
-    const existing = lineMap.get(entry.lineNumber);
-    if (!existing || entry.isMatch) {
-      lineMap.set(entry.lineNumber, {
-        lineNumber: entry.lineNumber,
-        text: entry.text,
-        isMatch: entry.isMatch || Boolean(existing?.isMatch)
-      });
-    }
-  };
   for (const rawLine of res.stdout.split("\n")) {
     if (!rawLine.trim()) continue;
     let ev;
@@ -2608,70 +2669,58 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     } catch {
       continue;
     }
-    if (ev.type === "begin" || ev.type === "end") {
-      pendingBeforeContext = [];
-      lastKeptMatchFile = "";
-      lastKeptMatchLine = -1;
-      continue;
-    }
     if (ev.type !== "match" && ev.type !== "context") continue;
     const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
     const lineNumber = ev.data?.line_number;
     const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
+    if (!rawFile || typeof lineNumber !== "number") continue;
+    const relFile = relativeFile(baseCwd, rawFile);
+    let lineMap = byFile.get(relFile);
+    if (!lineMap) {
+      lineMap = /* @__PURE__ */ new Map();
+      byFile.set(relFile, lineMap);
+    }
+    const isMatch = ev.type === "match";
     const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || !matchesType(rawFile) || typeof lineNumber !== "number") continue;
-    const absFile = path4.isAbsolute(rawFile) ? rawFile : path4.resolve(baseCwd, rawFile);
-    const relFile = toPosixPath(path4.relative(baseCwd, absFile)) || path4.basename(absFile);
-    if (ev.type === "context") {
-      if (lastKeptMatchFile === relFile && lastKeptMatchLine !== -1 && lineNumber > lastKeptMatchLine && lineNumber <= lastKeptMatchLine + contextLines) {
-        upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (totalMatches < maxResults && (query.multiline || (matchCountByFile.get(relFile) ?? 0) < perFileCap)) {
-        pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
-      }
-      continue;
-    }
-    const fileHits = matchCountByFile.get(relFile) ?? 0;
-    if (totalMatches >= maxResults || !query.multiline && fileHits >= perFileCap) {
-      truncated = true;
-      pendingBeforeContext = [];
-      continue;
-    }
-    for (const ctx of pendingBeforeContext) {
-      if (ctx.relFile === relFile) {
-        upsertLine(ctx.relFile, {
-          lineNumber: ctx.lineNumber,
-          text: ctx.text,
-          isMatch: false
-        });
-      }
-    }
-    pendingBeforeContext = [];
-    const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
-    lastKeptMatchFile = relFile;
-    let addedForFile = fileHits;
+    const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
     for (const [offset, text] of segments.entries()) {
       const line = lineNumber + offset;
-      if (byFile.get(relFile)?.get(line)?.isMatch) continue;
-      if (totalMatches >= maxResults || !query.multiline && addedForFile >= perFileCap) {
-        truncated = true;
-        break;
-      }
-      upsertLine(relFile, { lineNumber: line, text, isMatch: true });
-      lastKeptMatchLine = line;
-      totalMatches++;
-      addedForFile++;
+      if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
     }
-    matchCountByFile.set(relFile, addedForFile);
   }
-  const files = [...byFile.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([file, lineMap]) => ({
-    file,
-    lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
-  }));
-  return {
-    files,
-    totalMatches,
-    truncated: truncated || res.truncated || res.timedOut || res.exitCode === null
-  };
+  const files = [];
+  let totalMatches = 0;
+  for (const { relFile, count } of chosen) {
+    if (totalMatches >= maxResults) {
+      truncated = true;
+      break;
+    }
+    const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
+    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const sorted = [...byFile.get(relFile)?.values() ?? []].sort(
+      (a, b) => a.lineNumber - b.lineNumber
+    );
+    const lines = [];
+    let kept = 0;
+    let lastKeptMatchLine = -1;
+    for (const line of sorted) {
+      if (line.isMatch) {
+        if (kept === budget) {
+          truncated = true;
+          continue;
+        }
+        kept += 1;
+        lastKeptMatchLine = line.lineNumber;
+        lines.push(line);
+      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+        lines.push(line);
+      }
+    }
+    if (kept === 0) continue;
+    files.push({ file: relFile, lines });
+    totalMatches += kept;
+  }
+  return { files, totalMatches, truncated: truncated || cutShort(res) };
 }
 function* multilineMatches(content, regex) {
   let previousEnd = -1;
@@ -2764,13 +2813,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     });
     discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path4.join(searchRoot, rel));
-    if (summary) {
-      targetFiles.sort((a, b) => {
-        const ra = relativeFile(baseCwd, a);
-        const rb = relativeFile(baseCwd, b);
-        return ra < rb ? -1 : ra > rb ? 1 : 0;
-      });
-    }
+    targetFiles.sort((a, b) => {
+      const ra = relativeFile(baseCwd, a);
+      const rb = relativeFile(baseCwd, b);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
   }
   const files = [];
   let totalMatches = 0;
@@ -3755,16 +3802,15 @@ function extractTsJsSymbols(lines) {
 function extractPythonSymbols(lines) {
   const symbols = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
-  const inTripleString = new Array(lines.length).fill(false);
-  const openParens = new Array(lines.length).fill(0);
-  const closeParens = new Array(lines.length).fill(0);
+  const isContinuation = new Array(lines.length).fill(false);
   let activeQuote = null;
+  let bracketDepth = 0;
+  let backslashContinued = false;
   for (let i = 0; i < lines.length; i++) {
-    inTripleString[i] = activeQuote !== null;
+    isContinuation[i] = activeQuote !== null || bracketDepth > 0 || backslashContinued;
     const line = lines[i];
+    backslashContinued = false;
     let j = 0;
-    let op = 0;
-    let cp = 0;
     while (j < line.length) {
       if (activeQuote) {
         if (line[j] === "\\") {
@@ -3799,53 +3845,53 @@ function extractPythonSymbols(lines) {
           j++;
           continue;
         }
-        if (line[j] === "(") op++;
-        else if (line[j] === ")") cp++;
+        if (line[j] === "(" || line[j] === "[" || line[j] === "{") bracketDepth++;
+        else if (line[j] === ")" || line[j] === "]" || line[j] === "}") {
+          bracketDepth = Math.max(0, bracketDepth - 1);
+        } else if (line[j] === "\\" && j === line.length - 1) backslashContinued = true;
         j++;
       }
     }
-    openParens[i] = op;
-    closeParens[i] = cp;
   }
+  const indentOf = (l) => (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
   const raw = [];
   for (let i = 0; i < lines.length; i++) {
-    if (inTripleString[i]) continue;
+    if (isContinuation[i]) continue;
     const m = re.exec(lines[i]);
     if (!m) continue;
     const indent = m[1].replace(/\t/g, "    ").length;
     const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3], startIdx: i });
+    raw.push({ indent, kind, name: m[3], defIdx: i });
   }
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx];
-    let headerEndIdx = item.startIdx;
-    let parenDepth = openParens[item.startIdx] - closeParens[item.startIdx];
-    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
-    while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
-      headerEndIdx++;
-      parenDepth += openParens[headerEndIdx] - closeParens[headerEndIdx];
+    let startIdx = item.defIdx;
+    for (let j = item.defIdx - 1; j >= 0; j--) {
+      if (isContinuation[j] || !lines[j].trim()) continue;
+      if (!lines[j].trimStart().startsWith("@")) break;
+      startIdx = j;
     }
-    if (parenDepth > 0) headerEndIdx = item.startIdx;
     let endIdx = lines.length - 1;
-    for (let j = headerEndIdx + 1; j < lines.length; j++) {
-      if (inTripleString[j]) continue;
+    for (let j = item.defIdx + 1; j < lines.length; j++) {
+      if (isContinuation[j]) continue;
       const l = lines[j];
       const trimmed = l.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
-      const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
-      if (curIndent <= item.indent) {
+      if (indentOf(l) <= item.indent) {
         endIdx = j - 1;
         break;
       }
     }
-    while (endIdx > headerEndIdx && !lines[endIdx].trim()) {
+    while (endIdx > item.defIdx) {
+      const trimmed = lines[endIdx].trim();
+      if (trimmed && !(trimmed.startsWith("#") && indentOf(lines[endIdx]) <= item.indent)) break;
       endIdx--;
     }
     symbols.push({
       kind: item.kind,
       name: item.name,
-      startLine: item.startIdx + 1,
-      endLine: Math.max(item.startIdx + 1, endIdx + 1),
+      startLine: startIdx + 1,
+      endLine: endIdx + 1,
       depth: item.indent > 0 ? 1 : 0
     });
   }
@@ -4869,7 +4915,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
   return results;
 }
-async function runChecks(input) {
+async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   const parsedCommands = parseMaybeJsonArray(input?.commands);
   if (!parsedCommands.ok) {
     if (parsedCommands.kind === "wrong_type" && (typeof input?.commands === "boolean" || input?.commands === null)) {
@@ -4933,7 +4979,7 @@ async function runChecks(input) {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
   const concurrency = clampInt2(input.concurrency ?? 4, 1, 8);
-  const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, 300);
+  const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, MCP_CALL_BUDGET_SEC);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
   const maxChars = clampInt2(input.maxChars ?? 8e3, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
@@ -4967,7 +5013,7 @@ async function runChecks(input) {
     const cmdTimeoutSec = clampInt2(
       spec.timeoutSec ?? defaultTimeoutSec,
       1,
-      300
+      MCP_CALL_BUDGET_SEC
     );
     normalized.push({
       index: i,
@@ -4978,13 +5024,16 @@ async function runChecks(input) {
     });
   }
   const wallStart = Date.now();
+  const deadline = wallStart + budgetMs;
   const outcomes = await mapWithConcurrency(
     normalized,
     concurrency,
     async (spec) => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return { spec, result: null, passed: false };
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
-        timeoutMs: spec.timeoutMs
+        timeoutMs: Math.min(spec.timeoutMs, remainingMs)
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
       return { spec, result, passed };
@@ -4992,8 +5041,16 @@ async function runChecks(input) {
   );
   const wallMs = Date.now() - wallStart;
   const passedCount = outcomes.filter((o) => o.passed).length;
-  const failedCount = outcomes.length - passedCount;
-  const summaryHeader = failedCount === 0 ? `Checks: ${passedCount}/${outcomes.length} passed (wall: ${wallMs}ms)` : `Checks: ${passedCount}/${outcomes.length} passed, ${failedCount} failed (wall: ${wallMs}ms)`;
+  const notRunCount = outcomes.filter((o) => !o.result).length;
+  const failedCount = outcomes.length - passedCount - notRunCount;
+  const counts = [`${passedCount}/${outcomes.length} passed`];
+  if (failedCount > 0) counts.push(`${failedCount} failed`);
+  if (notRunCount > 0) {
+    counts.push(
+      `${notRunCount} not run (call time budget of ${Math.round(budgetMs / 1e3)}s used up; run them in another call)`
+    );
+  }
+  const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
   const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
   const failedBudget = failedCount > 0 ? Math.max(160, Math.floor((usableChars - passedCount * 120) / failedCount)) : 320;
   const fullPerCmdBudget = Math.max(
@@ -5001,6 +5058,8 @@ async function runChecks(input) {
     Math.floor(usableChars / outcomes.length)
   );
   const blocks = outcomes.map(({ spec, result, passed }) => {
+    if (!result) return `## [NOT RUN] ${spec.name}
+$ ${spec.command}`;
     const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
     if (outputMode === "full") {
       const combined = [
@@ -5056,7 +5115,10 @@ var SERVER_VERSION = "0.2.6";
 function createAgyFastServer() {
   const server = new McpStdioServer({
     name: "agy-fast",
-    version: SERVER_VERSION
+    version: SERVER_VERSION,
+    // agy starts plugin servers in the plugin directory; relative paths and
+    // the default cwd of every tool must resolve against the workspace instead.
+    onWorkspaceRoots: (paths) => process.chdir(paths[0])
   });
   server.registerTool(
     {
@@ -5067,7 +5129,7 @@ function createAgyFastServer() {
         properties: {
           cwd: {
             type: "string",
-            description: "Workspace directory (defaults to current working directory)."
+            description: "Base directory for relative paths (defaults to the first workspace root)."
           },
           queries: {
             type: "array",
@@ -5152,7 +5214,7 @@ function createAgyFastServer() {
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative file paths and verify command."
+            description: "Base directory for relative file paths and verify command (defaults to the first workspace root)."
           },
           edits: {
             type: "array",
@@ -5215,8 +5277,8 @@ function createAgyFastServer() {
           verifyTimeoutSec: {
             type: "integer",
             minimum: 1,
-            maximum: 300,
-            description: "Optional timeout in seconds for the verify command (default 60)."
+            maximum: MCP_CALL_BUDGET_SEC,
+            description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`
           },
           maxVerifyChars: {
             type: "integer",
@@ -5237,7 +5299,10 @@ function createAgyFastServer() {
       inputSchema: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root)."
+          },
           outlines: {
             type: "array",
             maxItems: 40,
@@ -5284,7 +5349,10 @@ function createAgyFastServer() {
       inputSchema: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root)."
+          },
           commands: {
             type: "array",
             minItems: 1,
@@ -5296,7 +5364,7 @@ function createAgyFastServer() {
                 name: { type: "string", description: "Short label (e.g. 'typecheck')." },
                 command: { type: "string", description: "Shell command to run." },
                 cwd: { type: "string", description: "Optional working directory override." },
-                timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
+                timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
               },
               required: ["command"]
             }
@@ -5310,8 +5378,8 @@ function createAgyFastServer() {
           timeoutSec: {
             type: "integer",
             minimum: 1,
-            maximum: 300,
-            description: "Default per-command timeout in seconds (default 60)."
+            maximum: MCP_CALL_BUDGET_SEC,
+            description: `Default per-command timeout in seconds (default 60). All commands of one call share a ${MCP_CALL_BUDGET_SEC}s budget because agy drops MCP results after 180s; commands that cannot start within it are reported as not run.`
           },
           outputMode: {
             type: "string",
