@@ -1,4 +1,5 @@
 import { McpStdioServer } from "./protocol/mcp.js";
+import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
 import { runBatchSearch, type BatchSearchInput } from "./tools/batch-search.js";
 import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
@@ -178,8 +179,8 @@ export function createAgyFastServer(): McpStdioServer {
           verifyTimeoutSec: {
             type: "integer",
             minimum: 1,
-            maximum: 300,
-            description: "Optional timeout in seconds for the verify command (default 60).",
+            maximum: MCP_CALL_BUDGET_SEC,
+            description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`,
           },
           maxVerifyChars: {
             type: "integer",
@@ -269,7 +270,7 @@ export function createAgyFastServer(): McpStdioServer {
                 name: { type: "string", description: "Short label (e.g. 'typecheck')." },
                 command: { type: "string", description: "Shell command to run." },
                 cwd: { type: "string", description: "Optional working directory override." },
-                timeoutSec: { type: "integer", minimum: 1, maximum: 300 },
+                timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
               },
               required: ["command"],
             },
@@ -283,8 +284,8 @@ export function createAgyFastServer(): McpStdioServer {
           timeoutSec: {
             type: "integer",
             minimum: 1,
-            maximum: 300,
-            description: "Default per-command timeout in seconds (default 60).",
+            maximum: MCP_CALL_BUDGET_SEC,
+            description: `Default per-command timeout in seconds (default 60). All commands of one call share a ${MCP_CALL_BUDGET_SEC}s budget because agy drops MCP results after 180s; commands that cannot start within it are reported as not run.`,
           },
           outputMode: {
             type: "string",

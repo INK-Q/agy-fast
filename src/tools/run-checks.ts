@@ -5,7 +5,7 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
+import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
 import { resolvePath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
@@ -42,7 +42,8 @@ interface NormalizedCommand {
 
 interface CheckRunOutcome {
   spec: NormalizedCommand;
-  result: ExecResult;
+  /** null when the call budget ran out before the command could start. */
+  result: ExecResult | null;
   passed: boolean;
 }
 
@@ -69,6 +70,7 @@ async function mapWithConcurrency<T, R>(
 
 export async function runChecks(
   input: RunChecksInput,
+  budgetMs = MCP_CALL_BUDGET_SEC * 1000,
 ): Promise<{ text: string; isError: boolean }> {
   const parsedCommands = parseMaybeJsonArray(input?.commands);
   if (!parsedCommands.ok) {
@@ -139,7 +141,7 @@ export async function runChecks(
   }
 
   const concurrency = clampInt(input.concurrency ?? 4, 1, 8);
-  const defaultTimeoutSec = clampInt(input.timeoutSec ?? 60, 1, 300);
+  const defaultTimeoutSec = clampInt(input.timeoutSec ?? 60, 1, MCP_CALL_BUDGET_SEC);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
   const maxChars = clampInt(input.maxChars ?? 8_000, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
@@ -175,7 +177,7 @@ export async function runChecks(
     const cmdTimeoutSec = clampInt(
       spec.timeoutSec ?? defaultTimeoutSec,
       1,
-      300,
+      MCP_CALL_BUDGET_SEC,
     );
     normalized.push({
       index: i,
@@ -187,13 +189,16 @@ export async function runChecks(
   }
 
   const wallStart = Date.now();
+  const deadline = wallStart + budgetMs;
   const outcomes = await mapWithConcurrency<NormalizedCommand, CheckRunOutcome>(
     normalized,
     concurrency,
     async (spec) => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return { spec, result: null, passed: false };
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
-        timeoutMs: spec.timeoutMs,
+        timeoutMs: Math.min(spec.timeoutMs, remainingMs),
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
       return { spec, result, passed };
@@ -202,12 +207,17 @@ export async function runChecks(
   const wallMs = Date.now() - wallStart;
 
   const passedCount = outcomes.filter((o) => o.passed).length;
-  const failedCount = outcomes.length - passedCount;
+  const notRunCount = outcomes.filter((o) => !o.result).length;
+  const failedCount = outcomes.length - passedCount - notRunCount;
 
-  const summaryHeader =
-    failedCount === 0
-      ? `Checks: ${passedCount}/${outcomes.length} passed (wall: ${wallMs}ms)`
-      : `Checks: ${passedCount}/${outcomes.length} passed, ${failedCount} failed (wall: ${wallMs}ms)`;
+  const counts = [`${passedCount}/${outcomes.length} passed`];
+  if (failedCount > 0) counts.push(`${failedCount} failed`);
+  if (notRunCount > 0) {
+    counts.push(
+      `${notRunCount} not run (call time budget of ${Math.round(budgetMs / 1000)}s used up; run them in another call)`,
+    );
+  }
+  const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
 
   // Allocate larger output share to failing checks than passing checks
   const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
@@ -221,6 +231,7 @@ export async function runChecks(
   );
 
   const blocks = outcomes.map(({ spec, result, passed }) => {
+    if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
     const badge = result.error
       ? "ERROR"
       : result.timedOut

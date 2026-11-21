@@ -6,7 +6,7 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { runShellCommandAsync } from "../utils/exec-utils.js";
+import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
@@ -928,7 +928,7 @@ export async function runApplyEdits(
     const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
     const timeoutMs =
       (Number.isFinite(rawTimeoutSec)
-        ? Math.max(1, Math.min(300, Math.trunc(rawTimeoutSec)))
+        ? Math.max(1, Math.min(MCP_CALL_BUDGET_SEC, Math.trunc(rawTimeoutSec)))
         : 60) * 1000;
     const rawMaxVerifyChars = Number(input.maxVerifyChars ?? 4000);
     const maxVerifyChars = Number.isFinite(rawMaxVerifyChars)
