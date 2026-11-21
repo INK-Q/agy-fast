@@ -285,6 +285,47 @@ describe("read_slices", () => {
     );
   });
 
+  it("ends Python symbols after multi-line signatures and includes decorators", () => {
+    const pySyms = extractSymbols(
+      "model.py",
+      [
+        "class Model:",
+        "    def __init__(",
+        "        self,",
+        "        size: int,",
+        "    ) -> None:",
+        "        self.size = size",
+        "        self.table = {",
+        "    'k': 1,",
+        "        }",
+        "",
+        "    @property",
+        "    @functools.lru_cache(",
+        "        maxsize=8,",
+        "    )",
+        "    def area(self) -> int:",
+        "        return self.size \\",
+        "* 2",
+        "",
+        "# --- helpers ---",
+        "",
+        "def build(",
+        "    size: int,",
+        "):",
+        "    return Model(size)",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      pySyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "class:Model:1-17",
+        "method:__init__:2-9",
+        "method:area:11-17",
+        "function:build:21-24",
+      ],
+    );
+  });
+
   it("extracts Vue SFC blocks, CSS structure, TS no-semi types, multiline object-param functions, and Fastify routes", () => {
     const vueSyms = extractSymbols(
       "App.vue",

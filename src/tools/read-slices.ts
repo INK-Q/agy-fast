@@ -596,17 +596,18 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
 
-  // Pre-compute triple-quoted multiline string state and paren balance per line
-  const inTripleString = new Array<boolean>(lines.length).fill(false);
-  const openParens = new Array<number>(lines.length).fill(0);
-  const closeParens = new Array<number>(lines.length).fill(0);
+  // Pre-compute whether each line continues the previous logical line: it starts
+  // inside a triple-quoted string, inside open brackets (multi-line signatures,
+  // calls, literals), or after a backslash continuation.
+  const isContinuation = new Array<boolean>(lines.length).fill(false);
   let activeQuote: '"""' | "'''" | null = null;
+  let bracketDepth = 0;
+  let backslashContinued = false;
   for (let i = 0; i < lines.length; i++) {
-    inTripleString[i] = activeQuote !== null;
+    isContinuation[i] = activeQuote !== null || bracketDepth > 0 || backslashContinued;
     const line = lines[i]!;
+    backslashContinued = false;
     let j = 0;
-    let op = 0;
-    let cp = 0;
     while (j < line.length) {
       if (activeQuote) {
         if (line[j] === "\\") {
@@ -641,57 +642,59 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
           j++;
           continue;
         }
-        if (line[j] === "(") op++;
-        else if (line[j] === ")") cp++;
+        if (line[j] === "(" || line[j] === "[" || line[j] === "{") bracketDepth++;
+        else if (line[j] === ")" || line[j] === "]" || line[j] === "}") {
+          bracketDepth = Math.max(0, bracketDepth - 1);
+        } else if (line[j] === "\\" && j === line.length - 1) backslashContinued = true;
         j++;
       }
     }
-    openParens[i] = op;
-    closeParens[i] = cp;
   }
 
-  const raw: Array<{ indent: number; kind: string; name: string; startIdx: number }> = [];
+  const indentOf = (l: string) => (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
+
+  const raw: Array<{ indent: number; kind: string; name: string; defIdx: number }> = [];
   for (let i = 0; i < lines.length; i++) {
-    if (inTripleString[i]) continue;
+    if (isContinuation[i]) continue;
     const m = re.exec(lines[i]!);
     if (!m) continue;
     const indent = m[1]!.replace(/\t/g, "    ").length;
     const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3]!, startIdx: i });
+    raw.push({ indent, kind, name: m[3]!, defIdx: i });
   }
 
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx]!;
-    // Advance past multiline signature parens before checking dedent
-    let headerEndIdx = item.startIdx;
-    let parenDepth = openParens[item.startIdx]! - closeParens[item.startIdx]!;
-    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
-    while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
-      headerEndIdx++;
-      parenDepth += openParens[headerEndIdx]! - closeParens[headerEndIdx]!;
+    // Decorators directly above the def belong to the symbol.
+    let startIdx = item.defIdx;
+    for (let j = item.defIdx - 1; j >= 0; j--) {
+      if (isContinuation[j] || !lines[j]!.trim()) continue;
+      if (!lines[j]!.trimStart().startsWith("@")) break;
+      startIdx = j;
     }
-    if (parenDepth > 0) headerEndIdx = item.startIdx;
-
     let endIdx = lines.length - 1;
-    for (let j = headerEndIdx + 1; j < lines.length; j++) {
-      if (inTripleString[j]) continue;
+    for (let j = item.defIdx + 1; j < lines.length; j++) {
+      if (isContinuation[j]) continue;
       const l = lines[j]!;
       const trimmed = l.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
-      const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
-      if (curIndent <= item.indent) {
+      if (indentOf(l) <= item.indent) {
         endIdx = j - 1;
         break;
       }
     }
-    while (endIdx > headerEndIdx && !lines[endIdx]!.trim()) {
+    // Trailing blank lines and comments at or left of the def indent introduce
+    // what follows, not this body.
+    while (endIdx > item.defIdx) {
+      const trimmed = lines[endIdx]!.trim();
+      if (trimmed && !(trimmed.startsWith("#") && indentOf(lines[endIdx]!) <= item.indent)) break;
       endIdx--;
     }
     symbols.push({
       kind: item.kind,
       name: item.name,
-      startLine: item.startIdx + 1,
-      endLine: Math.max(item.startIdx + 1, endIdx + 1),
+      startLine: startIdx + 1,
+      endLine: endIdx + 1,
       depth: item.indent > 0 ? 1 : 0,
     });
   }
