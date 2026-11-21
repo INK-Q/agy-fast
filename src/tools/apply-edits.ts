@@ -541,9 +541,17 @@ export async function runApplyEdits(
 ): Promise<{ text: string; isError: boolean }> {
   const parsedEdits = parseMaybeJsonArray(input?.edits);
   if (!parsedEdits.ok) {
-    if (parsedEdits.kind === "wrong_type" && (typeof input?.edits === "boolean" || input?.edits === null)) {
+    if (
+      parsedEdits.kind === "corrupted_literal" ||
+      (parsedEdits.kind === "wrong_type" &&
+        (typeof input?.edits === "boolean" || input?.edits === null))
+    ) {
       return corruptedEditsError([
-        { label: "edits", value: input.edits, expected: "an array of edit objects" },
+        {
+          label: "edits",
+          value: parsedEdits.kind === "corrupted_literal" ? parsedEdits.value : input.edits,
+          expected: "an array of edit objects",
+        },
       ]);
     }
     if (parsedEdits.kind === "invalid_json") {
@@ -553,16 +561,16 @@ export async function runApplyEdits(
       };
     }
     return {
-      text: "Error: 'edits' must be a non-empty array of file edit objects.",
+      text: "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
       isError: true,
     };
   }
   const rawEdits = parsedEdits.value;
-  // A model never means to send zero edits; on agy's Flash worker a long native
-  // array of edit objects reaches the server as [] with the payload lost.
+  // A model never means to send zero edits; on agy CLI 1.5.x a long native
+  // array of edit objects can reach the server as [] with the payload lost.
   if (rawEdits.length === 0) {
     return corruptedEditsError([
-      { label: "edits", value: input.edits, expected: "a non-empty array of edit objects" },
+      { label: "edits", value: rawEdits, expected: "a non-empty array of edit objects" },
     ]);
   }
   if (rawEdits.length > 50) {
@@ -588,7 +596,7 @@ export async function runApplyEdits(
       if (!parsedHunks.ok) {
         corruptedItems.push({
           label: `edits[${i}].hunks`,
-          value: rawEntry.hunks,
+          value: parsedHunks.kind === "corrupted_literal" ? parsedHunks.value : rawEntry.hunks,
           expected: "an array of hunk objects",
         });
         continue;

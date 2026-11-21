@@ -546,20 +546,41 @@ describe("apply_edits", () => {
     const file = path.join(tmpDir, "empty-edits.ts");
     await fs.writeFile(file, "export const y = 1;\n", "utf8");
 
-    // agy's Flash worker can deliver a long native edits array as [].
-    const emptyRes = await runApplyEdits({ cwd: tmpDir, edits: [] });
-    assert.equal(emptyRes.isError, true);
-    assert.match(emptyRes.text, /nested argument serialization corruption/i);
-    assert.match(emptyRes.text, /edits: received array \(len=0\)/);
-    assert.match(emptyRes.text, /Do NOT retry the same apply_edits payload/);
-    assert.match(emptyRes.text, /edit_file/);
+    // agy CLI 1.5.x can deliver a long native edits array as [] (or stringified "[]", "true", "null").
+    for (const emptyPayload of [[], "[]"]) {
+      const emptyRes = await runApplyEdits({ cwd: tmpDir, edits: emptyPayload as unknown as never[] });
+      assert.equal(emptyRes.isError, true);
+      assert.match(emptyRes.text, /nested argument serialization corruption/i);
+      assert.match(emptyRes.text, /edits: received array \(len=0\)/);
+      assert.match(emptyRes.text, /Do NOT retry the same apply_edits payload/);
+      assert.match(emptyRes.text, /edit_file/);
+    }
 
-    const badJson = await runApplyEdits({
-      cwd: tmpDir,
-      edits: '[{"path": "empty-edits.ts", "hunks": [{"target": "1;", "replacement": "2;"}]',
-    });
-    assert.equal(badJson.isError, true);
-    assert.match(badJson.text, /^Error: 'edits' is not a valid JSON array \(0 files modified\): \S/);
+    for (const [lit, expectedLabel] of [
+      ["true", /boolean \(true\)/],
+      ["false", /boolean \(false\)/],
+      ["null", /received null/],
+    ] as const) {
+      const litRes = await runApplyEdits({ cwd: tmpDir, edits: lit });
+      assert.equal(litRes.isError, true);
+      assert.match(litRes.text, /nested argument serialization corruption/i);
+      assert.match(litRes.text, expectedLabel);
+    }
+
+    // Truncated JSON, markdown-fenced JSON, and single-object JSON all surface invalid_json clearly
+    for (const badPayload of [
+      '[{"path": "empty-edits.ts", "hunks": [{"target": "1;", "replacement": "2;"}]',
+      '```json\n[{"path": "empty-edits.ts"}]\n```',
+      '{"path": "empty-edits.ts", "hunks": []}',
+    ]) {
+      const badJson = await runApplyEdits({ cwd: tmpDir, edits: badPayload });
+      assert.equal(badJson.isError, true);
+      assert.match(badJson.text, /^Error: 'edits' is not a valid JSON array \(0 files modified\): \S/);
+    }
+
+    const emptyStr = await runApplyEdits({ cwd: tmpDir, edits: "   " });
+    assert.equal(emptyStr.isError, true);
+    assert.match(emptyStr.text, /non-empty JSON array string \(or array\)/);
     assert.equal(await fs.readFile(file, "utf8"), "export const y = 1;\n");
   });
 
