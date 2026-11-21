@@ -1,4 +1,5 @@
 import type { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 export interface McpToolDefinition {
   name: string;
@@ -34,6 +35,12 @@ interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
+interface JsonRpcOutgoingRequest {
+  jsonrpc: "2.0";
+  id: string;
+  method: string;
+}
+
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -49,10 +56,44 @@ export class McpStdioServer {
   private inFlight = 0;
   private stdinEnded = false;
   private onDrainExit?: () => void;
+  private readonly onWorkspaceRoots?: (paths: string[]) => void;
+  private sendToClient?: (request: JsonRpcOutgoingRequest) => void;
+  private clientSupportsRoots = false;
+  private rootsRequestCount = 0;
+  private pendingRootsRequest?: { id: string; resolve: () => void };
+  private rootsReady: Promise<void> = Promise.resolve();
 
-  constructor(options: { name: string; version: string }) {
+  constructor(options: {
+    name: string;
+    version: string;
+    // Receives the client's workspace root directories (MCP roots).
+    onWorkspaceRoots?: (paths: string[]) => void;
+  }) {
     this.serverName = options.name;
     this.serverVersion = options.version;
+    this.onWorkspaceRoots = options.onWorkspaceRoots;
+  }
+
+  // Tool calls wait for the answer, so the first call already sees the roots.
+  private requestRoots(): void {
+    if (!this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) return;
+    this.rootsRequestCount += 1;
+    const id = `agy-fast-roots-${this.rootsRequestCount}`;
+    this.rootsReady = new Promise((resolve) => {
+      this.pendingRootsRequest = { id, resolve };
+    });
+    this.sendToClient({ jsonrpc: "2.0", id, method: "roots/list" });
+  }
+
+  private receiveRoots(result: unknown): void {
+    const roots = (result as { roots?: Array<{ uri?: unknown }> } | undefined)?.roots ?? [];
+    const paths = roots
+      .map((root) => root.uri)
+      .filter((uri): uri is string => typeof uri === "string" && uri.startsWith("file:"))
+      .map((uri) => fileURLToPath(uri));
+    if (paths.length > 0) {
+      this.onWorkspaceRoots?.(paths);
+    }
   }
 
   registerTool(definition: McpToolDefinition, handler: McpToolHandler): void {
@@ -74,6 +115,14 @@ export class McpStdioServer {
     const id = hasId ? (msg.id ?? null) : null;
     const method = typeof msg.method === "string" ? msg.method : "";
 
+    if (!method && this.pendingRootsRequest?.id === id) {
+      const { resolve } = this.pendingRootsRequest;
+      this.pendingRootsRequest = undefined;
+      this.receiveRoots((msg as { result?: unknown }).result);
+      resolve();
+      return null;
+    }
+
     if (!method) {
       return {
         jsonrpc: "2.0",
@@ -84,6 +133,9 @@ export class McpStdioServer {
 
     // Notifications (no id) must not produce a response
     if (!hasId) {
+      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
+        this.requestRoots();
+      }
       return null;
     }
 
@@ -95,6 +147,8 @@ export class McpStdioServer {
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested)
         ? requested
         : DEFAULT_PROTOCOL_VERSION;
+      const capabilities = msg.params?.capabilities as { roots?: unknown } | undefined;
+      this.clientSupportsRoots = Boolean(capabilities?.roots);
       return {
         jsonrpc: "2.0",
         id,
@@ -187,6 +241,7 @@ export class McpStdioServer {
       }
 
       try {
+        await this.rootsReady;
         const res = await tool.handler(args);
         return {
           jsonrpc: "2.0",
@@ -224,8 +279,10 @@ export class McpStdioServer {
     this.onDrainExit = onExit;
     let buffer: Buffer = Buffer.alloc(0);
 
+    // Requests to the client use the framing of the latest client message.
+    let clientUsesContentLength = false;
     const writeResponse = (
-      payload: JsonRpcResponse | JsonRpcResponse[],
+      payload: JsonRpcResponse | JsonRpcResponse[] | JsonRpcOutgoingRequest,
       useContentLength: boolean,
     ): void => {
       const serialized = JSON.stringify(payload);
@@ -237,7 +294,10 @@ export class McpStdioServer {
       }
     };
 
+    this.sendToClient = (request) => writeResponse(request, clientUsesContentLength);
+
     const dispatchRawJson = (jsonText: string, useContentLength: boolean): void => {
+      clientUsesContentLength = useContentLength;
       let parsed: unknown;
       try {
         parsed = JSON.parse(jsonText);

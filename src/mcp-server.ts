@@ -10,6 +10,9 @@ export function createAgyFastServer(): McpStdioServer {
   const server = new McpStdioServer({
     name: "agy-fast",
     version: SERVER_VERSION,
+    // agy starts plugin servers in the plugin directory; relative paths and
+    // the default cwd of every tool must resolve against the workspace instead.
+    onWorkspaceRoots: (paths) => process.chdir(paths[0]!),
   });
 
   server.registerTool(
@@ -22,7 +25,7 @@ export function createAgyFastServer(): McpStdioServer {
         properties: {
           cwd: {
             type: "string",
-            description: "Workspace directory (defaults to current working directory).",
+            description: "Base directory for relative paths (defaults to the first workspace root).",
           },
           queries: {
             type: "array",
@@ -110,7 +113,7 @@ export function createAgyFastServer(): McpStdioServer {
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative file paths and verify command.",
+            description: "Base directory for relative file paths and verify command (defaults to the first workspace root).",
           },
           edits: {
             type: "array",
@@ -199,7 +202,10 @@ export function createAgyFastServer(): McpStdioServer {
       inputSchema: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root).",
+          },
           outlines: {
             type: "array",
             maxItems: 40,
@@ -248,7 +254,10 @@ export function createAgyFastServer(): McpStdioServer {
       inputSchema: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root).",
+          },
           commands: {
             type: "array",
             minItems: 1,

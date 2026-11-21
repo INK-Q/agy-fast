@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
@@ -211,6 +212,48 @@ describe("MCP Stdio Server end-to-end", () => {
       byId.get(7)?.result as { content: Array<{ text: string }> }
     ).content[0]?.text;
     assert.match(checkText ?? "", /Checks: 1\/1 passed/);
+  });
+
+  it("resolves tool paths against the client's workspace root instead of its own cwd", async () => {
+    const msgs = [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: { roots: { listChanged: true } },
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      // Sent before the roots answer: the call must wait for it.
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "read_slices", arguments: { outlines: ["demo.ts"] } },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "agy-fast-roots-1",
+        result: { roots: [{ uri: pathToFileURL(tmpDir).href }] },
+      },
+    ];
+
+    const res = await sendMessagesToServer(msgs.map((m) => `${JSON.stringify(m)}\n`));
+    assert.equal(res.code, 0);
+    assert.equal(res.stderr, "");
+    const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(
+      lines.find((l) => l.method === "roots/list"),
+      { jsonrpc: "2.0", id: "agy-fast-roots-1", method: "roots/list" },
+    );
+    const call = lines.find((l) => l.id === 2);
+    assert.equal(call.result.isError, false);
+    assert.match(call.result.content[0].text, /greet/);
+    // The roots answer is consumed, not treated as an invalid request.
+    assert.equal(lines.filter((l) => l.error).length, 0);
   });
 
   it("handles JSON-RPC error codes, chunked UTF-8 input, and Content-Length framing", async () => {
