@@ -182,6 +182,11 @@ describe("MCP Stdio Server end-to-end", () => {
       toolList.map((t) => t.name),
       ["batch_search", "apply_edits", "read_slices", "run_checks"],
     );
+    // apply_edits takes its edits as one JSON string: agy can drop a long array of objects.
+    const applySchema = toolList.find((t) => t.name === "apply_edits")?.inputSchema as {
+      properties: { edits: { type: string } };
+    };
+    assert.equal(applySchema.properties.edits.type, "string");
     // Ensure schemas avoid oneOf/anyOf/allOf for maximum client compatibility
     for (const tool of toolList) {
       assert.equal(

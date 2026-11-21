@@ -542,6 +542,27 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(file, "utf8"), "export const x = 42;\n");
   });
 
+  it("treats an empty edits array as lost arguments and reports invalid JSON strings", async () => {
+    const file = path.join(tmpDir, "empty-edits.ts");
+    await fs.writeFile(file, "export const y = 1;\n", "utf8");
+
+    // agy's Flash worker can deliver a long native edits array as [].
+    const emptyRes = await runApplyEdits({ cwd: tmpDir, edits: [] });
+    assert.equal(emptyRes.isError, true);
+    assert.match(emptyRes.text, /nested argument serialization corruption/i);
+    assert.match(emptyRes.text, /edits: received array \(len=0\)/);
+    assert.match(emptyRes.text, /Do NOT retry the same apply_edits payload/);
+    assert.match(emptyRes.text, /edit_file/);
+
+    const badJson = await runApplyEdits({
+      cwd: tmpDir,
+      edits: '[{"path": "empty-edits.ts", "hunks": [{"target": "1;", "replacement": "2;"}]',
+    });
+    assert.equal(badJson.isError, true);
+    assert.match(badJson.text, /^Error: 'edits' is not a valid JSON array \(0 files modified\): \S/);
+    assert.equal(await fs.readFile(file, "utf8"), "export const y = 1;\n");
+  });
+
   function makeErrnoError(code: string, message: string): NodeJS.ErrnoException {
     const err = new Error(message) as NodeJS.ErrnoException;
     err.code = code;

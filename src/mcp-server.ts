@@ -104,7 +104,7 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "apply_edits",
       description:
-        "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+        "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command. Pass 'edits' as one JSON array string.",
       inputSchema: {
         type: "object",
         properties: {
@@ -113,50 +113,9 @@ export function createAgyFastServer(): McpStdioServer {
             description: "Base directory for relative file paths and verify command.",
           },
           edits: {
-            type: "array",
-            minItems: 1,
-            maxItems: 50,
-            description: "Files to edit or create.",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string" },
-                hunks: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      target: { type: "string", description: "Exact text to replace." },
-                      replacement: { type: "string", description: "Replacement text." },
-                      startLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based start line to narrow matching.",
-                      },
-                      endLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based end line to narrow matching.",
-                      },
-                      replaceAll: {
-                        type: "boolean",
-                        description: "Replace every occurrence in range (default false).",
-                      },
-                    },
-                    required: ["target", "replacement"],
-                  },
-                },
-                create: {
-                  type: "string",
-                  description: "Create file with this full content instead of hunks.",
-                },
-                overwrite: {
-                  type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'.",
-                },
-              },
-              required: ["path"],
-            },
+            type: "string",
+            description:
+              'JSON array string of 1-50 files to edit or create: [{"path", "hunks"?: [{"target", "replacement", "startLine"?, "endLine"?, "replaceAll"?}], "create"?, "overwrite"?}]. A hunk replaces exact target text (optional 1-based line window; replaceAll replaces every occurrence in it); "create" writes the whole file instead of hunks, and "overwrite" allows replacing an existing file. A native array is also accepted, but agy can deliver a long array of objects in call_mcp_tool Arguments as [] while a string arrives intact.',
           },
           dryRun: {
             type: "boolean",
