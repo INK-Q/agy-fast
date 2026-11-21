@@ -494,6 +494,89 @@ describe("batch_search", () => {
     }
   });
 
+  it("keeps the first matches in path order when maxResults truncates", async () => {
+    const manyDir = path.join(tmpDir, "many");
+    for (let i = 0; i < 40; i++) {
+      const sub = path.join(manyDir, `d${i % 4}`);
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(
+        path.join(sub, `f${String(i).padStart(2, "0")}.txt`),
+        "pre\nMANY_NEEDLE one\nmid\nMANY_NEEDLE two\npost\n",
+        "utf8",
+      );
+    }
+    const query = { type: "text" as const, pattern: "MANY_NEEDLE", contextLines: 1, maxResults: 7 };
+    const runs = await Promise.all(
+      Array.from({ length: 5 }, () => runBatchSearch({ cwd: manyDir, queries: [query] })),
+    );
+    const nodeRun = await runBatchSearch(
+      { cwd: manyDir, queries: [query] },
+      { forceNodeFallback: true },
+    );
+
+    // d0 holds f00, f04, f08, ...; two matches per file, so 7 matches end
+    // after the first match of the fourth file.
+    const expected = [
+      "d0/f00.txt",
+      "  1- pre",
+      "  2: MANY_NEEDLE one",
+      "  3- mid",
+      "  4: MANY_NEEDLE two",
+      "  5- post",
+      "d0/f04.txt",
+      "  1- pre",
+      "  2: MANY_NEEDLE one",
+      "  3- mid",
+      "  4: MANY_NEEDLE two",
+      "  5- post",
+      "d0/f08.txt",
+      "  1- pre",
+      "  2: MANY_NEEDLE one",
+      "  3- mid",
+      "  4: MANY_NEEDLE two",
+      "  5- post",
+      "d0/f12.txt",
+      "  1- pre",
+      "  2: MANY_NEEDLE one",
+      "  3- mid",
+      "... [truncated at 7 matches]",
+    ].join("\n");
+    for (const res of [...runs, nodeRun]) {
+      assert.equal(res.isError, false);
+      assert.ok(res.text.includes(expected), `Unexpected result set:\n${res.text}`);
+    }
+
+    // Each line of a multiline match counts as one match.
+    const multilineQuery = {
+      type: "regex" as const,
+      pattern: "MANY_NEEDLE one\\nmid",
+      multiline: true,
+      maxResults: 5,
+    };
+    const multilineRuns = await Promise.all(
+      Array.from({ length: 5 }, () => runBatchSearch({ cwd: manyDir, queries: [multilineQuery] })),
+    );
+    const multilineNodeRun = await runBatchSearch(
+      { cwd: manyDir, queries: [multilineQuery] },
+      { forceNodeFallback: true },
+    );
+    const multilineExpected = [
+      "d0/f00.txt",
+      "  2: MANY_NEEDLE one",
+      "  3: mid",
+      "d0/f04.txt",
+      "  2: MANY_NEEDLE one",
+      "  3: mid",
+      "d0/f08.txt",
+      "  2: MANY_NEEDLE one",
+      "... [truncated at 5 matches]",
+    ].join("\n");
+    for (const res of [...multilineRuns, multilineNodeRun]) {
+      assert.equal(res.isError, false);
+      assert.ok(res.text.includes(multilineExpected), `Unexpected result set:\n${res.text}`);
+    }
+  });
+
   it("tokenizes quoted arguments properly", () => {
     assert.deepEqual(tokenizeArgs(`log --grep="hello world" -n 3`), [
       "log",

@@ -6,7 +6,7 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { execBinaryAsync, isRipgrepAvailable } from "../utils/exec-utils.js";
+import { execBinaryAsync, isRipgrepAvailable, type ExecResult } from "../utils/exec-utils.js";
 import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
   globToRegExp,
@@ -509,13 +509,6 @@ async function runTextOrRegexWithRg(
   const args = ["--no-messages", "--max-filesize", "2M"];
   if (summary || typeGlobs || query.multiline) args.push("--no-config");
   if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
-  if (query.outputMode === "count") {
-    args.push(query.multiline ? "--count-matches" : "--count", "--with-filename", "--null");
-  } else if (query.outputMode === "files_with_matches") {
-    args.push("--files-with-matches", "--null");
-  } else {
-    args.push("--json");
-  }
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
     args.push("--type", "agyfilter");
@@ -526,9 +519,6 @@ async function runTextOrRegexWithRg(
   }
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
-  }
-  if (!summary && contextLines > 0) {
-    args.push("-C", String(contextLines));
   }
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
@@ -550,25 +540,35 @@ async function runTextOrRegexWithRg(
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  // Request perFileCap + 1 so hitting the per-file cap still surfaces a sentinel match for `truncated`
-  if (!summary && !query.multiline) args.push("--max-count", String(perFileCap + 1));
-  args.push("--", query.pattern, searchRoot);
 
-  const res = await execBinaryAsync("rg", args, {
-    cwd: baseCwd,
-    timeoutMs: 15_000,
-    maxOutputBytes: 2 * 1024 * 1024,
-  });
-
-  if (res.error) {
-    throw new Error(`rg spawn error: ${res.error}`);
-  }
-  // rg exit code 0 = matches found, 1 = no matches, 2 = error (e.g. bad regex)
-  if (res.exitCode === 2) {
-    throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
-  }
+  const runRg = async (runArgs: string[]): Promise<ExecResult> => {
+    const res = await execBinaryAsync("rg", runArgs, {
+      cwd: baseCwd,
+      timeoutMs: 15_000,
+      maxOutputBytes: 2 * 1024 * 1024,
+    });
+    if (res.error) {
+      throw new Error(`rg spawn error: ${res.error}`);
+    }
+    // rg exit code 0 = matches found, 1 = no matches, 2 = error (e.g. bad regex)
+    if (res.exitCode === 2) {
+      throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
+    }
+    return res;
+  };
+  const cutShort = (res: ExecResult): boolean =>
+    res.truncated || res.timedOut || res.exitCode === null;
 
   if (summary) {
+    const res = await runRg([
+      ...args,
+      ...(query.outputMode === "count"
+        ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"]
+        : ["--files-with-matches", "--null"]),
+      "--",
+      query.pattern,
+      searchRoot,
+    ]);
     const files: FileMatches[] = [];
     const out = res.stdout;
     let pos = 0;
@@ -593,34 +593,61 @@ async function runTextOrRegexWithRg(
     return {
       files: files.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files.length > maxResults || res.truncated || res.timedOut || res.exitCode === null,
+      truncated: files.length > maxResults || cutShort(res),
     };
   }
 
+  // rg reports files in thread order, so the kept files are chosen from per-file
+  // counts in path order, and only those files are searched for lines.
+  // Request perFileCap + 1 so hitting the per-file cap still shows as `truncated`.
+  const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
+  const counts = await runRg([
+    ...args,
+    ...maxCountArgs,
+    "--count",
+    "--with-filename",
+    "--null",
+    "--",
+    query.pattern,
+    searchRoot,
+  ]);
+  const counted: Array<{ rawFile: string; relFile: string; count: number }> = [];
+  // The text after the last newline is empty or a record cut by the output budget.
+  for (const record of counts.stdout.split("\n").slice(0, -1)) {
+    const sep = record.lastIndexOf("\0");
+    const count = Number(record.slice(sep + 1));
+    if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
+    const rawFile = record.slice(0, sep);
+    if (!matchesType(rawFile)) continue;
+    counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+  }
+  counted.sort((a, b) => (a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0));
+
+  // A multiline count is a lower bound on the matched lines, so the chosen files
+  // still cover maxResults.
+  const chosen: typeof counted = [];
+  let coveredMatches = 0;
+  for (const item of counted) {
+    if (coveredMatches >= maxResults) break;
+    chosen.push(item);
+    coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+  }
+  let truncated = cutShort(counts) || chosen.length < counted.length;
+  if (chosen.length === 0) {
+    return { files: [], totalMatches: 0, truncated };
+  }
+
+  const res = await runRg([
+    ...args,
+    ...maxCountArgs,
+    "--json",
+    ...(contextLines > 0 ? ["-C", String(contextLines)] : []),
+    "--",
+    query.pattern,
+    ...chosen.map((item) => item.rawFile),
+  ]);
+
   const byFile = new Map<string, Map<number, SearchLine>>();
-  const matchCountByFile = new Map<string, number>();
-  let totalMatches = 0;
-  let truncated = false;
-  let pendingBeforeContext: Array<{ relFile: string; lineNumber: number; text: string }> = [];
-  let lastKeptMatchFile = "";
-  let lastKeptMatchLine = -1;
-
-  const upsertLine = (relFile: string, entry: SearchLine): void => {
-    let lineMap = byFile.get(relFile);
-    if (!lineMap) {
-      lineMap = new Map<number, SearchLine>();
-      byFile.set(relFile, lineMap);
-    }
-    const existing = lineMap.get(entry.lineNumber);
-    if (!existing || entry.isMatch) {
-      lineMap.set(entry.lineNumber, {
-        lineNumber: entry.lineNumber,
-        text: entry.text,
-        isMatch: entry.isMatch || Boolean(existing?.isMatch),
-      });
-    }
-  };
-
   for (const rawLine of res.stdout.split("\n")) {
     if (!rawLine.trim()) continue;
     let ev: {
@@ -636,13 +663,6 @@ async function runTextOrRegexWithRg(
     } catch {
       continue;
     }
-
-    if (ev.type === "begin" || ev.type === "end") {
-      pendingBeforeContext = [];
-      lastKeptMatchFile = "";
-      lastKeptMatchLine = -1;
-      continue;
-    }
     if (ev.type !== "match" && ev.type !== "context") continue;
     const rawFile =
       ev.data?.path?.text ??
@@ -651,76 +671,63 @@ async function runTextOrRegexWithRg(
     const rawText =
       ev.data?.lines?.text ??
       (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
+    if (!rawFile || typeof lineNumber !== "number") continue;
+
+    const relFile = relativeFile(baseCwd, rawFile);
+    let lineMap = byFile.get(relFile);
+    if (!lineMap) {
+      lineMap = new Map<number, SearchLine>();
+      byFile.set(relFile, lineMap);
+    }
+    const isMatch = ev.type === "match";
     const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || !matchesType(rawFile) || typeof lineNumber !== "number") continue;
-
-    const absFile = path.isAbsolute(rawFile) ? rawFile : path.resolve(baseCwd, rawFile);
-    const relFile = toPosixPath(path.relative(baseCwd, absFile)) || path.basename(absFile);
-
-    if (ev.type === "context") {
-      if (
-        lastKeptMatchFile === relFile &&
-        lastKeptMatchLine !== -1 &&
-        lineNumber > lastKeptMatchLine &&
-        lineNumber <= lastKeptMatchLine + contextLines
-      ) {
-        upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (
-        totalMatches < maxResults &&
-        (query.multiline || (matchCountByFile.get(relFile) ?? 0) < perFileCap)
-      ) {
-        pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
-      }
-      continue;
-    }
-
-    // ev.type === "match"
-    const fileHits = matchCountByFile.get(relFile) ?? 0;
-    if (totalMatches >= maxResults || (!query.multiline && fileHits >= perFileCap)) {
-      truncated = true;
-      pendingBeforeContext = [];
-      continue;
-    }
-    for (const ctx of pendingBeforeContext) {
-      if (ctx.relFile === relFile) {
-        upsertLine(ctx.relFile, {
-          lineNumber: ctx.lineNumber,
-          text: ctx.text,
-          isMatch: false,
-        });
-      }
-    }
-    pendingBeforeContext = [];
-    const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
-    lastKeptMatchFile = relFile;
-    let addedForFile = fileHits;
+    // A multiline match event spans several lines; each one counts as a match.
+    const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
     for (const [offset, text] of segments.entries()) {
       const line = lineNumber + offset;
-      if (byFile.get(relFile)?.get(line)?.isMatch) continue;
-      if (totalMatches >= maxResults || (!query.multiline && addedForFile >= perFileCap)) {
-        truncated = true;
-        break;
-      }
-      upsertLine(relFile, { lineNumber: line, text, isMatch: true });
-      lastKeptMatchLine = line;
-      totalMatches++;
-      addedForFile++;
+      if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
     }
-    matchCountByFile.set(relFile, addedForFile);
   }
 
-  const files: FileMatches[] = [...byFile.entries()]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([file, lineMap]) => ({
-      file,
-      lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber),
-    }));
+  // Keep matches in path and line order up to maxResults. Without multiline, a
+  // file keeps at most its counted matches: rg searches an explicitly named
+  // binary file past the NUL byte at which the counting pass stopped.
+  const files: FileMatches[] = [];
+  let totalMatches = 0;
+  for (const { relFile, count } of chosen) {
+    if (totalMatches >= maxResults) {
+      truncated = true;
+      break;
+    }
+    const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
+    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const sorted = [...(byFile.get(relFile)?.values() ?? [])].sort(
+      (a, b) => a.lineNumber - b.lineNumber,
+    );
+    const lines: SearchLine[] = [];
+    let kept = 0;
+    let lastKeptMatchLine = -1;
+    for (const line of sorted) {
+      if (line.isMatch) {
+        if (kept === budget) {
+          truncated = true;
+          continue;
+        }
+        kept += 1;
+        lastKeptMatchLine = line.lineNumber;
+        lines.push(line);
+      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+        // Before the budget is spent, a context line belongs to a kept match;
+        // afterwards only the after-context of the last kept match remains.
+        lines.push(line);
+      }
+    }
+    if (kept === 0) continue;
+    files.push({ file: relFile, lines });
+    totalMatches += kept;
+  }
 
-  return {
-    files,
-    totalMatches,
-    truncated: truncated || res.truncated || res.timedOut || res.exitCode === null,
-  };
+  return { files, totalMatches, truncated: truncated || cutShort(res) };
 }
 
 function* multilineMatches(content: string, regex: RegExp): Generator<RegExpMatchArray> {
@@ -829,14 +836,13 @@ async function runTextOrRegexWithNode(
       fileFilter: globMatchesFile,
     });
     discoveryTruncated = walked.truncated;
+    // Subdirectories are walked concurrently; scan in path order like the rg backend.
     targetFiles = walked.files.map((rel) => path.join(searchRoot, rel));
-    if (summary) {
-      targetFiles.sort((a, b) => {
-        const ra = relativeFile(baseCwd, a);
-        const rb = relativeFile(baseCwd, b);
-        return ra < rb ? -1 : ra > rb ? 1 : 0;
-      });
-    }
+    targetFiles.sort((a, b) => {
+      const ra = relativeFile(baseCwd, a);
+      const rb = relativeFile(baseCwd, b);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
   }
 
   const files: FileMatches[] = [];
