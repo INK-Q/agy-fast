@@ -2127,7 +2127,10 @@ var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "shortlog",
   "describe",
   "tag",
-  "remote"
+  "remote",
+  "grep",
+  "rev-list",
+  "cat-file"
 ]);
 var FORBIDDEN_GIT_GLOBAL_FLAGS = /* @__PURE__ */ new Set([
   "-c",
@@ -2206,6 +2209,24 @@ var ALLOWED_TAG_VALUE_FLAGS = /* @__PURE__ */ new Set([
 ]);
 var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "i"]);
 var ALLOWED_REMOTE_SUBCOMMANDS = /* @__PURE__ */ new Set(["show", "get-url"]);
+var GREP_VALUE_FLAGS = /* @__PURE__ */ new Set([
+  "-e",
+  "--regexp",
+  "-f",
+  "--file",
+  "-m",
+  "--max-count",
+  "-A",
+  "--after-context",
+  "-B",
+  "--before-context",
+  "-C",
+  "--context",
+  "--max-depth",
+  "--threads",
+  "--parent-basename"
+]);
+var GREP_SHORT_VALUE_CHARS = /* @__PURE__ */ new Set(["e", "f", "m", "A", "B", "C"]);
 function tokenizeArgs(input) {
   const tokens = [];
   let current = "";
@@ -2427,6 +2448,67 @@ function validateReadonlyGitArgs(pattern) {
         throw new Error(
           `Remote target '${arg}' must be a configured remote name, not a URL or path`
         );
+      }
+    }
+  } else if (subcmd === "grep") {
+    let expectValue = false;
+    for (const arg of rest) {
+      if (expectValue) {
+        expectValue = false;
+        continue;
+      }
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--op") || flagName.startsWith("--no-ind")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+        }
+        if (eqIdx === -1 && GREP_VALUE_FLAGS.has(flagName)) {
+          expectValue = true;
+        }
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        const chars = arg.slice(1);
+        for (let i = 0; i < chars.length; i++) {
+          const ch = chars[i];
+          if (ch === "O") {
+            throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+          }
+          if (GREP_SHORT_VALUE_CHARS.has(ch)) {
+            if (i === chars.length - 1) {
+              expectValue = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+  } else if (subcmd === "rev-list") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--std")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git rev-list query`);
+        }
+      }
+    }
+  } else if (subcmd === "cat-file") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--fi") || flagName.startsWith("--ba") || flagName.startsWith("--te")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git cat-file query`);
+        }
       }
     }
   }
@@ -3047,7 +3129,7 @@ function hardenGitExecArgs(validatedArgs) {
   let subArgs = rest;
   if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
     subArgs = ["--no-ext-diff", "--no-textconv", ...rest];
-  } else if (subcmd === "blame") {
+  } else if (subcmd === "blame" || subcmd === "grep") {
     subArgs = ["--no-textconv", ...rest];
   } else if (subcmd === "remote") {
     const remoteSubIdx = rest.findIndex((a) => !a.startsWith("-"));
@@ -3117,6 +3199,9 @@ async function runGitQuery(query, searchRoot) {
     throw new Error("git query timed out");
   }
   if (res.exitCode !== 0) {
+    if (gitArgs[1] === "grep" && res.exitCode === 1 && !res.stderr.trim() && !res.stdout.trim()) {
+      return "(no matches)";
+    }
     const msg = (res.stderr || res.stdout).trim();
     throw new Error(msg || `git exited with code ${res.exitCode}`);
   }
@@ -5061,7 +5146,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+      description: "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch/grep/rev-list/cat-file) concurrently in one call with bounded output.",
       inputSchema: {
         type: "object",
         properties: {

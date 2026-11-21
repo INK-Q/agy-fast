@@ -404,6 +404,40 @@ describe("batch_search", () => {
       "get-url",
       "origin",
     ]);
+    assert.deepEqual(validateReadonlyGitArgs("grep -n export HEAD -- src/"), [
+      "--no-pager",
+      "grep",
+      "-n",
+      "export",
+      "HEAD",
+      "--",
+      "src/",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("grep -e -O HEAD"), [
+      "--no-pager",
+      "grep",
+      "-e",
+      "-O",
+      "HEAD",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("grep -neFOO HEAD"), [
+      "--no-pager",
+      "grep",
+      "-neFOO",
+      "HEAD",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("rev-list --count HEAD"), [
+      "--no-pager",
+      "rev-list",
+      "--count",
+      "HEAD",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("cat-file -p HEAD:src/api/routes.ts"), [
+      "--no-pager",
+      "cat-file",
+      "-p",
+      "HEAD:src/api/routes.ts",
+    ]);
   });
 
   it("rejects mutating git subcommands, bypass flags, and combined short flags", () => {
@@ -449,6 +483,22 @@ describe("batch_search", () => {
       "diff -ccore.pager=sh",
       "log --ext-diff",
       "-c core.fsmonitor=evil status",
+      "grep -Oless foo",
+      "grep -nO foo",
+      "grep --open-files-in-pager=sh foo",
+      "grep --op foo",
+      "grep --no-index foo",
+      "grep --no-ind foo",
+      "grep --textconv foo",
+      "rev-list --stdin HEAD",
+      "cat-file --filters HEAD:doc.txt",
+      "cat-file --fi HEAD:doc.txt",
+      "cat-file --textconv HEAD:doc.txt",
+      "cat-file --te HEAD:doc.txt",
+      "cat-file --batch",
+      "cat-file --ba",
+      "cat-file --batch-check",
+      "cat-file --batch-all-objects",
       'log "unterminated',
     ];
     for (const cmd of blocked) {
@@ -687,7 +737,7 @@ describe("batch_search", () => {
       execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: untrustedRepo });
       execFileSync("git", ["config", "user.name", "Test User"], { cwd: untrustedRepo });
       await fs.writeFile(path.join(untrustedRepo, "doc.txt"), "v1\n", "utf8");
-      await fs.writeFile(path.join(untrustedRepo, ".gitattributes"), "*.txt diff=evil\n", "utf8");
+      await fs.writeFile(path.join(untrustedRepo, ".gitattributes"), "*.txt diff=evil filter=evil\n", "utf8");
       execFileSync("git", ["add", "."], { cwd: untrustedRepo });
       execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: untrustedRepo });
       await fs.writeFile(path.join(untrustedRepo, "doc.txt"), "v2\n", "utf8");
@@ -696,12 +746,14 @@ describe("batch_search", () => {
       const markerTc = path.join(untrustedRepo, "pwn_tc");
       const markerFs = path.join(untrustedRepo, "pwn_fs");
       const markerGpg = path.join(untrustedRepo, "pwn_gpg");
+      const markerFilter = path.join(untrustedRepo, "pwn_filter");
       const touchCmd = (p: string) =>
         `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(p)},'1')`)}`;
       execFileSync("git", ["config", "diff.external", touchCmd(markerExt)], { cwd: untrustedRepo });
       execFileSync("git", ["config", "diff.evil.textconv", touchCmd(markerTc)], { cwd: untrustedRepo });
       execFileSync("git", ["config", "core.fsmonitor", touchCmd(markerFs)], { cwd: untrustedRepo });
       execFileSync("git", ["config", "gpg.program", touchCmd(markerGpg)], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "filter.evil.smudge", touchCmd(markerFilter)], { cwd: untrustedRepo });
       execFileSync("git", ["remote", "add", "show", "https://example.invalid/repo.git"], { cwd: untrustedRepo });
 
       const gRes = await runBatchSearch({
@@ -714,15 +766,27 @@ describe("batch_search", () => {
           { type: "git", pattern: "shortlog -S v1 HEAD" },
           { type: "git", pattern: "log --show-signature -n 1" },
           { type: "git", pattern: "remote get-url show" },
+          { type: "git", pattern: "grep -n v1 HEAD" },
+          { type: "git", pattern: "grep -n nonexistent_token_xyz HEAD" },
+          { type: "git", pattern: "rev-list --count HEAD" },
+          { type: "git", pattern: "rev-list --show-signature -n 1 HEAD" },
+          { type: "git", pattern: "cat-file -t HEAD" },
+          { type: "git", pattern: "cat-file -p HEAD:doc.txt" },
         ],
       });
       assert.equal(gRes.isError, false);
       assert.match(gRes.text, /Test User/); // shortlog returns actual commit count instead of (empty output)
       assert.match(gRes.text, /https:\/\/example\.invalid\/repo\.git/); // remote named 'show' must not inject -n
+      assert.match(gRes.text, /HEAD:doc\.txt:1:v1/); // git grep matches committed content
+      assert.match(gRes.text, /\(no matches\)/); // git grep exit code 1 returns (no matches), not ERROR
+      assert.match(gRes.text, /## Query 10 \[git\] rev-list --count HEAD\n1/);
+      assert.match(gRes.text, /## Query 12 \[git\] cat-file -t HEAD\ncommit/);
+      assert.match(gRes.text, /## Query 13 \[git\] cat-file -p HEAD:doc\.txt\nv1/);
       assert.equal(await fs.access(markerExt).then(() => true, () => false), false);
       assert.equal(await fs.access(markerTc).then(() => true, () => false), false);
       assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
       assert.equal(await fs.access(markerGpg).then(() => true, () => false), false);
+      assert.equal(await fs.access(markerFilter).then(() => true, () => false), false);
 
       // Prefix abbreviations of --ext-diff / --textconv are also rejected
       assert.throws(() => validateReadonlyGitArgs("diff --textc"), /not allowed/i);
