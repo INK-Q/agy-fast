@@ -60,6 +60,9 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
   "describe",
   "tag",
   "remote",
+  "grep",
+  "rev-list",
+  "cat-file",
 ]);
 
 const FORBIDDEN_GIT_GLOBAL_FLAGS = new Set([
@@ -152,6 +155,26 @@ const ALLOWED_TAG_VALUE_FLAGS = new Set([
 const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "i"]);
 
 const ALLOWED_REMOTE_SUBCOMMANDS = new Set(["show", "get-url"]);
+
+const GREP_VALUE_FLAGS = new Set([
+  "-e",
+  "--regexp",
+  "-f",
+  "--file",
+  "-m",
+  "--max-count",
+  "-A",
+  "--after-context",
+  "-B",
+  "--before-context",
+  "-C",
+  "--context",
+  "--max-depth",
+  "--threads",
+  "--parent-basename",
+]);
+
+const GREP_SHORT_VALUE_CHARS = new Set(["e", "f", "m", "A", "B", "C"]);
 
 export function tokenizeArgs(input: string): string[] {
   const tokens: string[] = [];
@@ -416,6 +439,71 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         throw new Error(
           `Remote target '${arg}' must be a configured remote name, not a URL or path`,
         );
+      }
+    }
+  } else if (subcmd === "grep") {
+    let expectValue = false;
+    for (const arg of rest) {
+      if (expectValue) {
+        expectValue = false;
+        continue;
+      }
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--op") || flagName.startsWith("--no-ind")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+        }
+        if (eqIdx === -1 && GREP_VALUE_FLAGS.has(flagName)) {
+          expectValue = true;
+        }
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        const chars = arg.slice(1);
+        for (let i = 0; i < chars.length; i++) {
+          const ch = chars[i]!;
+          if (ch === "O") {
+            throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+          }
+          if (GREP_SHORT_VALUE_CHARS.has(ch)) {
+            if (i === chars.length - 1) {
+              expectValue = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+  } else if (subcmd === "rev-list") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--std")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git rev-list query`);
+        }
+      }
+    }
+  } else if (subcmd === "cat-file") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (
+          flagName.startsWith("--fi") ||
+          flagName.startsWith("--ba") ||
+          flagName.startsWith("--te")
+        ) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git cat-file query`);
+        }
       }
     }
   }
@@ -1274,7 +1362,7 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
 
   if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
     subArgs = ["--no-ext-diff", "--no-textconv", ...rest];
-  } else if (subcmd === "blame") {
+  } else if (subcmd === "blame" || subcmd === "grep") {
     subArgs = ["--no-textconv", ...rest];
   } else if (subcmd === "remote") {
     const remoteSubIdx = rest.findIndex((a) => !a.startsWith("-"));
@@ -1352,6 +1440,14 @@ async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<stri
     throw new Error("git query timed out");
   }
   if (res.exitCode !== 0) {
+    if (
+      gitArgs[1] === "grep" &&
+      res.exitCode === 1 &&
+      !res.stderr.trim() &&
+      !res.stdout.trim()
+    ) {
+      return "(no matches)";
+    }
     const msg = (res.stderr || res.stdout).trim();
     throw new Error(msg || `git exited with code ${res.exitCode}`);
   }
