@@ -575,6 +575,54 @@ describe("batch_search", () => {
       assert.equal(res.isError, false);
       assert.ok(res.text.includes(multilineExpected), `Unexpected result set:\n${res.text}`);
     }
+
+    // Truncated adjacent matches with contextLines>0 must NOT leave line-number gaps,
+    // and single-file search / dash filename / RIPGREP_CONFIG_PATH must match Node parity.
+    const parityDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-rg-parity-"));
+    const prevRgrc = process.env.RIPGREP_CONFIG_PATH;
+    try {
+      await fs.writeFile(path.join(parityDir, "adj.txt"), "foo 1\nfoo 2\nbar 3\n", "utf8");
+      await fs.writeFile(path.join(parityDir, "multi.txt"), "pre\nalpha\nbeta\ngamma\npost1\n", "utf8");
+      await fs.writeFile(path.join(parityDir, "-"), "dash_file_hit\n", "utf8");
+      await fs.writeFile(path.join(parityDir, "crlf.txt"), "alpha\r\nbeta\r\n", "utf8");
+      await fs.writeFile(path.join(parityDir, "bin.dat"), Buffer.from("needle\x00binary\n"));
+      const rgrc = path.join(parityDir, ".ripgreprc");
+      await fs.writeFile(rgrc, "--color=always\n--smart-case\n--context=1\n", "utf8");
+      process.env.RIPGREP_CONFIG_PATH = rgrc;
+
+      for (const forceNodeFallback of [false, true]) {
+        const res = await runBatchSearch(
+          {
+            cwd: parityDir,
+            queries: [
+              { type: "text", pattern: "foo", path: "adj.txt", contextLines: 2, maxResults: 1 },
+              { type: "regex", pattern: "alpha\\nbeta\\ngamma", path: "multi.txt", multiline: true, contextLines: 2, maxResults: 2 },
+              { type: "text", pattern: "dash_file_hit" },
+              { type: "text", pattern: "foo", path: "adj.txt", glob: "*.ts" },
+              { type: "text", pattern: "foo", path: "adj.txt", glob: "!*.ts" },
+              { type: "text", pattern: "foo", path: "adj.txt", glob: "!*.txt" },
+              { type: "text", pattern: "needle", path: "bin.dat" },
+              { type: "regex", pattern: "^alpha$", path: "crlf.txt" },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(res.isError, false);
+        const sections = res.text.split("\n\n");
+        assert.ok(sections[0]!.includes("  1: foo 1\n  2- foo 2\n  3- bar 3"), sections[0]);
+        assert.ok(sections[1]!.includes("  2: alpha\n  3: beta\n  4- gamma\n  5- post1"), sections[1]);
+        assert.match(sections[2]!, /dash_file_hit/);
+        assert.match(sections[3]!, /\(no matches\)/);
+        assert.match(sections[4]!, /1: foo 1/);
+        assert.match(sections[5]!, /\(no matches\)/);
+        assert.match(sections[6]!, /\(no matches\)/);
+        assert.match(sections[7]!, /1: alpha/);
+      }
+    } finally {
+      if (prevRgrc === undefined) delete process.env.RIPGREP_CONFIG_PATH;
+      else process.env.RIPGREP_CONFIG_PATH = prevRgrc;
+      await fs.rm(parityDir, { recursive: true, force: true });
+    }
   });
 
   it("tokenizes quoted arguments properly", () => {

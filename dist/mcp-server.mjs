@@ -1,6 +1,10 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
+// src/mcp-server.ts
+import fs5 from "node:fs";
+import path6 from "node:path";
+
 // src/protocol/mcp.ts
 import { fileURLToPath } from "node:url";
 var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
@@ -10,6 +14,8 @@ var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2024-11-05"
 ]);
 var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+var ROOTS_REQUEST_TIMEOUT_MS = 1500;
+var MAX_KNOWN_ROOTS_IDS = 64;
 var McpStdioServer = class {
   tools = /* @__PURE__ */ new Map();
   serverName;
@@ -21,34 +27,121 @@ var McpStdioServer = class {
   sendToClient;
   clientSupportsRoots = false;
   rootsRequestCount = 0;
-  pendingRootsRequest;
-  rootsReady = Promise.resolve();
+  lastAppliedRootsSeq = 0;
+  pendingRoots = /* @__PURE__ */ new Map();
+  knownRootsIds = /* @__PURE__ */ new Map();
+  rootsWaiters = /* @__PURE__ */ new Set();
+  activeOutgoingQueue = null;
+  rootsTimeoutMs;
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
     this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
   }
-  // Tool calls wait for the answer, so the first call already sees the roots.
-  requestRoots() {
-    if (!this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) return;
-    this.rootsRequestCount += 1;
-    const id = `agy-fast-roots-${this.rootsRequestCount}`;
-    this.rootsReady = new Promise((resolve) => {
-      this.pendingRootsRequest = { id, resolve };
+  flushRootsWaiters() {
+    for (const waiter of this.rootsWaiters) {
+      let stillWaiting = false;
+      for (const pending of this.pendingRoots.values()) {
+        if (pending.seq <= waiter.minSeq) {
+          stillWaiting = true;
+          break;
+        }
+      }
+      if (!stillWaiting) {
+        this.rootsWaiters.delete(waiter);
+        waiter.resolve();
+      }
+    }
+  }
+  settleAllPendingRoots() {
+    for (const pending of this.pendingRoots.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingRoots.clear();
+    for (const waiter of this.rootsWaiters) {
+      waiter.resolve();
+    }
+    this.rootsWaiters.clear();
+  }
+  waitForRoots() {
+    if (this.pendingRoots.size === 0 || this.stdinEnded) {
+      return Promise.resolve();
+    }
+    if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
+      const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
+      for (const task of tasks) {
+        task();
+      }
+    }
+    const minSeq = this.rootsRequestCount;
+    return new Promise((resolve) => {
+      this.rootsWaiters.add({ minSeq, resolve });
     });
-    this.sendToClient({ jsonrpc: "2.0", id, method: "roots/list" });
+  }
+  pruneKnownRootsIds() {
+    if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) return;
+    for (const key of this.knownRootsIds.keys()) {
+      if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) break;
+      if (!this.pendingRoots.has(key)) {
+        this.knownRootsIds.delete(key);
+      }
+    }
+  }
+  // Tool calls wait for the pending answer (bounded by rootsTimeoutMs and stdin EOF),
+  // so the first call already sees the workspace roots without ever deadlocking.
+  requestRoots(useContentLength) {
+    if (this.stdinEnded || !this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) {
+      return;
+    }
+    this.rootsRequestCount += 1;
+    const seq = this.rootsRequestCount;
+    const id = `agy-fast-roots-${seq}`;
+    const timer = setTimeout(() => {
+      if (this.pendingRoots.delete(id)) {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
+    }, this.rootsTimeoutMs);
+    timer.unref();
+    this.pendingRoots.set(id, { seq, timer });
+    this.knownRootsIds.set(id, seq);
+    this.pruneKnownRootsIds();
+    const send = this.sendToClient;
+    const sendTask = () => {
+      send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
+    };
+    if (this.activeOutgoingQueue) {
+      this.activeOutgoingQueue.push(sendTask);
+    } else {
+      sendTask();
+    }
   }
   receiveRoots(result) {
-    const roots = result?.roots ?? [];
-    const paths = roots.map((root) => root.uri).filter((uri) => typeof uri === "string" && uri.startsWith("file:")).map((uri) => fileURLToPath(uri));
+    if (!result || typeof result !== "object") return;
+    const rawRoots = result.roots;
+    if (!Array.isArray(rawRoots)) return;
+    const paths = [];
+    for (const root of rawRoots) {
+      if (!root || typeof root !== "object") continue;
+      const uri = root.uri;
+      if (typeof uri !== "string" || !/^file:/i.test(uri)) continue;
+      try {
+        paths.push(fileURLToPath(uri));
+      } catch {
+      }
+    }
     if (paths.length > 0) {
-      this.onWorkspaceRoots?.(paths);
+      try {
+        this.onWorkspaceRoots?.(paths);
+      } catch {
+      }
     }
   }
   registerTool(definition, handler) {
     this.tools.set(definition.name, { definition, handler });
   }
-  async handleMessage(raw) {
+  async handleMessage(raw, useContentLength = false) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       return {
         jsonrpc: "2.0",
@@ -60,11 +153,31 @@ var McpStdioServer = class {
     const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
     const id = hasId ? msg.id ?? null : null;
     const method = typeof msg.method === "string" ? msg.method : "";
-    if (!method && this.pendingRootsRequest?.id === id) {
-      const { resolve } = this.pendingRootsRequest;
-      this.pendingRootsRequest = void 0;
-      this.receiveRoots(msg.result);
-      resolve();
+    if (!method && typeof id === "string" && this.knownRootsIds.has(id)) {
+      const seq = this.knownRootsIds.get(id);
+      this.knownRootsIds.delete(id);
+      const pending = this.pendingRoots.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingRoots.delete(id);
+      }
+      const errField = msg.error;
+      const hasError = errField !== void 0 && errField !== null;
+      try {
+        if (!hasError && seq >= this.lastAppliedRootsSeq) {
+          this.lastAppliedRootsSeq = seq;
+          for (const [oldId, oldPending] of this.pendingRoots.entries()) {
+            if (oldPending.seq < seq) {
+              clearTimeout(oldPending.timer);
+              this.pendingRoots.delete(oldId);
+            }
+          }
+          this.receiveRoots(msg.result);
+        }
+      } finally {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
       return null;
     }
     if (!method) {
@@ -76,7 +189,7 @@ var McpStdioServer = class {
     }
     if (!hasId) {
       if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
-        this.requestRoots();
+        this.requestRoots(useContentLength);
       }
       return null;
     }
@@ -84,7 +197,7 @@ var McpStdioServer = class {
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
       const capabilities = msg.params?.capabilities;
-      this.clientSupportsRoots = Boolean(capabilities?.roots);
+      this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
       return {
         jsonrpc: "2.0",
         id,
@@ -168,7 +281,7 @@ var McpStdioServer = class {
         };
       }
       try {
-        await this.rootsReady;
+        await this.waitForRoots();
         const res = await tool.handler(args);
         return {
           jsonrpc: "2.0",
@@ -199,7 +312,6 @@ var McpStdioServer = class {
   listen(input = process.stdin, output = process.stdout, onExit) {
     this.onDrainExit = onExit;
     let buffer = Buffer.alloc(0);
-    let clientUsesContentLength = false;
     const writeResponse = (payload, useContentLength) => {
       const serialized = JSON.stringify(payload);
       if (useContentLength) {
@@ -212,9 +324,14 @@ ${serialized}`);
 `);
       }
     };
-    this.sendToClient = (request) => writeResponse(request, clientUsesContentLength);
+    this.sendToClient = (request, useContentLength) => writeResponse(request, useContentLength);
+    let drainExitCalled = false;
+    const triggerDrainExit = () => {
+      if (drainExitCalled) return;
+      drainExitCalled = true;
+      this.onDrainExit?.();
+    };
     const dispatchRawJson = (jsonText, useContentLength) => {
-      clientUsesContentLength = useContentLength;
       let parsed;
       try {
         parsed = JSON.parse(jsonText);
@@ -233,7 +350,13 @@ ${serialized}`);
       const finish = () => {
         this.inFlight -= 1;
         if (this.stdinEnded && this.inFlight === 0) {
-          this.onDrainExit?.();
+          triggerDrainExit();
+        }
+      };
+      const outgoingForCall = [];
+      const flushOutgoingForCall = () => {
+        for (const task of outgoingForCall) {
+          task();
         }
       };
       if (Array.isArray(parsed)) {
@@ -249,20 +372,40 @@ ${serialized}`);
           finish();
           return;
         }
-        Promise.all(parsed.map((item) => this.handleMessage(item))).then((responses) => {
+        const prevQueue2 = this.activeOutgoingQueue;
+        this.activeOutgoingQueue = outgoingForCall;
+        let promises;
+        try {
+          promises = parsed.map((item) => this.handleMessage(item, useContentLength));
+        } finally {
+          this.activeOutgoingQueue = prevQueue2;
+        }
+        Promise.all(promises).then((responses) => {
           const nonNull = responses.filter(
             (r) => r !== null
           );
           if (nonNull.length > 0) {
             writeResponse(nonNull, useContentLength);
           }
+          flushOutgoingForCall();
+        }).catch(() => {
         }).finally(finish);
         return;
       }
-      this.handleMessage(parsed).then((response) => {
+      const prevQueue = this.activeOutgoingQueue;
+      this.activeOutgoingQueue = outgoingForCall;
+      let promise;
+      try {
+        promise = this.handleMessage(parsed, useContentLength);
+      } finally {
+        this.activeOutgoingQueue = prevQueue;
+      }
+      promise.then((response) => {
         if (response !== null) {
           writeResponse(response, useContentLength);
         }
+        flushOutgoingForCall();
+      }).catch(() => {
       }).finally(finish);
     };
     const drainBuffer = () => {
@@ -277,19 +420,25 @@ ${serialized}`);
         }
         const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
         if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
-          const crlfEnd = buffer.indexOf("\r\n\r\n");
-          const lfEnd = buffer.indexOf("\n\n");
-          let sepIdx = -1;
-          let sepLen = 0;
-          if (crlfEnd !== -1 && (lfEnd === -1 || crlfEnd < lfEnd)) {
-            sepIdx = crlfEnd;
-            sepLen = 4;
-          } else if (lfEnd !== -1) {
-            sepIdx = lfEnd;
-            sepLen = 2;
+          const headerScan = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("latin1");
+          const sepMatch = /\r?\n\r?\n/.exec(headerScan);
+          if (!sepMatch) {
+            if (buffer.length >= 16384) {
+              writeResponse(
+                {
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid Request: header too large" }
+                },
+                true
+              );
+              buffer = Buffer.alloc(0);
+            }
+            break;
           }
-          if (sepIdx === -1) break;
-          const headerText = buffer.subarray(0, sepIdx).toString("latin1");
+          const sepIdx = sepMatch.index;
+          const sepLen = sepMatch[0].length;
+          const headerText = headerScan.slice(0, sepIdx);
           const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
           const maxFrameBytes = 64 * 1024 * 1024;
           if (clMatches.length !== 1) {
@@ -344,19 +493,21 @@ ${serialized}`);
     input.on("end", () => {
       const remaining = buffer.toString("utf8").trim();
       buffer = Buffer.alloc(0);
+      this.stdinEnded = true;
       const lowerRem = remaining.toLowerCase();
       if (remaining.length > 0 && !lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
         dispatchRawJson(remaining, false);
       }
-      this.stdinEnded = true;
+      this.settleAllPendingRoots();
       if (this.inFlight === 0) {
-        this.onDrainExit?.();
+        triggerDrainExit();
       }
     });
     input.on("error", () => {
       this.stdinEnded = true;
+      this.settleAllPendingRoots();
       if (this.inFlight === 0) {
-        this.onDrainExit?.();
+        triggerDrainExit();
       }
     });
   }
@@ -1789,10 +1940,12 @@ async function runApplyEdits(input) {
           isError: true
         };
       }
+      const rawSpecTimeout = input.verify.timeoutSec;
+      const parsedSpecTimeout = typeof rawSpecTimeout === "number" || typeof rawSpecTimeout === "string" && rawSpecTimeout.trim() !== "" ? Number(rawSpecTimeout) : void 0;
       validatedVerify = {
         command: cmd,
         cwd: input.verify.cwd,
-        timeoutSec: typeof input.verify.timeoutSec === "number" ? input.verify.timeoutSec : void 0
+        timeoutSec: parsedSpecTimeout !== void 0 && Number.isFinite(parsedSpecTimeout) ? parsedSpecTimeout : void 0
       };
     } else {
       return {
@@ -2031,7 +2184,8 @@ ${summaryLines.join("\n")}`];
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-    const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
+    const timeoutCandidate = verifySpec.timeoutSec ?? input.verifyTimeoutSec;
+    const rawTimeoutSec = typeof timeoutCandidate === "number" || typeof timeoutCandidate === "string" && timeoutCandidate.trim() !== "" ? Number(timeoutCandidate) : 60;
     const timeoutMs = (Number.isFinite(rawTimeoutSec) ? Math.max(1, Math.min(MCP_CALL_BUDGET_SEC, Math.trunc(rawTimeoutSec))) : 60) * 1e3;
     const rawMaxVerifyChars = Number(input.maxVerifyChars ?? 4e3);
     const maxVerifyChars = Number.isFinite(rawMaxVerifyChars) ? Math.max(300, Math.min(7500, Math.trunc(rawMaxVerifyChars))) : 4e3;
@@ -2532,14 +2686,39 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const isFileTarget = (await fs3.stat(searchRoot)).isFile();
-  if (typeGlobs && !matchesType(searchRoot) && isFileTarget) {
-    return { files: [], totalMatches: 0, truncated: false };
+  const fileStat = await fs3.stat(searchRoot);
+  const isFileTarget = fileStat.isFile();
+  if (isFileTarget) {
+    if (typeGlobs && !matchesType(searchRoot)) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (fileStat.size > 2 * 1024 * 1024) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (query.glob) {
+      const negated = query.glob.startsWith("!");
+      const rawGlob = negated ? query.glob.slice(1) : query.glob;
+      const globRe = globToRegExp(rawGlob);
+      const relPosix = relativeFile(baseCwd, searchRoot);
+      const matched = globRe.test(relPosix) || globRe.test(path4.basename(searchRoot));
+      if (negated ? matched : !matched) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    }
+    const fh = await fs3.open(searchRoot, "r");
+    try {
+      const head = Buffer.alloc(Math.min(fileStat.size, 8192));
+      const { bytesRead } = await fh.read(head, 0, head.length, 0);
+      if (isLikelyBinary(head.subarray(0, bytesRead))) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    } finally {
+      await fh.close();
+    }
   }
   const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
-  const args = ["--no-messages", "--max-filesize", "2M"];
-  if (summary || typeGlobs || query.multiline) args.push("--no-config");
-  if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
+  const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  if (query.multiline) args.push("--multiline", "--multiline-dotall");
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
     args.push("--type", "agyfilter");
@@ -2569,23 +2748,23 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  const runRg = async (runArgs) => {
-    const res2 = await execBinaryAsync("rg", runArgs, {
+  const runRg = async (runArgs, opts) => {
+    const res = await execBinaryAsync("rg", runArgs, {
       cwd: baseCwd,
       timeoutMs: 15e3,
       maxOutputBytes: 2 * 1024 * 1024
     });
-    if (res2.error) {
-      throw new Error(`rg spawn error: ${res2.error}`);
+    if (res.error) {
+      throw new Error(`rg spawn error: ${res.error}`);
     }
-    if (res2.exitCode === 2) {
-      throw new Error(res2.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
+    if (res.exitCode === 2 && !(opts?.allowPartialError && !res.stderr.trim())) {
+      throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
     }
-    return res2;
+    return res;
   };
-  const cutShort = (res2) => res2.truncated || res2.timedOut || res2.exitCode === null;
+  const cutShort = (res) => res.truncated || res.timedOut || res.exitCode === null;
   if (summary) {
-    const res2 = await runRg([
+    const res = await runRg([
       ...args,
       ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
       "--",
@@ -2593,7 +2772,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       searchRoot
     ]);
     const files2 = [];
-    const out = res2.stdout;
+    const out = res.stdout;
     let pos = 0;
     while (pos < out.length) {
       const nul = out.indexOf("\0", pos);
@@ -2601,8 +2780,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const rawFile = out.slice(pos, nul);
       let count = 0;
       if (query.outputMode === "count") {
-        let nl = out.indexOf("\n", nul + 1);
-        if (nl === -1) nl = out.length;
+        const nl = out.indexOf("\n", nul + 1);
+        if (nl === -1) break;
         const rawCount = out.slice(nul + 1, nl).trim();
         count = Number(rawCount);
         pos = nl + 1;
@@ -2616,76 +2795,115 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files2.length > maxResults || cutShort(res2)
+      truncated: files2.length > maxResults || cutShort(res)
     };
   }
   const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
-  const counts = await runRg([
-    ...args,
-    ...maxCountArgs,
-    "--count",
-    "--with-filename",
-    "--null",
-    "--",
-    query.pattern,
-    searchRoot
-  ]);
-  const counted = [];
-  for (const record of counts.stdout.split("\n").slice(0, -1)) {
-    const sep = record.lastIndexOf("\0");
-    const count = Number(record.slice(sep + 1));
-    if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
-    const rawFile = record.slice(0, sep);
-    if (!matchesType(rawFile)) continue;
-    counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+  let chosen;
+  let truncated = false;
+  if (isFileTarget) {
+    chosen = [
+      {
+        rawFile: searchRoot,
+        relFile: relativeFile(baseCwd, searchRoot),
+        count: Number.POSITIVE_INFINITY
+      }
+    ];
+  } else {
+    const counts = await runRg([
+      ...args,
+      ...maxCountArgs,
+      "--count",
+      "--with-filename",
+      "--null",
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
+    const counted = [];
+    for (const record of counts.stdout.split("\n").slice(0, -1)) {
+      const sep = record.lastIndexOf("\0");
+      const count = Number(record.slice(sep + 1));
+      if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
+      const rawFile = record.slice(0, sep);
+      if (!matchesType(rawFile)) continue;
+      counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+    }
+    counted.sort((a, b) => a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0);
+    chosen = [];
+    let coveredMatches = 0;
+    for (const item of counted) {
+      if (coveredMatches >= maxResults) break;
+      chosen.push(item);
+      coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+    }
+    truncated = cutShort(counts) || chosen.length < counted.length;
+    if (chosen.length === 0) {
+      return { files: [], totalMatches: 0, truncated };
+    }
   }
-  counted.sort((a, b) => a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0);
-  const chosen = [];
-  let coveredMatches = 0;
-  for (const item of counted) {
-    if (coveredMatches >= maxResults) break;
-    chosen.push(item);
-    coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+  const toRgArgPath = (rawFile) => {
+    const rel = path4.relative(baseCwd, rawFile);
+    const chosenPath = rel && !rel.startsWith("..") && !path4.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path4.sep}-` : chosenPath;
+  };
+  const rgChunks = [];
+  let currentChunk = [];
+  let currentChunkChars = 0;
+  const maxArgChars = 2e4;
+  for (const item of chosen) {
+    const argPath = toRgArgPath(item.rawFile);
+    const est = argPath.length + 3;
+    if (currentChunk.length > 0 && currentChunkChars + est > maxArgChars) {
+      rgChunks.push(currentChunk);
+      currentChunk = [];
+      currentChunkChars = 0;
+    }
+    currentChunk.push(argPath);
+    currentChunkChars += est;
   }
-  let truncated = cutShort(counts) || chosen.length < counted.length;
-  if (chosen.length === 0) {
-    return { files: [], totalMatches: 0, truncated };
-  }
-  const res = await runRg([
-    ...args,
-    ...maxCountArgs,
-    "--json",
-    ...contextLines > 0 ? ["-C", String(contextLines)] : [],
-    "--",
-    query.pattern,
-    ...chosen.map((item) => item.rawFile)
-  ]);
+  if (currentChunk.length > 0) rgChunks.push(currentChunk);
   const byFile = /* @__PURE__ */ new Map();
-  for (const rawLine of res.stdout.split("\n")) {
-    if (!rawLine.trim()) continue;
-    let ev;
-    try {
-      ev = JSON.parse(rawLine);
-    } catch {
-      continue;
-    }
-    if (ev.type !== "match" && ev.type !== "context") continue;
-    const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
-    const lineNumber = ev.data?.line_number;
-    const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
-    if (!rawFile || typeof lineNumber !== "number") continue;
-    const relFile = relativeFile(baseCwd, rawFile);
-    let lineMap = byFile.get(relFile);
-    if (!lineMap) {
-      lineMap = /* @__PURE__ */ new Map();
-      byFile.set(relFile, lineMap);
-    }
-    const isMatch = ev.type === "match";
-    const lineText = rawText.replace(/\r?\n$/, "");
-    const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
-    for (const [offset, text] of segments.entries()) {
-      const line = lineNumber + offset;
-      if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
+  for (const chunk of rgChunks) {
+    const res = await runRg(
+      [
+        ...args,
+        ...maxCountArgs,
+        "--json",
+        ...contextLines > 0 ? ["-C", String(contextLines)] : [],
+        "--",
+        query.pattern,
+        ...chunk
+      ],
+      { allowPartialError: !isFileTarget }
+    );
+    if (cutShort(res)) truncated = true;
+    for (const rawLine of res.stdout.split("\n")) {
+      if (!rawLine.trim()) continue;
+      let ev;
+      try {
+        ev = JSON.parse(rawLine);
+      } catch {
+        continue;
+      }
+      if (ev.type !== "match" && ev.type !== "context") continue;
+      const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
+      const lineNumber = ev.data?.line_number;
+      const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
+      if (!rawFile || typeof lineNumber !== "number") continue;
+      const relFile = relativeFile(baseCwd, rawFile);
+      let lineMap = byFile.get(relFile);
+      if (!lineMap) {
+        lineMap = /* @__PURE__ */ new Map();
+        byFile.set(relFile, lineMap);
+      }
+      const isMatch = ev.type === "match";
+      const lineText = rawText.replace(/\r?\n$/, "");
+      const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
+      for (const [offset, text] of segments.entries()) {
+        const line = lineNumber + offset;
+        if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
+      }
     }
   }
   const files = [];
@@ -2707,6 +2925,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       if (line.isMatch) {
         if (kept === budget) {
           truncated = true;
+          if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
+            lines.push({ ...line, isMatch: false });
+          }
           continue;
         }
         kept += 1;
@@ -2720,7 +2941,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     files.push({ file: relFile, lines });
     totalMatches += kept;
   }
-  return { files, totalMatches, truncated: truncated || cutShort(res) };
+  return { files, totalMatches, truncated };
 }
 function* multilineMatches(content, regex) {
   let previousEnd = -1;
@@ -2785,16 +3006,18 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const matchesType = fileTypeMatcher(query.fileType);
   let discoveryTruncated = false;
-  const globRegex = query.glob ? globToRegExp(query.glob) : null;
+  const globNegated = Boolean(query.glob && query.glob.startsWith("!"));
+  const rawGlob = query.glob ? globNegated ? query.glob.slice(1) : query.glob : null;
+  const globRegex = rawGlob ? globToRegExp(rawGlob) : null;
   const globMatchesFile = (relPosix) => {
     if (!matchesType(relPosix)) return false;
     if (!globRegex) return true;
-    if (globRegex.test(relPosix)) return true;
-    if (!query.glob.includes("/")) {
+    let matched = globRegex.test(relPosix);
+    if (!matched && !rawGlob.includes("/")) {
       const base = relPosix.split("/").pop() ?? relPosix;
-      return globRegex.test(base);
+      matched = globRegex.test(base);
     }
-    return false;
+    return globNegated ? !matched : matched;
   };
   const stat = await fs3.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
@@ -2804,7 +3027,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
   } else {
     const includeHidden = Boolean(
-      query.glob && (query.glob.startsWith(".") || query.glob.includes("/."))
+      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/."))
     );
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
@@ -3799,16 +4022,47 @@ function extractTsJsSymbols(lines) {
   }
   return symbols;
 }
+function isPythonFStringPrefix(line, quoteIdx) {
+  let k = quoteIdx - 1;
+  while (k >= 0 && /[A-Za-z]/.test(line[k])) k--;
+  if (k >= 0 && /[0-9_]/.test(line[k])) return false;
+  const prefix = line.slice(k + 1, quoteIdx).toLowerCase();
+  return prefix === "f" || prefix === "fr" || prefix === "rf";
+}
 function extractPythonSymbols(lines) {
   const symbols = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
+  const indentOf = (l) => (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
   const isContinuation = new Array(lines.length).fill(false);
+  const inStringContinuation = new Array(lines.length).fill(false);
   let activeQuote = null;
+  let activeSingleQuote = null;
+  let activeSingleIsFString = false;
   let bracketDepth = 0;
   let backslashContinued = false;
+  const fExprStack = [];
   for (let i = 0; i < lines.length; i++) {
-    isContinuation[i] = activeQuote !== null || bracketDepth > 0 || backslashContinued;
     const line = lines[i];
+    inStringContinuation[i] = activeQuote !== null || activeSingleQuote !== null || backslashContinued;
+    if (!inStringContinuation[i] && (bracketDepth > 0 || fExprStack.length > 0) && re.test(line)) {
+      bracketDepth = 0;
+      fExprStack.length = 0;
+      const defIndent = indentOf(line);
+      for (let k = i - 1; k >= 0; k--) {
+        if (inStringContinuation[k]) break;
+        const t = lines[k].trim();
+        if (!t || t.startsWith("#")) {
+          isContinuation[k] = false;
+          continue;
+        }
+        if (t.startsWith("@") && indentOf(lines[k]) === defIndent) {
+          isContinuation[k] = false;
+          continue;
+        }
+        break;
+      }
+    }
+    isContinuation[i] = inStringContinuation[i] || bracketDepth > 0 || fExprStack.length > 0;
     backslashContinued = false;
     let j = 0;
     while (j < line.length) {
@@ -3820,6 +4074,43 @@ function extractPythonSymbols(lines) {
         if (line.startsWith(activeQuote, j)) {
           activeQuote = null;
           j += 3;
+          continue;
+        }
+        j++;
+      } else if (activeSingleQuote) {
+        if (line[j] === "\\") {
+          if (j === line.length - 1) {
+            backslashContinued = true;
+            break;
+          }
+          j += 2;
+          continue;
+        }
+        if (activeSingleIsFString) {
+          if (line[j] === "{") {
+            if (line[j + 1] === "{") {
+              j += 2;
+              continue;
+            }
+            fExprStack.push({
+              quote: activeSingleQuote,
+              braceDepth: 1,
+              baseBracketDepth: bracketDepth
+            });
+            activeSingleQuote = null;
+            activeSingleIsFString = false;
+            j++;
+            continue;
+          }
+          if (line[j] === "}" && line[j + 1] === "}") {
+            j += 2;
+            continue;
+          }
+        }
+        if (line[j] === activeSingleQuote) {
+          activeSingleQuote = null;
+          activeSingleIsFString = false;
+          j++;
           continue;
         }
         j++;
@@ -3836,14 +4127,51 @@ function extractPythonSymbols(lines) {
           continue;
         }
         if (line[j] === '"' || line[j] === "'") {
-          const q = line[j];
-          j++;
-          while (j < line.length && line[j] !== q) {
-            if (line[j] === "\\") j += 2;
-            else j++;
-          }
+          activeSingleQuote = line[j] === '"' ? '"' : "'";
+          activeSingleIsFString = isPythonFStringPrefix(line, j);
           j++;
           continue;
+        }
+        if (fExprStack.length > 0) {
+          const top = fExprStack[fExprStack.length - 1];
+          if (top.braceDepth === 1 && bracketDepth === top.baseBracketDepth && line[j] === ":" && line[j + 1] !== "=") {
+            let specDepth = 1;
+            j++;
+            while (j < line.length && specDepth > 0) {
+              if (line[j] === "\\") {
+                j += 2;
+                continue;
+              }
+              if (line[j] === "{") specDepth++;
+              else if (line[j] === "}") specDepth--;
+              j++;
+            }
+            if (specDepth === 0) {
+              fExprStack.pop();
+              activeSingleQuote = top.quote;
+              activeSingleIsFString = true;
+            }
+            continue;
+          }
+          if (line[j] === "{") {
+            top.braceDepth++;
+            bracketDepth++;
+            j++;
+            continue;
+          }
+          if (line[j] === "}") {
+            if (top.braceDepth === 1) {
+              fExprStack.pop();
+              activeSingleQuote = top.quote;
+              activeSingleIsFString = true;
+              j++;
+              continue;
+            }
+            top.braceDepth--;
+            bracketDepth = Math.max(0, bracketDepth - 1);
+            j++;
+            continue;
+          }
         }
         if (line[j] === "(" || line[j] === "[" || line[j] === "{") bracketDepth++;
         else if (line[j] === ")" || line[j] === "]" || line[j] === "}") {
@@ -3852,8 +4180,11 @@ function extractPythonSymbols(lines) {
         j++;
       }
     }
+    if (activeSingleQuote && !backslashContinued) {
+      activeSingleQuote = null;
+      activeSingleIsFString = false;
+    }
   }
-  const indentOf = (l) => (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
   const raw = [];
   for (let i = 0; i < lines.length; i++) {
     if (isContinuation[i]) continue;
@@ -3868,7 +4199,9 @@ function extractPythonSymbols(lines) {
     let startIdx = item.defIdx;
     for (let j = item.defIdx - 1; j >= 0; j--) {
       if (isContinuation[j] || !lines[j].trim()) continue;
-      if (!lines[j].trimStart().startsWith("@")) break;
+      const trimmed = lines[j].trimStart();
+      if (trimmed.startsWith("#")) continue;
+      if (!trimmed.startsWith("@") || indentOf(lines[j]) !== item.indent) break;
       startIdx = j;
     }
     let endIdx = lines.length - 1;
@@ -3884,7 +4217,9 @@ function extractPythonSymbols(lines) {
     }
     while (endIdx > item.defIdx) {
       const trimmed = lines[endIdx].trim();
-      if (trimmed && !(trimmed.startsWith("#") && indentOf(lines[endIdx]) <= item.indent)) break;
+      if (trimmed && !(!isContinuation[endIdx] && trimmed.startsWith("#") && indentOf(lines[endIdx]) <= item.indent)) {
+        break;
+      }
       endIdx--;
     }
     symbols.push({
@@ -4901,6 +5236,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
 
 // src/tools/run-checks.ts
 import { promises as fs4 } from "node:fs";
+import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIdx = 0;
@@ -4978,10 +5314,10 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   } catch {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
-  const concurrency = clampInt2(input.concurrency ?? 4, 1, 8);
-  const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, MCP_CALL_BUDGET_SEC);
+  const concurrency = clampInt2(input.concurrency, 1, 8, 4);
+  const defaultTimeoutSec = clampInt2(input.timeoutSec, 1, MCP_CALL_BUDGET_SEC, 60);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt2(input.maxChars ?? 8e3, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxChars = clampInt2(input.maxChars, 500, DEFAULT_INLINE_MAX_BYTES, 8e3);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const normalized = [];
   for (let i = 0; i < rawCommands.length; i++) {
@@ -4993,8 +5329,15 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
         isError: true
       };
     }
-    const cmdCwd = spec.cwd ? resolvePath(spec.cwd, baseCwd) : baseCwd;
-    if (spec.cwd) {
+    if (spec.cwd !== void 0 && spec.cwd !== null && typeof spec.cwd !== "string") {
+      return {
+        text: `Error: commands[${i}].cwd must be a string path.`,
+        isError: true
+      };
+    }
+    const trimmedSpecCwd = spec.cwd?.trim() || "";
+    const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
+    if (trimmedSpecCwd) {
       try {
         const st = await fs4.stat(cmdCwd);
         if (!st.isDirectory()) {
@@ -5011,9 +5354,10 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       }
     }
     const cmdTimeoutSec = clampInt2(
-      spec.timeoutSec ?? defaultTimeoutSec,
+      spec.timeoutSec,
       1,
-      MCP_CALL_BUDGET_SEC
+      MCP_CALL_BUDGET_SEC,
+      defaultTimeoutSec
     );
     normalized.push({
       index: i,
@@ -5023,14 +5367,15 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       timeoutMs: cmdTimeoutSec * 1e3
     });
   }
-  const wallStart = Date.now();
-  const deadline = wallStart + budgetMs;
+  const safeBudgetMs = Number.isFinite(budgetMs) && budgetMs > 0 ? Math.max(100, Math.trunc(budgetMs)) : MCP_CALL_BUDGET_SEC * 1e3;
+  const wallStart = performance.now();
+  const deadline = wallStart + safeBudgetMs;
   const outcomes = await mapWithConcurrency(
     normalized,
     concurrency,
     async (spec) => {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) return { spec, result: null, passed: false };
+      const remainingMs = deadline - performance.now();
+      if (remainingMs < 100) return { spec, result: null, passed: false };
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
         timeoutMs: Math.min(spec.timeoutMs, remainingMs)
@@ -5039,7 +5384,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       return { spec, result, passed };
     }
   );
-  const wallMs = Date.now() - wallStart;
+  const wallMs = Math.round(performance.now() - wallStart);
   const passedCount = outcomes.filter((o) => o.passed).length;
   const notRunCount = outcomes.filter((o) => !o.result).length;
   const failedCount = outcomes.length - passedCount - notRunCount;
@@ -5047,12 +5392,15 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   if (failedCount > 0) counts.push(`${failedCount} failed`);
   if (notRunCount > 0) {
     counts.push(
-      `${notRunCount} not run (call time budget of ${Math.round(budgetMs / 1e3)}s used up; run them in another call)`
+      `${notRunCount} not run (call time budget of ${Math.round(safeBudgetMs / 1e3)}s used up; run them in another call)`
     );
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
   const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget = failedCount > 0 ? Math.max(160, Math.floor((usableChars - passedCount * 120) / failedCount)) : 320;
+  const failedBudget = failedCount > 0 ? Math.max(
+    160,
+    Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount)
+  ) : 320;
   const fullPerCmdBudget = Math.max(
     160,
     Math.floor(usableChars / outcomes.length)
@@ -5105,20 +5453,55 @@ ${fittedBlocks}`,
   }
   return { text, isError: false };
 }
-function clampInt2(val, min, max) {
-  if (!Number.isFinite(val)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(val)));
+function clampInt2(val, min, max, fallback) {
+  if (typeof val !== "number" && typeof val !== "string") return fallback;
+  if (typeof val === "string" && val.trim() === "") return fallback;
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
 // src/mcp-server.ts
 var SERVER_VERSION = "0.2.6";
 function createAgyFastServer() {
+  let defaultCwd;
+  const resolveToolArgs = (args) => {
+    if (args.cwd !== void 0 && args.cwd !== null && typeof args.cwd !== "string") {
+      return {
+        ok: false,
+        error: `Error: 'cwd' must be a string path (received ${Array.isArray(args.cwd) ? "array" : typeof args.cwd}).`
+      };
+    }
+    const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
+    if (!rawCwd) {
+      return {
+        ok: true,
+        value: defaultCwd ? { ...args, cwd: defaultCwd } : { ...args, cwd: void 0 }
+      };
+    }
+    const isHomePath = rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
+    if (defaultCwd && !path6.isAbsolute(rawCwd) && !isHomePath) {
+      return {
+        ok: true,
+        value: { ...args, cwd: path6.resolve(defaultCwd, rawCwd) }
+      };
+    }
+    return { ok: true, value: { ...args, cwd: rawCwd } };
+  };
   const server = new McpStdioServer({
     name: "agy-fast",
     version: SERVER_VERSION,
-    // agy starts plugin servers in the plugin directory; relative paths and
-    // the default cwd of every tool must resolve against the workspace instead.
-    onWorkspaceRoots: (paths) => process.chdir(paths[0])
+    onWorkspaceRoots: (paths) => {
+      for (const candidate of paths) {
+        try {
+          if (fs5.statSync(candidate).isDirectory()) {
+            defaultCwd = candidate;
+            return;
+          }
+        } catch {
+        }
+      }
+    }
   });
   server.registerTool(
     {
@@ -5203,7 +5586,11 @@ function createAgyFastServer() {
         required: ["queries"]
       }
     },
-    (args) => runBatchSearch(args)
+    async (args) => {
+      const resolved = resolveToolArgs(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runBatchSearch(resolved.value);
+    }
   );
   server.registerTool(
     {
@@ -5290,7 +5677,11 @@ function createAgyFastServer() {
         required: ["edits"]
       }
     },
-    (args) => runApplyEdits(args)
+    async (args) => {
+      const resolved = resolveToolArgs(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runApplyEdits(resolved.value);
+    }
   );
   server.registerTool(
     {
@@ -5340,7 +5731,11 @@ function createAgyFastServer() {
         }
       }
     },
-    (args) => runReadSlices(args)
+    async (args) => {
+      const resolved = resolveToolArgs(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runReadSlices(resolved.value);
+    }
   );
   server.registerTool(
     {
@@ -5396,7 +5791,11 @@ function createAgyFastServer() {
         required: ["commands"]
       }
     },
-    (args) => runChecks(args)
+    async (args) => {
+      const resolved = resolveToolArgs(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runChecks(resolved.value);
+    }
   );
   return server;
 }
@@ -5410,6 +5809,11 @@ function main() {
       process.exit(0);
     });
   };
+  process.stdout.on("error", (err) => {
+    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
+      process.exit(0);
+    }
+  });
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
   server.listen(process.stdin, process.stdout, flushAndExit);

@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { McpStdioServer } from "./protocol/mcp.js";
 import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
@@ -8,12 +10,51 @@ import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 const SERVER_VERSION = "0.2.6";
 
 export function createAgyFastServer(): McpStdioServer {
+  // agy starts plugin servers in the plugin directory; resolve omitted or relative
+  // tool `cwd` values against the first valid workspace root without mutating process.cwd().
+  let defaultCwd: string | undefined;
+
+  const resolveToolArgs = <T extends { cwd?: string }>(
+    args: Record<string, unknown>,
+  ): { ok: true; value: T } | { ok: false; error: string } => {
+    if (args.cwd !== undefined && args.cwd !== null && typeof args.cwd !== "string") {
+      return {
+        ok: false,
+        error: `Error: 'cwd' must be a string path (received ${Array.isArray(args.cwd) ? "array" : typeof args.cwd}).`,
+      };
+    }
+    const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
+    if (!rawCwd) {
+      return {
+        ok: true,
+        value: (defaultCwd ? { ...args, cwd: defaultCwd } : { ...args, cwd: undefined }) as unknown as T,
+      };
+    }
+    const isHomePath = rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
+    if (defaultCwd && !path.isAbsolute(rawCwd) && !isHomePath) {
+      return {
+        ok: true,
+        value: { ...args, cwd: path.resolve(defaultCwd, rawCwd) } as unknown as T,
+      };
+    }
+    return { ok: true, value: { ...args, cwd: rawCwd } as unknown as T };
+  };
+
   const server = new McpStdioServer({
     name: "agy-fast",
     version: SERVER_VERSION,
-    // agy starts plugin servers in the plugin directory; relative paths and
-    // the default cwd of every tool must resolve against the workspace instead.
-    onWorkspaceRoots: (paths) => process.chdir(paths[0]!),
+    onWorkspaceRoots: (paths) => {
+      for (const candidate of paths) {
+        try {
+          if (fs.statSync(candidate).isDirectory()) {
+            defaultCwd = candidate;
+            return;
+          }
+        } catch {
+          // Ignore nonexistent or inaccessible root paths
+        }
+      }
+    },
   });
 
   server.registerTool(
@@ -101,7 +142,11 @@ export function createAgyFastServer(): McpStdioServer {
         required: ["queries"],
       },
     },
-    (args) => runBatchSearch(args as unknown as BatchSearchInput),
+    async (args) => {
+      const resolved = resolveToolArgs<BatchSearchInput>(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runBatchSearch(resolved.value);
+    },
   );
 
   server.registerTool(
@@ -192,7 +237,11 @@ export function createAgyFastServer(): McpStdioServer {
         required: ["edits"],
       },
     },
-    (args) => runApplyEdits(args as unknown as ApplyEditsInput),
+    async (args) => {
+      const resolved = resolveToolArgs<ApplyEditsInput>(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runApplyEdits(resolved.value);
+    },
   );
 
   server.registerTool(
@@ -244,7 +293,11 @@ export function createAgyFastServer(): McpStdioServer {
         },
       },
     },
-    (args) => runReadSlices(args as unknown as ReadSlicesInput),
+    async (args) => {
+      const resolved = resolveToolArgs<ReadSlicesInput>(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runReadSlices(resolved.value);
+    },
   );
 
   server.registerTool(
@@ -302,7 +355,11 @@ export function createAgyFastServer(): McpStdioServer {
         required: ["commands"],
       },
     },
-    (args) => runChecks(args as unknown as RunChecksInput),
+    async (args) => {
+      const resolved = resolveToolArgs<RunChecksInput>(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runChecks(resolved.value);
+    },
   );
 
   return server;
@@ -319,6 +376,11 @@ function main(): void {
       process.exit(0);
     });
   };
+  process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
+      process.exit(0);
+    }
+  });
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
   server.listen(process.stdin, process.stdout, flushAndExit);

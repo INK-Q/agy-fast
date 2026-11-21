@@ -120,6 +120,20 @@ describe("run_checks", () => {
     });
     assert.equal(badSubCwd.isError, true);
     assert.match(badSubCwd.text, /does not exist/);
+
+    // Non-string commands[i].cwd returns a clean validation error; boolean timeoutSec falls back
+    const nonStrSubCwd = await runChecks({
+      commands: [{ name: "bad-type", command: `${nodeBin} -e "0"`, cwd: 123 as unknown as string }],
+    });
+    assert.equal(nonStrSubCwd.isError, true);
+    assert.match(nonStrSubCwd.text, /commands\[0\]\.cwd must be a string/);
+
+    const boolTimeout = await runChecks({
+      timeoutSec: false as unknown as number,
+      commands: [{ name: "bool-timeout", command: `${nodeBin} -e "setTimeout(() => console.log('ok'), 1150)"` }],
+    });
+    assert.equal(boolTimeout.isError, false);
+    assert.match(boolTimeout.text, /1\/1 passed/);
   });
 
   it("captures npm ERR! lines and respects tight maxChars across multiple failures", async () => {

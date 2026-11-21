@@ -634,11 +634,19 @@ export async function runApplyEdits(
           isError: true,
         };
       }
+      const rawSpecTimeout = input.verify.timeoutSec as unknown;
+      const parsedSpecTimeout =
+        (typeof rawSpecTimeout === "number" ||
+          (typeof rawSpecTimeout === "string" && rawSpecTimeout.trim() !== ""))
+          ? Number(rawSpecTimeout)
+          : undefined;
       validatedVerify = {
         command: cmd,
         cwd: input.verify.cwd,
         timeoutSec:
-          typeof input.verify.timeoutSec === "number" ? input.verify.timeoutSec : undefined,
+          parsedSpecTimeout !== undefined && Number.isFinite(parsedSpecTimeout)
+            ? parsedSpecTimeout
+            : undefined,
       };
     } else {
       return {
@@ -925,7 +933,12 @@ export async function runApplyEdits(
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-    const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
+    const timeoutCandidate: unknown = verifySpec.timeoutSec ?? input.verifyTimeoutSec;
+    const rawTimeoutSec =
+      (typeof timeoutCandidate === "number" ||
+        (typeof timeoutCandidate === "string" && timeoutCandidate.trim() !== ""))
+        ? Number(timeoutCandidate)
+        : 60;
     const timeoutMs =
       (Number.isFinite(rawTimeoutSec)
         ? Math.max(1, Math.min(MCP_CALL_BUDGET_SEC, Math.trunc(rawTimeoutSec)))
