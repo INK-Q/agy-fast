@@ -199,7 +199,7 @@ export function createAgyFastServer(
     {
       name: "batch_search",
       description:
-        "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+        "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch/grep/rev-list/cat-file) concurrently in one call with bounded output.",
       inputSchema: {
         type: "object",
         properties: {
