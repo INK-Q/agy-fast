@@ -76,24 +76,37 @@ export function truncateWithByteNotice(text: string, maxBytes: number): string {
     : sliceUtf8Bytes(result, maxBytes);
 }
 
-export function truncateWithNotice(text: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
+export function sliceSafeChars(text: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (text.length <= limit) return text;
+  let end = limit;
+  const lastCode = text.charCodeAt(end - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    end -= 1;
+  }
+  return text.slice(0, end);
+}
 
-  if (maxChars < 48) {
-    if (maxChars <= 3) return text.slice(0, maxChars);
-    return `${text.slice(0, maxChars - 3)}...`;
+export function truncateWithNotice(text: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (text.length <= limit) return text;
+
+  if (limit < 48) {
+    if (limit <= 3) return sliceSafeChars(text, limit);
+    return `${sliceSafeChars(text, limit - 3)}...`;
   }
 
   const maxNoticeLen = `\n... [truncated: showed ${text.length} of ${text.length} chars]`.length;
-  const cutoff = Math.max(0, maxChars - maxNoticeLen);
-  let slice = text.slice(0, cutoff);
+  const cutoff = Math.max(0, limit - maxNoticeLen);
+  let slice = sliceSafeChars(text, cutoff);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > cutoff * 0.6) {
     slice = slice.slice(0, lastNewline);
   }
   const result = `${slice}\n... [truncated: showed ${slice.length} of ${text.length} chars]`;
-  return result.length <= maxChars ? result : result.slice(0, maxChars);
+  return result.length <= limit ? result : sliceSafeChars(result, limit);
 }
 
 /**
