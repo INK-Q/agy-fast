@@ -1543,4 +1543,57 @@ describe("batch_search", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
+
+  it("caps per-line UTF-8 bytes in formatted matches so multibyte docs fit more hits inline", async () => {
+    const mbDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-mb-"));
+    try {
+      // 20 lines of 180 CJK chars (~540 UTF-8 bytes each, under 240 UTF-16 chars)
+      const cjkLines = Array.from(
+        { length: 20 },
+        (_, idx) => `标记${String(idx + 1).padStart(2, "0")}：${"多字节搜索性能测试内容".repeat(17)}`,
+      );
+      await fs.writeFile(path.join(mbDir, "notes.md"), cjkLines.join("\n") + "\n", "utf8");
+      // Pure ASCII 240-char line must stay unclipped; 250-char ASCII clips at 240
+      const ascii240 = `ascii240_${"a".repeat(231)}`;
+      const ascii250 = `ascii250_${"b".repeat(241)}`;
+      await fs.writeFile(path.join(mbDir, "ascii.txt"), `${ascii240}\n${ascii250}\n`, "utf8");
+
+      for (const forceNodeFallback of [false, true]) {
+        const res = await runBatchSearch(
+          {
+            cwd: mbDir,
+            queries: [
+              { type: "text", pattern: "标记", path: "notes.md", maxResults: 20 },
+              { type: "text", pattern: "ascii2", path: "ascii.txt" },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(res.isError, false);
+        assert.ok(Buffer.byteLength(res.text, "utf8") <= 8_800);
+        // Every CJK line is bounded to <= 300 UTF-8 bytes + "..." instead of 540 bytes,
+        // so all 20 matches fit without triggering response truncation.
+        assert.match(res.text, /标记20：/);
+        assert.doesNotMatch(res.text, /\[truncated:/);
+        for (const line of res.text.split("\n")) {
+          if (/^\s+\d+:\s+标记/.test(line)) {
+            const matchText = line.replace(/^\s+\d+:\s+/, "");
+            assert.ok(matchText.endsWith("..."), `expected clipped CJK line: ${matchText}`);
+            assert.ok(
+              Buffer.byteLength(matchText, "utf8") <= 303,
+              `expected <= 303 bytes, got ${Buffer.byteLength(matchText, "utf8")}`,
+            );
+          }
+        }
+        assert.ok(res.text.includes(`  1: ${ascii240}`));
+        assert.ok(res.text.includes(`  2: ${ascii250.slice(0, 240)}...`));
+        assert.equal(
+          /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(res.text),
+          false,
+        );
+      }
+    } finally {
+      await fs.rm(mbDir, { recursive: true, force: true });
+    }
+  });
 });
