@@ -1442,6 +1442,189 @@ function extractJsonYamlSymbols(lines: string[], isJson: boolean): SymbolEntry[]
   return symbols;
 }
 
+function stripTomlInlineComment(line: string): string {
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (inDouble) {
+      if (ch === "\\") {
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'") {
+      inSingle = true;
+    } else if (ch === "#") {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function parseTomlHeader(line: string): { kind: "table" | "array-table"; name: string } | null {
+  const noComment = stripTomlInlineComment(line).trim();
+  if (!noComment.startsWith("[") || !noComment.endsWith("]")) return null;
+
+  let kind: "table" | "array-table" = "table";
+  let inner = "";
+  if (noComment.startsWith("[[") && noComment.endsWith("]]")) {
+    kind = "array-table";
+    inner = noComment.slice(2, -2).trim();
+  } else {
+    inner = noComment.slice(1, -1).trim();
+  }
+  if (!inner) return null;
+
+  // Validate header body: balanced quotes and no unquoted brackets or commas
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!;
+    if (inDouble) {
+      if (ch === "\\") {
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'") {
+      inSingle = true;
+    } else if (ch === "[" || ch === "]" || ch === "," || ch === "=") {
+      return null;
+    }
+  }
+  if (inDouble || inSingle) return null;
+  return { kind, name: inner };
+}
+
+function extractTomlSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  let inMulti: '"""' | "'''" | null = null;
+  let arrayDepth = 0;
+  let inlineTableDepth = 0;
+  let seenTable = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const atTopLevel = inMulti === null && arrayDepth === 0 && inlineTableDepth === 0;
+
+    if (atTopLevel) {
+      const header = parseTomlHeader(line);
+      if (header) {
+        seenTable = true;
+        symbols.push({
+          kind: header.kind,
+          name: header.name,
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0,
+        });
+        continue;
+      }
+      if (!seenTable) {
+        const keyMatch = /^\s*([A-Za-z0-9_.-]+|"[^"\n]+"|'[^'\n]+')\s*=/.exec(line);
+        if (keyMatch && keyMatch[1]) {
+          symbols.push({
+            kind: "key",
+            name: keyMatch[1],
+            startLine: i + 1,
+            endLine: i + 1,
+            depth: 0,
+          });
+        }
+      }
+    }
+
+    // Advance multiline string & bracket/brace state across this line
+    for (let j = 0; j < line.length; j++) {
+      if (inMulti === '"""') {
+        if (line[j] === "\\") {
+          j++;
+          continue;
+        }
+        if (line.startsWith('"""', j)) {
+          let run = 3;
+          while (run < 5 && line[j + run] === '"') run++;
+          j += run - 1;
+          inMulti = null;
+        }
+        continue;
+      }
+      if (inMulti === "'''") {
+        if (line.startsWith("'''", j)) {
+          let run = 3;
+          while (run < 5 && line[j + run] === "'") run++;
+          j += run - 1;
+          inMulti = null;
+        }
+        continue;
+      }
+
+      const ch = line[j]!;
+      if (ch === "#") break;
+      if (line.startsWith('"""', j)) {
+        inMulti = '"""';
+        j += 2;
+      } else if (line.startsWith("'''", j)) {
+        inMulti = "'''";
+        j += 2;
+      } else if (ch === '"') {
+        j++;
+        while (j < line.length) {
+          if (line[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (line[j] === '"') break;
+          j++;
+        }
+      } else if (ch === "'") {
+        j++;
+        while (j < line.length && line[j] !== "'") j++;
+      } else if (ch === "[") {
+        arrayDepth++;
+      } else if (ch === "]") {
+        arrayDepth = Math.max(0, arrayDepth - 1);
+      } else if (ch === "{") {
+        inlineTableDepth++;
+      } else if (ch === "}") {
+        inlineTableDepth = Math.max(0, inlineTableDepth - 1);
+      }
+    }
+  }
+
+  for (let idx = 0; idx < symbols.length; idx++) {
+    const cur = symbols[idx]!;
+    let endLine =
+      idx + 1 < symbols.length ? symbols[idx + 1]!.startLine - 1 : lines.length;
+    while (endLine > cur.startLine && !(lines[endLine - 1] ?? "").trim()) {
+      endLine--;
+    }
+    cur.endLine = Math.max(cur.startLine, endLine);
+  }
+  return symbols;
+}
+
 function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const state: ScanState = {
@@ -2541,6 +2724,8 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".toml":
+      return extractTomlSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }

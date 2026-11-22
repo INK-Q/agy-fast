@@ -1333,4 +1333,47 @@ describe("read_slices", () => {
     assert.match(cjkRes.text, /--- L150-L250 \(of 261\) ---/);
     assert.match(cjkRes.text, /第150行：/);
   });
+
+  it("extracts TOML table, array-table, and root key outlines while ignoring multiline strings and arrays", async () => {
+    const tomlDir = path.join(tmpDir, "toml-outline");
+    await fs.mkdir(tomlDir, { recursive: true });
+    const pyprojRel = "toml-outline/pyproject.toml";
+    const pyprojContent = [
+      'line-length = 100 # root setting',
+      'description = """',
+      '[not.a.table]',
+      '[[also.not.array.table]]',
+      '"""',
+      '',
+      '[build-system]',
+      'requires = [',
+      '  "[dep-in-array]",',
+      '  "setuptools>=68",',
+      ']',
+      '',
+      '[tool.pytest.ini_options] # trailing comment',
+      'testpaths = ["tests"]',
+      '',
+      '[[tool.uv.index]]',
+      'name = "internal"',
+      'url = "https://example.invalid/simple"',
+      '',
+      '[tool."quoted.pkg"]',
+      'enabled = true',
+      '',
+    ].join("\n");
+    await fs.writeFile(path.join(tmpDir, pyprojRel), pyprojContent, "utf8");
+
+    const res = await runQuickOutline({ cwd: tmpDir, paths: [pyprojRel] });
+    assert.equal(res.isError, false);
+    assert.match(res.text, /L1 \[key\] line-length/);
+    assert.match(res.text, /L2-L5 \[key\] description/);
+    assert.match(res.text, /L7-L11 \[table\] build-system/);
+    assert.match(res.text, /L13-L14 \[table\] tool\.pytest\.ini_options/);
+    assert.match(res.text, /L16-L18 \[array-table\] tool\.uv\.index/);
+    assert.match(res.text, /L20-L21 \[table\] tool\."quoted\.pkg"/);
+    assert.doesNotMatch(res.text, /not\.a\.table/);
+    assert.doesNotMatch(res.text, /also\.not\.array\.table/);
+    assert.doesNotMatch(res.text, /dep-in-array/);
+  });
 });
