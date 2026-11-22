@@ -1271,4 +1271,66 @@ describe("read_slices", () => {
     assert.match(encRes.text, /be\.rc\nERROR: UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 BE\]/);
     assert.match(encRes.text, /u32\.txt\nERROR: Binary file cannot be read as text:/);
   });
+
+  it("water-fills budgets across multiple ranges within one file to prevent later-range starvation", async () => {
+    const dir = path.join(tmpDir, "multi-range-fairness");
+    await fs.mkdir(dir, { recursive: true });
+
+    // 1. Two oversized ranges in a single file must both appear instead of range 1 starving range 2
+    const longPyRel = "multi-range-fairness/long_module.py";
+    const pyLines: string[] = [];
+    for (let i = 1; i <= 600; i++) {
+      pyLines.push(`value_${String(i).padStart(3, "0")} = "${"x".repeat(60)}_line_${i}"`);
+    }
+    await fs.writeFile(path.join(tmpDir, longPyRel), pyLines.join("\n") + "\n", "utf8");
+
+    const twoRangeRes = await runReadSlices({
+      cwd: tmpDir,
+      slices: [{ path: longPyRel, ranges: [[1, 220], [400, 560]] }],
+      maxChars: 4_000,
+    });
+    assert.equal(twoRangeRes.isError, false);
+    assert.ok(twoRangeRes.text.length <= 4_000);
+    assert.ok(Buffer.byteLength(twoRangeRes.text, "utf8") <= 8_800);
+    assert.match(twoRangeRes.text, /--- L1-L220 \(of 601\) ---/);
+    assert.match(twoRangeRes.text, /value_001 =/);
+    assert.match(twoRangeRes.text, /--- L400-L560 \(of 601\) ---/);
+    assert.match(twoRangeRes.text, /value_400 =/);
+    assert.match(twoRangeRes.text, /\[tip: MCP responses are hard-capped <=8\.8KB inline/);
+
+    // 2. Short range keeps 100% of its lines while two long ranges split remaining budget
+    const asymRes = await runReadSlices({
+      cwd: tmpDir,
+      lineRanges: [`${longPyRel}:1-3,100-300,400-560`],
+      maxChars: 4_000,
+    });
+    assert.equal(asymRes.isError, false);
+    assert.ok(asymRes.text.length <= 4_000);
+    assert.match(asymRes.text, /value_001 =/);
+    assert.match(asymRes.text, /value_003 =/);
+    assert.match(asymRes.text, /--- L100-L300 \(of 601\) ---/);
+    assert.match(asymRes.text, /value_100 =/);
+    assert.match(asymRes.text, /--- L400-L560 \(of 601\) ---/);
+    assert.match(asymRes.text, /value_400 =/);
+
+    // 3. Multibyte CJK multi-range file respects UTF-8 8800-byte inline ceiling and preserves both ranges
+    const cjkRel = "multi-range-fairness/cjk_notes.md";
+    const cjkLines: string[] = [];
+    for (let i = 1; i <= 260; i++) {
+      cjkLines.push(`第${String(i).padStart(3, "0")}行：${"中文测试内容".repeat(10)}`);
+    }
+    await fs.writeFile(path.join(tmpDir, cjkRel), cjkLines.join("\n") + "\n", "utf8");
+
+    const cjkRes = await runReadSlices({
+      cwd: tmpDir,
+      slices: [{ path: cjkRel, ranges: [[1, 120], [150, 250]] }],
+      maxChars: 8_500,
+    });
+    assert.equal(cjkRes.isError, false);
+    assert.ok(Buffer.byteLength(cjkRes.text, "utf8") <= 8_800);
+    assert.match(cjkRes.text, /--- L1-L120 \(of 261\) ---/);
+    assert.match(cjkRes.text, /第001行：/);
+    assert.match(cjkRes.text, /--- L150-L250 \(of 261\) ---/);
+    assert.match(cjkRes.text, /第150行：/);
+  });
 });

@@ -2798,6 +2798,39 @@ function packOutlineToBudget(
   return fallbackFooter ? `${header}${fallbackFooter}` : header;
 }
 
+function packSliceBlocksToBudget(
+  header: string,
+  blocks: string[],
+  charBudget: number,
+  byteBudget: number,
+): string {
+  const fullText = `${header}\n${blocks.join("\n")}`;
+  if (
+    blocks.length <= 1 ||
+    (fullText.length <= charBudget &&
+      Buffer.byteLength(fullText, "utf8") <= byteBudget)
+  ) {
+    return fullText;
+  }
+
+  const prefix = `${header}\n`;
+  const remChars = charBudget - prefix.length;
+  const remBytes = byteBudget - Buffer.byteLength(prefix, "utf8");
+  if (remChars < blocks.length * 48 || remBytes < blocks.length * 48) {
+    return fitSectionsToByteBudget([fullText], charBudget, byteBudget, "\n");
+  }
+
+  const fittedBlocks = fitSectionsToByteBudget(blocks, remChars, remBytes, "\n");
+  const combined = `${prefix}${fittedBlocks}`;
+  if (
+    combined.length <= charBudget &&
+    Buffer.byteLength(combined, "utf8") <= byteBudget
+  ) {
+    return combined;
+  }
+  return fitSectionsToByteBudget([combined], charBudget, byteBudget, "\n");
+}
+
 export async function runReadSlices(
   input: ReadSlicesInput,
 ): Promise<{ text: string; isError: boolean }> {
@@ -2993,6 +3026,7 @@ export async function runReadSlices(
 
   type RenderedSection =
     | { kind: "outline"; header: string; symbols: SymbolEntry[]; fullText: string }
+    | { kind: "slice"; header: string; blocks: string[]; fullText: string }
     | { kind: "static"; fullText: string };
 
   const sectionEntries: RenderedSection[] = [];
@@ -3093,9 +3127,19 @@ export async function runReadSlices(
             blocks.push(snippet.join("\n"));
           }
 
+          const header = `## Slice: ${relPath} (${totalLines} lines)`;
+          const fullText = `${header}\n${blocks.join("\n")}`;
+          if (blocks.length > 1) {
+            return {
+              kind: "slice",
+              header,
+              blocks,
+              fullText,
+            };
+          }
           return {
             kind: "static",
-            fullText: `## Slice: ${relPath} (${totalLines} lines)\n${blocks.join("\n")}`,
+            fullText,
           };
         } catch (err) {
           return {
@@ -3153,6 +3197,18 @@ export async function runReadSlices(
       return packOutlineToBudget(
         entry.header,
         entry.symbols,
+        charBudgets[idx]!,
+        byteBudgets[idx]!,
+      );
+    }
+    if (
+      entry.kind === "slice" &&
+      entry.blocks.length > 1 &&
+      (charSizes[idx]! > charBudgets[idx]! || byteSizes[idx]! > byteBudgets[idx]!)
+    ) {
+      return packSliceBlocksToBudget(
+        entry.header,
+        entry.blocks,
         charBudgets[idx]!,
         byteBudgets[idx]!,
       );
