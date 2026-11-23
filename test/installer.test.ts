@@ -685,4 +685,73 @@ describe("installer", () => {
       await fs.rm(modeHome, { recursive: true, force: true });
     }
   });
+
+  it("runs post-update doctor from the newly installed install.mjs instead of stale in-memory code", async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-update-doctor-"));
+    try {
+      const homeDir = path.join(tmpRoot, "home");
+      const remoteRepo = path.join(tmpRoot, "remote-repo");
+      await fs.mkdir(homeDir, { recursive: true });
+      const env = makeIsolatedEnv(homeDir, {
+        AGY_FAST_AUTO_UPDATE: "off",
+        AGY_FAST_CACHE_DIR: path.join(homeDir, ".gemini", "cache", "agy-fast"),
+      });
+      const pluginDir = path.join(homeDir, ".gemini", "config", "plugins", "agy-fast");
+
+      // 1. Install baseline plugin into isolated HOME
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"], {
+        env,
+        encoding: "utf8",
+      });
+
+      // 2. Prepare a local git release v9.9.9 whose scripts/install.mjs emits a distinct doctor marker
+      await fs.cp(pluginDir, remoteRepo, { recursive: true });
+      const remoteManifestPath = path.join(remoteRepo, "plugin.json");
+      const remoteManifest = JSON.parse(await fs.readFile(remoteManifestPath, "utf8"));
+      remoteManifest.version = "9.9.9";
+      await fs.writeFile(remoteManifestPath, `${JSON.stringify(remoteManifest, null, 2)}\n`, "utf8");
+
+      const remoteInstallerPath = path.join(remoteRepo, "scripts", "install.mjs");
+      const remoteInstallerSrc = await fs.readFile(remoteInstallerPath, "utf8");
+      assert.ok(remoteInstallerSrc.includes('console.log("agy-fast health check:");'));
+      await fs.writeFile(
+        remoteInstallerPath,
+        remoteInstallerSrc.replace(
+          'console.log("agy-fast health check:");',
+          'console.log("agy-fast health check:");\n    console.log("  - Fresh doctor: POST_UPDATE_FRESH_DOCTOR_V999");',
+        ),
+        "utf8",
+      );
+
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+      };
+      execFileSync("git", ["init", "-b", "main"], { cwd: remoteRepo, env: gitEnv, stdio: "ignore" });
+      execFileSync("git", ["add", "."], { cwd: remoteRepo, env: gitEnv, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "release v9.9.9"], { cwd: remoteRepo, env: gitEnv, stdio: "ignore" });
+      execFileSync("git", ["tag", "v9.9.9"], { cwd: remoteRepo, env: gitEnv, stdio: "ignore" });
+
+      // 3. Downgrade installed version so update triggers v0.0.1 -> v9.9.9
+      const installedManifestPath = path.join(pluginDir, "plugin.json");
+      const installedManifest = JSON.parse(await fs.readFile(installedManifestPath, "utf8"));
+      installedManifest.version = "0.0.1";
+      await fs.writeFile(installedManifestPath, `${JSON.stringify(installedManifest, null, 2)}\n`, "utf8");
+
+      // 4. Invoke the pre-update INSTALL_SCRIPT: post-update doctor must execute the updated install.mjs on disk
+      const updateOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "update", "--no-acp", "--repo", remoteRepo],
+        { env, encoding: "utf8" },
+      );
+      assert.match(updateOut, /Updated agy-fast v0\.0\.1 -> v9\.9\.9/);
+      assert.match(updateOut, /POST_UPDATE_FRESH_DOCTOR_V999/);
+      assert.match(updateOut, /Version\s*: v9\.9\.9/);
+    } finally {
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });

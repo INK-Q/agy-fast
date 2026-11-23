@@ -241,6 +241,7 @@ function parseArgs(argv) {
   return {
     command,
     targetDir,
+    projectDir,
     isProject: Boolean(projectDir),
     isCustomTarget,
     useLink,
@@ -1587,7 +1588,7 @@ async function runUpdate(opts) {
   }
 
   if (parsed.status === "updated") {
-    const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
+    const ok = await runPostUpdateDoctor(resolvedDst, opts, syncIsolated);
     if (!ok) {
       throw new Error("Post-update health check failed.");
     }
@@ -1596,6 +1597,28 @@ async function runUpdate(opts) {
       console.log("Update complete. Start a new session (or reload Desktop/IDE window) to load the updated MCP server.");
     }
   }
+}
+
+async function runPostUpdateDoctor(resolvedDst, opts, syncIsolated) {
+  const updatedInstaller = path.join(resolvedDst, "scripts", "install.mjs");
+  if (await pathExists(updatedInstaller)) {
+    const doctorArgs = [updatedInstaller, "doctor"];
+    if (opts.isCustomTarget) {
+      doctorArgs.push("--target", resolvedDst);
+    } else if (opts.isProject && opts.projectDir) {
+      doctorArgs.push("--project", opts.projectDir);
+    }
+    if (opts.skipAcp) doctorArgs.push("--no-acp");
+    if (opts.quiet) doctorArgs.push("--quiet");
+    const res = spawnSync(process.execPath, doctorArgs, {
+      stdio: opts.quiet ? "ignore" : "inherit",
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    return !res.error && res.status === 0;
+  }
+  const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
+  return ok;
 }
 
 async function runUninstall(opts) {
