@@ -1936,4 +1936,96 @@ describe("read_slices", () => {
       ["function:default:1-3"],
     );
   });
+
+  it("ignores </script> and </style> inside literals/comments in SFCs and outlines .astro components", () => {
+    const vueLiteralClose = [
+      '<script setup lang="ts">', // 1
+      'const fakeStr = "</script>";', // 2
+      "const fakeTpl = `<script>${1 + 1}</script>`;", // 3
+      "// line comment mentioning </script>", // 4
+      "/* block comment mentioning </script> */", // 5
+      "function renderEmbed() {", // 6
+      "  return fakeStr + fakeTpl;", // 7
+      "}", // 8
+      "</script>", // 9
+      "", // 10
+      "<template>", // 11
+      '  <main><section id="embed-root"><EmbedModal /></section></main>', // 12
+      "</template>", // 13
+      "", // 14
+      '<style scoped lang="scss">', // 15
+      "/* comment with </style> */", // 16
+      "// scss comment with </style>", // 17
+      '.embed::after { content: "</style>"; background: url(https://example.com/a.svg); }', // 18
+      "@media (max-width: 768px) {", // 19
+      "  .embed { display: block; }", // 20
+      "}", // 21
+      "</style>", // 22
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("Embed.vue", vueLiteralClose).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        'script:<script setup lang="ts">:1-9:d0',
+        "function:renderEmbed:6-8:d1",
+        "template:<template>:11-13:d0",
+        "block:<main>:12-12:d1",
+        "block:<section #embed-root>:12-12:d2",
+        "component:<EmbedModal>:12-12:d2",
+        'style:<style scoped lang="scss">:15-22:d0',
+        "@media:(max-width: 768px):19-21:d1",
+      ],
+    );
+
+    const astroDoc = [
+      "---", // 1
+      "export interface Props {", // 2
+      "  title: string;", // 3
+      "}", // 4
+      "const rule = `", // 5
+      "---", // 6 (inside template literal — must NOT close frontmatter!)
+      "`;", // 7
+      "function buildHeading(title: string) {", // 8
+      "  return title.toUpperCase();", // 9
+      "}", // 10
+      "---", // 11
+      "", // 12
+      "<main>", // 13
+      '  <section id="hero">', // 14
+      "    <SearchModal />", // 15
+      "  </section>", // 16
+      "</main>", // 17
+      "", // 18
+      "<script>", // 19
+      '  const ignore = "</script>";', // 20
+      "  function hydrateHero() {", // 21
+      "    return ignore;", // 22
+      "  }", // 23
+      "</script>", // 24
+      "", // 25
+      "<style>", // 26
+      "  :root { --hero-gap: 1rem; }", // 27
+      "</style>", // 28
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("Hero.astro", astroDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "frontmatter:---:1-11:d0",
+        "interface:Props:2-4:d1",
+        "function:buildHeading:8-10:d1",
+        "block:<main>:13-17:d0",
+        "block:<section #hero>:14-16:d1",
+        "component:<SearchModal>:15-15:d2",
+        "script:<script>:19-24:d0",
+        "function:hydrateHero:21-23:d1",
+        "style:<style>:26-28:d0",
+        "tokens::root:27-27:d1",
+      ],
+    );
+  });
 });

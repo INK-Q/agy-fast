@@ -6065,7 +6065,8 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       break;
     }
     if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "/") break;
-    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "*") {
+    if (lang === "css" && ch === "/" && next === "/" && (i === 0 || line[i - 1] !== ":")) break;
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust" || lang === "css") && ch === "/" && next === "*") {
       state.inBlockComment = true;
       i++;
       continue;
@@ -8067,7 +8068,7 @@ function extractCssSymbols(lines, compactOnly = false) {
       } else {
         const am = atRuleRe.exec(trimmed);
         if (am && am[1]) {
-          const endLine = trimmed.includes("{") ? findBraceBlockEnd(lines, i, "c") : i + 1;
+          const endLine = trimmed.includes("{") ? findBraceBlockEnd(lines, i, "css") : i + 1;
           const rest = (am[2] ?? "").trim().replace(/\s+/g, " ").slice(0, 56);
           symbols.push({
             kind: `@${am[1].toLowerCase()}`,
@@ -8079,7 +8080,7 @@ function extractCssSymbols(lines, compactOnly = false) {
         } else {
           const tm = tokenBlockRe.exec(trimmed);
           if (tm && tm[1]) {
-            const endLine = findBraceBlockEnd(lines, i, "c");
+            const endLine = findBraceBlockEnd(lines, i, "css");
             const header = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
             symbols.push({
               kind: "tokens",
@@ -8092,7 +8093,7 @@ function extractCssSymbols(lines, compactOnly = false) {
         }
       }
     }
-    const { open, close } = scanBracesOnLine(line, state, "c");
+    const { open, close } = scanBracesOnLine(line, state, "css");
     braceDepth = Math.max(0, braceDepth + open - close);
   }
   if (!compactOnly && symbols.length < 10) {
@@ -8111,7 +8112,7 @@ function extractCssSymbols(lines, compactOnly = false) {
       if (!wasInComment && d === 0 && !seen.has(i + 1) && i - lastAddedLine >= 10 && /^[.#\[a-zA-Z*:]/.test(trimmed) && trimmed.includes("{") && !trimmed.startsWith("@")) {
         const sel = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
         if (sel) {
-          const endLine = findBraceBlockEnd(lines, i, "c");
+          const endLine = findBraceBlockEnd(lines, i, "css");
           symbols.push({
             kind: "rule",
             name: sel,
@@ -8122,7 +8123,7 @@ function extractCssSymbols(lines, compactOnly = false) {
           lastAddedLine = i;
         }
       }
-      const { open, close } = scanBracesOnLine(line, fallbackState, "c");
+      const { open, close } = scanBracesOnLine(line, fallbackState, "css");
       d = Math.max(0, d + open - close);
     }
     symbols.sort((a, b) => a.startLine - b.startLine);
@@ -9389,6 +9390,144 @@ function extractCommentLandmark(inner) {
   if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(cleaned)) return null;
   return cleaned;
 }
+function findRawBlockCloseTag(text, contentStart, lowerTag) {
+  const quickRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+  quickRe.lastIndex = contentStart;
+  if (!quickRe.exec(text)) {
+    return null;
+  }
+  const len = text.length;
+  let pos = contentStart;
+  let lineStart = contentStart;
+  while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+  let inBlockComment = false;
+  let inLineComment = false;
+  let quote = null;
+  let inTemplate = false;
+  const templateBraceStack = [];
+  while (pos < len) {
+    const ch = text[pos];
+    const next = text[pos + 1];
+    if (ch === "\n") {
+      lineStart = pos + 1;
+      if (inLineComment) inLineComment = false;
+      if (quote !== null) quote = null;
+      pos++;
+      continue;
+    }
+    if (inLineComment) {
+      pos++;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        pos += 2;
+      } else {
+        pos++;
+      }
+      continue;
+    }
+    if (quote !== null) {
+      if (ch === "\\") {
+        pos += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      pos++;
+      continue;
+    }
+    if (inTemplate) {
+      if (ch === "\\") {
+        pos += 2;
+        continue;
+      }
+      if (ch === "`") {
+        inTemplate = false;
+        pos++;
+        continue;
+      }
+      if (ch === "$" && next === "{") {
+        inTemplate = false;
+        templateBraceStack.push(0);
+        pos += 2;
+        continue;
+      }
+      pos++;
+      continue;
+    }
+    if (ch === "<" && next === "/" && templateBraceStack.length === 0) {
+      const tagEnd = pos + 2 + lowerTag.length;
+      if (tagEnd < len && text.slice(pos + 2, tagEnd).toLowerCase() === lowerTag) {
+        let k = tagEnd;
+        while (k < len && /\s/.test(text[k])) k++;
+        if (text[k] === ">") {
+          return { index: pos, closeEndPos: k + 1 };
+        }
+      }
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      pos += 2;
+      continue;
+    }
+    if (ch === "/" && next === "/" && (lowerTag === "script" || pos === contentStart || text[pos - 1] !== ":")) {
+      inLineComment = true;
+      pos += 2;
+      continue;
+    }
+    if (lowerTag === "script" && ch === "/" && next !== "/" && next !== "*" && text[pos - 1] !== "<") {
+      let lineEnd = text.indexOf("\n", pos);
+      if (lineEnd < 0) lineEnd = len;
+      const lineSlice = text.slice(lineStart, lineEnd);
+      const relIdx = pos - lineStart;
+      if (!isJsxSelfClosingSlash(lineSlice, relIdx) && isRegexStartContext(lineSlice, relIdx) && hasClosingRegexSlashOnLine(lineSlice, relIdx)) {
+        let r = pos + 1;
+        let inClass = false;
+        while (r < lineEnd) {
+          const rc = text[r];
+          if (rc === "\\") {
+            r += 2;
+            continue;
+          }
+          if (rc === "[") inClass = true;
+          else if (rc === "]") inClass = false;
+          else if (rc === "/" && !inClass) {
+            pos = r + 1;
+            break;
+          }
+          r++;
+        }
+        continue;
+      }
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      pos++;
+      continue;
+    }
+    if (lowerTag === "script" && ch === "`") {
+      inTemplate = true;
+      pos++;
+      continue;
+    }
+    if (templateBraceStack.length > 0) {
+      if (ch === "{") {
+        templateBraceStack[templateBraceStack.length - 1] += 1;
+      } else if (ch === "}") {
+        const top = templateBraceStack[templateBraceStack.length - 1];
+        if (top === 0) {
+          templateBraceStack.pop();
+          inTemplate = true;
+        } else {
+          templateBraceStack[templateBraceStack.length - 1] = top - 1;
+        }
+      }
+    }
+    pos++;
+  }
+  return null;
+}
 function extractTemplateSymbols(rawLines, mode = "html") {
   if (rawLines.length === 0) return [];
   const lines = rawLines[0].startsWith("\uFEFF") ? [rawLines[0].slice(1), ...rawLines.slice(1)] : rawLines;
@@ -9740,12 +9879,10 @@ function extractTemplateSymbols(rawLines, mode = "html") {
         continue;
       }
       const noCloseLatch = lowerTag === "script" ? noCloseScript : noCloseStyle;
-      let closeMatch = null;
+      let closeInfo = null;
       if (!noCloseLatch) {
-        const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
-        closeRe.lastIndex = gtPos + 1;
-        closeMatch = closeRe.exec(text);
-        if (!closeMatch) {
+        closeInfo = findRawBlockCloseTag(text, gtPos + 1, lowerTag);
+        if (!closeInfo) {
           if (lowerTag === "script") noCloseScript = true;
           else noCloseStyle = true;
         }
@@ -9753,9 +9890,9 @@ function extractTemplateSymbols(rawLines, mode = "html") {
       let closeStart;
       let endLine;
       let nextPos;
-      if (closeMatch) {
-        closeStart = closeMatch.index;
-        const closeEndPos = closeMatch.index + closeMatch[0].length;
+      if (closeInfo) {
+        closeStart = closeInfo.index;
+        const closeEndPos = closeInfo.closeEndPos;
         endLine = Math.max(startLine, offsetToLineIdx(closeEndPos - 1) + 1);
         nextPos = closeEndPos;
       } else if (lowerTag === "script" && parsed.attrs.has("src")) {
@@ -9880,6 +10017,65 @@ function extractSfcSymbols(lines, mode) {
   const symbols = extractTemplateSymbols(lines, mode);
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
+function extractAstroSymbols(rawLines) {
+  if (rawLines.length === 0) return [];
+  const lines = rawLines[0].startsWith("\uFEFF") ? [rawLines[0].slice(1), ...rawLines.slice(1)] : rawLines;
+  let firstNonEmpty = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().length > 0) {
+      firstNonEmpty = i;
+      break;
+    }
+  }
+  if (firstNonEmpty >= 0 && /^---\s*$/.test(lines[firstNonEmpty])) {
+    const fmState = {
+      inBlockComment: false,
+      templateExprStack: [],
+      inBacktick: false
+    };
+    let closeFence = -1;
+    for (let k = firstNonEmpty + 1; k < lines.length; k++) {
+      const wasInComment = fmState.inBlockComment;
+      const wasInBacktick = fmState.inBacktick || fmState.templateExprStack.length > 0;
+      scanBracesOnLine(lines[k], fmState, "js");
+      if (!wasInComment && !wasInBacktick && /^---\s*$/.test(lines[k])) {
+        closeFence = k;
+        break;
+      }
+    }
+    if (closeFence > firstNonEmpty) {
+      const symbols = [
+        {
+          kind: "frontmatter",
+          name: "---",
+          startLine: firstNonEmpty + 1,
+          endLine: closeFence + 1,
+          depth: 0
+        }
+      ];
+      const fmInner = lines.slice(firstNonEmpty + 1, closeFence);
+      if (fmInner.some((l) => l.trim().length > 0)) {
+        const dedented = dedentBlockLines(fmInner);
+        const baseOffset = firstNonEmpty + 1;
+        for (const s of extractTsJsSymbols(dedented)) {
+          const childStart = s.startLine + baseOffset;
+          const childEnd = Math.max(childStart, s.endLine + baseOffset);
+          symbols.push({
+            kind: s.kind,
+            name: s.name,
+            startLine: childStart,
+            endLine: childEnd,
+            depth: Math.min(MAX_HTML_DEPTH, 1 + s.depth)
+          });
+        }
+      }
+      const bodyLines = lines.map((l, idx) => idx <= closeFence ? "" : l);
+      symbols.push(...extractTemplateSymbols(bodyLines, "astro"));
+      return symbols;
+    }
+  }
+  return extractTemplateSymbols(lines, "astro");
+}
 function extractSymbolsFromLines(filePath, lines) {
   const base = path6.basename(filePath).toLowerCase();
   const ext = path6.extname(filePath).toLowerCase();
@@ -9903,6 +10099,8 @@ function extractSymbolsFromLines(filePath, lines) {
       return extractSfcSymbols(lines, "vue");
     case ".svelte":
       return extractSfcSymbols(lines, "svelte");
+    case ".astro":
+      return extractAstroSymbols(lines);
     case ".css":
     case ".scss":
     case ".less":
