@@ -2569,30 +2569,243 @@ function extractJsonYamlSymbols(lines: string[], isJson: boolean): SymbolEntry[]
     return symbols;
   }
 
-  // YAML top-level keys (including quoted keys like `"on":` in GitHub Actions, while rejecting bare `https://...`)
-  const re = /^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(?:\s*(?:#.*)?$|\s+\S)/;
+  // YAML outlining with depth-1 section children and block-scalar (`|`, `>`, `|-`, `>+`) skipping
+  const YAML_SECTION_PARENTS = new Set([
+    "jobs",
+    "services",
+    "packages",
+    "paths",
+    "components",
+    "environments",
+    "workflows",
+    "stages",
+    "pipelines",
+    "containers",
+    "volumes",
+    "networks",
+    "resources",
+    "definitions",
+    "schemas",
+    "scripts",
+    "tasks",
+    "targets",
+    "profiles",
+    "spec",
+  ]);
+  const yamlKeyRe =
+    /^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_./{}-]+))\s*:(?:\s*(?:#.*)?$|\s+([\s\S]*))$/;
+  const blockScalarTailRe =
+    /^(?:(?:![^\s]+|&[^\s]+)\s+)*[|>](?:[+-]|\d+[+-]?|[+-]\d+)?(?:\s+#.*|\s*)$/;
+
+  interface YamlRawEntry {
+    lineNum: number;
+    indent: number;
+    keyName: string;
+    hasInlineScalarValue: boolean;
+    isDocBoundary?: boolean;
+  }
+
+  const rawEntries: YamlRawEntry[] = [];
+  let blockScalarBaseIndent: number | null = null;
+  let flowDepth = 0;
+  let multiQuote: '"' | "'" | null = null;
+
   for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]!);
-    const keyName = m?.[1] || m?.[2] || m?.[3];
-    if (keyName) {
-      symbols.push({
-        kind: "key",
-        name: keyName,
-        startLine: i + 1,
-        endLine: i + 1,
-        depth: 0,
+    const line = lines[i]!;
+    const trimmed = line.trim();
+
+    let indent = 0;
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] === " ") indent += 1;
+      else if (line[c] === "\t") indent += 2;
+      else break;
+    }
+
+    if (blockScalarBaseIndent !== null) {
+      if (!trimmed) continue;
+      if (indent > blockScalarBaseIndent) continue;
+      blockScalarBaseIndent = null;
+    }
+
+    if (multiQuote !== null) {
+      for (let c = 0; c < line.length; c++) {
+        if (multiQuote === '"' && line[c] === "\\") {
+          c++;
+          continue;
+        }
+        if (multiQuote === "'" && line[c] === "'" && line[c + 1] === "'") {
+          c++;
+          continue;
+        }
+        if (line[c] === multiQuote) {
+          multiQuote = null;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    if (indent === 0 && /^(?:---|\.\.\.)(?:\s+#.*|\s*)$/.test(trimmed)) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent: 0,
+        keyName: "",
+        hasInlineScalarValue: false,
+        isDocBoundary: true,
+      });
+      flowDepth = 0;
+      continue;
+    }
+
+    const wasInFlow = flowDepth > 0;
+    const afterIndent = line.slice(
+      /^[ \t]*/.exec(line)?.[0].length ?? 0,
+    );
+
+    // Check `- |` or `- run: |` sequence block scalars before flow scanning
+    if (!wasInFlow && afterIndent.startsWith("-")) {
+      const seqRest = afterIndent.slice(1).trimStart();
+      if (blockScalarTailRe.test(seqRest)) {
+        blockScalarBaseIndent = indent;
+        continue;
+      }
+      const seqKeyMatch = yamlKeyRe.exec(seqRest);
+      if (seqKeyMatch && blockScalarTailRe.test((seqKeyMatch[4] ?? "").trim())) {
+        blockScalarBaseIndent = indent;
+        continue;
+      }
+    }
+
+    let matchedKey: string | undefined;
+    let inlineTail = "";
+    if (!wasInFlow && !afterIndent.startsWith("-")) {
+      const km = yamlKeyRe.exec(afterIndent);
+      matchedKey = km?.[1] || km?.[2] || km?.[3];
+      inlineTail = (km?.[4] ?? "").trim();
+    }
+
+    if (matchedKey && blockScalarTailRe.test(inlineTail)) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent,
+        keyName: matchedKey,
+        hasInlineScalarValue: true,
+      });
+      blockScalarBaseIndent = indent;
+      continue;
+    }
+
+    // Update flow depth (`{}` / `[]`) and multiline quote state across the line
+    let lineQuote: '"' | "'" | null = null;
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c]!;
+      if (lineQuote) {
+        if (lineQuote === '"' && ch === "\\") {
+          c++;
+          continue;
+        }
+        if (lineQuote === "'" && ch === "'" && line[c + 1] === "'") {
+          c++;
+          continue;
+        }
+        if (ch === lineQuote) lineQuote = null;
+        continue;
+      }
+      if (ch === "#" && (c === 0 || /\s/.test(line[c - 1]!))) break;
+      if (ch === '"' || ch === "'") {
+        lineQuote = ch;
+        continue;
+      }
+      if (ch === "{" || ch === "[") flowDepth++;
+      else if (ch === "}" || ch === "]") flowDepth = Math.max(0, flowDepth - 1);
+    }
+    if (lineQuote !== null) {
+      multiQuote = lineQuote;
+    }
+
+    if (matchedKey) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent,
+        keyName: matchedKey,
+        hasInlineScalarValue: inlineTail.length > 0 && !inlineTail.startsWith("#"),
       });
     }
   }
-  for (let idx = 0; idx < symbols.length; idx++) {
-    const cur = symbols[idx]!;
-    let endLine =
-      idx + 1 < symbols.length ? symbols[idx + 1]!.startLine - 1 : lines.length;
-    while (endLine > cur.startLine && !(lines[endLine - 1] ?? "").trim()) {
-      endLine--;
+
+  const trimTrailingBlankYamlLine = (startLine: number, rawEndLine: number): number => {
+    let end = rawEndLine;
+    while (end > startLine && !(lines[end - 1] ?? "").trim()) {
+      end--;
     }
-    cur.endLine = Math.max(cur.startLine, endLine);
+    return Math.max(startLine, end);
+  };
+
+  const topIndices: number[] = [];
+  for (let r = 0; r < rawEntries.length; r++) {
+    if (rawEntries[r]!.indent === 0) topIndices.push(r);
   }
+
+  for (let t = 0; t < topIndices.length; t++) {
+    const rawIdx = topIndices[t]!;
+    const entry = rawEntries[rawIdx]!;
+    if (entry.isDocBoundary) continue;
+
+    const nextTopRawIdx = t + 1 < topIndices.length ? topIndices[t + 1]! : -1;
+    const rawBound =
+      nextTopRawIdx >= 0 ? rawEntries[nextTopRawIdx]!.lineNum - 1 : lines.length;
+    const parentEndLine = trimTrailingBlankYamlLine(entry.lineNum, rawBound);
+
+    symbols.push({
+      kind: "key",
+      name: entry.keyName,
+      startLine: entry.lineNum,
+      endLine: parentEndLine,
+      depth: 0,
+    });
+
+    if (!entry.hasInlineScalarValue) {
+      const sliceEnd = nextTopRawIdx >= 0 ? nextTopRawIdx : rawEntries.length;
+      let childIndent = Infinity;
+      for (let k = rawIdx + 1; k < sliceEnd; k++) {
+        const cand = rawEntries[k]!;
+        if (cand.indent > 0 && cand.indent < childIndent) {
+          childIndent = cand.indent;
+        }
+      }
+      if (Number.isFinite(childIndent)) {
+        const children = rawEntries
+          .slice(rawIdx + 1, sliceEnd)
+          .filter((c) => c.indent === childIndent);
+        const parentSpan = parentEndLine - entry.lineNum;
+        const shouldExpandChildren =
+          children.length >= 2 ||
+          (children.length === 1 &&
+            parentSpan >= 3 &&
+            (YAML_SECTION_PARENTS.has(entry.keyName) || parentSpan >= 6));
+
+        if (shouldExpandChildren) {
+          for (let cIdx = 0; cIdx < children.length; cIdx++) {
+            const child = children[cIdx]!;
+            const rawChildEnd =
+              cIdx + 1 < children.length
+                ? children[cIdx + 1]!.lineNum - 1
+                : parentEndLine;
+            symbols.push({
+              kind: "section",
+              name: `${entry.keyName}.${child.keyName}`,
+              startLine: child.lineNum,
+              endLine: trimTrailingBlankYamlLine(child.lineNum, rawChildEnd),
+              depth: 1,
+            });
+          }
+        }
+      }
+    }
+  }
+
   return symbols;
 }
 

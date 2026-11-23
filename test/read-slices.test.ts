@@ -2028,4 +2028,69 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("extracts YAML depth-1 section children while skipping literal/folded block scalars", () => {
+    const ghaDoc = [
+      "name: Release", // 1
+      '"on":', // 2
+      "  push:", // 3
+      "    branches: [main]", // 4
+      "", // 5
+      "jobs:", // 6
+      "  build:", // 7
+      "    runs-on: ubuntu-latest", // 8
+      "    steps:", // 9
+      "      - name: Run suite", // 10
+      "        run: |", // 11
+      '          echo "key: val"', // 12 (inside `|` — must NOT become a YAML symbol!)
+      "          fake_sibling:", // 13
+      "            nested: 1", // 14
+      "  deploy:", // 15
+      "    needs: build", // 16
+      "    steps:", // 17
+      "      - run: >-", // 18
+      '          echo "another_key: ignored"', // 19
+      "", // 20
+      "notes: |-", // 21
+      "  fake_section:", // 22
+      "    item: true", // 23
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("release.yml", ghaDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "key:name:1-1:d0",
+        "key:on:2-4:d0",
+        "key:jobs:6-19:d0",
+        "section:jobs.build:7-14:d1",
+        "section:jobs.deploy:15-19:d1",
+        "key:notes:21-23:d0",
+      ],
+    );
+
+    const openApiDoc = [
+      "openapi: 3.1.0", // 1
+      "paths:", // 2
+      "  /v1/users:", // 3
+      "    get:", // 4
+      "      summary: List users", // 5
+      "  /v1/users/{id}:", // 6
+      "    delete:", // 7
+      "      summary: Delete user", // 8
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("openapi.yaml", openApiDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "key:openapi:1-1:d0",
+        "key:paths:2-8:d0",
+        "section:paths./v1/users:3-5:d1",
+        "section:paths./v1/users/{id}:6-8:d1",
+      ],
+    );
+  });
 });
