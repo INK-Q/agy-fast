@@ -1481,4 +1481,129 @@ describe("read_slices", () => {
       ["trigger:audit_log_insert:1-5"],
     );
   });
+
+  it("extracts Protocol Buffers (.proto) and GraphQL (.graphql/.gql) schema outlines", () => {
+    const protoDoc = [
+      'syntax = "proto3";', // 1
+      "package acme.orders.v1;", // 2
+      "", // 3
+      "/* message FakeCommented { string id = 1; } */", // 4
+      "message Order {", // 5
+      "  enum Status {", // 6
+      "    STATUS_UNSPECIFIED = 0;", // 7
+      "    STATUS_PAID = 1;", // 8
+      "  }", // 9
+      "  oneof payment {", // 10
+      "    string card_token = 2;", // 11
+      "    string bank_iban = 3;", // 12
+      "  }", // 13
+      "  string message = 4; // field named message, not a declaration", // 14
+      "}", // 15
+      "", // 16
+      "extend google.protobuf.FieldOptions {", // 17
+      "  bool redacted = 50001;", // 18
+      "}", // 19
+      "", // 20
+      "service OrderService {", // 21
+      "  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);", // 22
+      "  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {", // 23
+      "    option (google.api.http) = {", // 24
+      '      post: "/v1/orders"', // 25
+      "    };", // 26
+      "  }", // 27
+      "}", // 28
+    ].join("\n");
+
+    const protoSyms = extractSymbols("orders.proto", protoDoc);
+    assert.deepEqual(
+      protoSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "package:acme.orders.v1:2-2:d0",
+        "message:Order:5-15:d0",
+        "enum:Status:6-9:d1",
+        "oneof:payment:10-13:d1",
+        "extend:google.protobuf.FieldOptions:17-19:d0",
+        "service:OrderService:21-28:d0",
+        "rpc:GetOrder:22-22:d1",
+        "rpc:CreateOrder:23-27:d1",
+      ],
+    );
+
+    const gqlDoc = [
+      '"""', // 1
+      "Schema docs with fake type inside block string:", // 2
+      "type FakeDocType { id: ID! }", // 3
+      '"""', // 4
+      "# Single-line comment: type IgnoredComment { id: ID! }", // 5
+      "scalar DateTime", // 6
+      "", // 7
+      "directive @auth(", // 8
+      "  requires: Role = ADMIN", // 9
+      ") repeatable on OBJECT | FIELD_DEFINITION", // 10
+      "", // 11
+      "enum Role {", // 12
+      "  ADMIN", // 13
+      "  USER", // 14
+      "}", // 15
+      "", // 16
+      "interface Node {", // 17
+      "  id: ID!", // 18
+      "}", // 19
+      "", // 20
+      "type User implements Node @auth(requires: USER) {", // 21
+      '  """Field description containing { unbalanced brace"""', // 22
+      "  id: ID! # inline comment { brace", // 23
+      "  createdAt: DateTime!", // 24
+      "}", // 25
+      "", // 26
+      "input CreateUserInput {", // 27
+      "  email: String!", // 28
+      "}", // 29
+      "", // 30
+      "union SearchResult =", // 31
+      "  | User", // 32
+      "  | Node", // 33
+      "", // 34
+      "schema {", // 35
+      "  query: Query", // 36
+      "  mutation: Mutation", // 37
+      "}", // 38
+      "", // 39
+      "fragment UserFields on User {", // 40
+      "  id", // 41
+      "}", // 42
+      "", // 43
+      "query GetUser($id: ID!) {", // 44
+      "  user(id: $id) { ...UserFields }", // 45
+      "}", // 46
+      "", // 47
+      "mutation CreateUser($input: CreateUserInput!) {", // 48
+      "  createUser(input: $input) { id }", // 49
+      "}", // 50
+      "", // 51
+      "subscription OnUserCreated {", // 52
+      "  userCreated { id }", // 53
+      "}", // 54
+    ].join("\n");
+
+    const gqlSyms = extractSymbols("schema.graphql", gqlDoc);
+    assert.deepEqual(extractSymbols("ops.gql", gqlDoc), gqlSyms);
+    assert.deepEqual(
+      gqlSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "scalar:DateTime:6-6",
+        "directive:@auth:8-10",
+        "enum:Role:12-15",
+        "interface:Node:17-19",
+        "type:User:21-25",
+        "input:CreateUserInput:27-29",
+        "union:SearchResult:31-33",
+        "schema:schema:35-38",
+        "fragment:UserFields:40-42",
+        "query:GetUser:44-46",
+        "mutation:CreateUser:48-50",
+        "subscription:OnUserCreated:52-54",
+      ],
+    );
+  });
 });

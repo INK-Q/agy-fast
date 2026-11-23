@@ -7799,6 +7799,257 @@ function extractSqlSymbols(lines) {
   }
   return symbols;
 }
+function hasProtoOpenBraceSoon(lines, lineIdx, restAfterName) {
+  const stripInlineComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/.*$/, "").trim();
+  const tail = stripInlineComments(restAfterName);
+  if (tail.startsWith("{")) return true;
+  if (tail.length > 0) return false;
+  for (let k = lineIdx + 1; k < Math.min(lines.length, lineIdx + 4); k++) {
+    const nextTrim = stripInlineComments(lines[k] ?? "");
+    if (!nextTrim) continue;
+    return nextTrim.startsWith("{");
+  }
+  return false;
+}
+function extractProtoSymbols(lines) {
+  const symbols = [];
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0
+  };
+  let braceDepth = 0;
+  const pkgRe = /^\s*package\s+([A-Za-z_][\w.]*)\s*;/;
+  const blockDeclRe = /^\s*(message|service|enum|oneof|extend)\s+(\.?[A-Za-z_][\w.]*)(.*)$/;
+  const rpcRe = /^\s*rpc\s+([A-Za-z_]\w*)\s*\(/;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const wasInComment = state.inBlockComment;
+    const depthBeforeLine = braceDepth;
+    const { open, close } = scanBracesOnLine(line, state, "c");
+    braceDepth = Math.max(0, braceDepth + open - close);
+    if (wasInComment) continue;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
+      continue;
+    }
+    if (depthBeforeLine === 0) {
+      const pm = pkgRe.exec(line);
+      if (pm && pm[1]) {
+        symbols.push({
+          kind: "package",
+          name: pm[1],
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0
+        });
+        continue;
+      }
+    }
+    const bm = blockDeclRe.exec(line);
+    if (bm && bm[1] && bm[2] && hasProtoOpenBraceSoon(lines, i, bm[3] ?? "")) {
+      symbols.push({
+        kind: bm[1],
+        name: bm[2],
+        startLine: i + 1,
+        endLine: findBraceBlockEnd(lines, i, "c"),
+        depth: Math.min(2, depthBeforeLine)
+      });
+      continue;
+    }
+    const rm = rpcRe.exec(line);
+    if (rm && rm[1] && depthBeforeLine >= 1) {
+      symbols.push({
+        kind: "rpc",
+        name: rm[1],
+        startLine: i + 1,
+        endLine: findBraceBlockEnd(lines, i, "c"),
+        depth: Math.min(2, depthBeforeLine)
+      });
+    }
+  }
+  return symbols;
+}
+function scanGraphqlLine(line, state) {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  let lastTokenChar = "";
+  let inSingleLineStr = false;
+  let i = 0;
+  while (i < line.length) {
+    if (state.inBlockString) {
+      if (line[i] === "\\" && line.startsWith('"""', i + 1)) {
+        i += 4;
+        continue;
+      }
+      if (line.startsWith('"""', i)) {
+        state.inBlockString = false;
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inSingleLineStr) {
+      if (line[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (line[i] === '"') {
+        inSingleLineStr = false;
+        lastTokenChar = '"';
+      }
+      i++;
+      continue;
+    }
+    if (line[i] === "#") break;
+    if (line.startsWith('"""', i)) {
+      state.inBlockString = true;
+      code += " ";
+      i += 3;
+      continue;
+    }
+    if (line[i] === '"') {
+      inSingleLineStr = true;
+      code += '""';
+      i++;
+      continue;
+    }
+    const ch = line[i];
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    if (!/\s/.test(ch)) lastTokenChar = ch;
+    i++;
+  }
+  return { code, openBrace, closeBrace, openParen, closeParen, lastTokenChar };
+}
+function findGraphqlDefinitionEnd(lines, startIdx, expectsBraceBlock) {
+  const state = { inBlockString: false };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let seenBrace = false;
+  let endLineIdx = startIdx;
+  let prevLastChar = "";
+  const maxScan = Math.min(lines.length, startIdx + 2e3);
+  const topDefStartRe = /^(?:extend\s+)?(?:type|input|interface|enum|union|scalar|directive|schema|fragment|query|mutation|subscription)\b/;
+  for (let i = startIdx; i < maxScan; i++) {
+    const wasInBlockStr = state.inBlockString;
+    const scan = scanGraphqlLine(lines[i], state);
+    const trimmedCode = scan.code.trim();
+    if (i > startIdx && !seenBrace && parenDepth === 0 && !wasInBlockStr && !state.inBlockString) {
+      if (!trimmedCode) {
+        if (!expectsBraceBlock && prevLastChar !== "=" && prevLastChar !== "|") {
+          return endLineIdx + 1;
+        }
+        continue;
+      }
+      if (topDefStartRe.test(trimmedCode)) {
+        return endLineIdx + 1;
+      }
+      if (!expectsBraceBlock && prevLastChar !== "=" && prevLastChar !== "|" && !trimmedCode.startsWith("|") && !trimmedCode.startsWith("@") && !trimmedCode.startsWith("=") && !/^(?:on|repeatable)\b/.test(trimmedCode)) {
+        return endLineIdx + 1;
+      }
+    }
+    if (scan.openBrace > 0) seenBrace = true;
+    braceDepth += scan.openBrace - scan.closeBrace;
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+    if (trimmedCode || wasInBlockStr || state.inBlockString) {
+      endLineIdx = i;
+    }
+    if (scan.lastTokenChar) {
+      prevLastChar = scan.lastTokenChar;
+    }
+    if (seenBrace && braceDepth <= 0 && parenDepth <= 0) {
+      return i + 1;
+    }
+  }
+  return endLineIdx + 1;
+}
+function extractGraphqlSymbols(lines) {
+  const symbols = [];
+  const state = { inBlockString: false };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  const namedTypeRe = /^(?:extend\s+)?(type|input|interface|enum|union|scalar)\s+([A-Za-z_]\w*)\b/;
+  const directiveRe = /^directive\s+(@[A-Za-z_]\w*)\b/;
+  const schemaRe = /^(?:extend\s+)?schema\b(?:\s*@|\s*\{|\s*$)/;
+  const fragmentRe = /^fragment\s+([A-Za-z_]\w*)\s+on\s+[A-Za-z_]\w*/;
+  const opRe = /^(query|mutation|subscription)\b(?:\s+([A-Za-z_]\w*))?\s*(?:[\({@]|$)/;
+  for (let i = 0; i < lines.length; i++) {
+    const wasInBlockString = state.inBlockString;
+    const braceBefore = braceDepth;
+    const parenBefore = parenDepth;
+    const scan = scanGraphqlLine(lines[i], state);
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+    if (wasInBlockString || braceBefore > 0 || parenBefore > 0) continue;
+    const code = scan.code.trim();
+    if (!code) continue;
+    const tm = namedTypeRe.exec(code);
+    if (tm && tm[1] && tm[2]) {
+      const kind = tm[1];
+      const expectsBrace = kind !== "union" && kind !== "scalar";
+      symbols.push({
+        kind,
+        name: tm[2],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, expectsBrace),
+        depth: 0
+      });
+      continue;
+    }
+    const dm = directiveRe.exec(code);
+    if (dm && dm[1]) {
+      symbols.push({
+        kind: "directive",
+        name: dm[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, false),
+        depth: 0
+      });
+      continue;
+    }
+    if (schemaRe.test(code)) {
+      symbols.push({
+        kind: "schema",
+        name: "schema",
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0
+      });
+      continue;
+    }
+    const fm = fragmentRe.exec(code);
+    if (fm && fm[1]) {
+      symbols.push({
+        kind: "fragment",
+        name: fm[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0
+      });
+      continue;
+    }
+    const om = opRe.exec(code);
+    if (om && om[1]) {
+      symbols.push({
+        kind: om[1],
+        name: om[2] || om[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0
+      });
+    }
+  }
+  return symbols;
+}
 var HTML_VOID_ELEMENTS = /* @__PURE__ */ new Set([
   "area",
   "base",
@@ -8608,6 +8859,12 @@ function extractSymbolsFromLines(filePath, lines) {
       return extractJsonYamlSymbols(lines, false);
     case ".sql":
       return extractSqlSymbols(lines);
+    case ".proto":
+      return extractProtoSymbols(lines);
+    case ".graphql":
+    case ".gql":
+    case ".graphqls":
+      return extractGraphqlSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }
