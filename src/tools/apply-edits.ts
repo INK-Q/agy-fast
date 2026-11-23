@@ -428,10 +428,39 @@ function planHunksForContent(
           gPos = found + Math.max(1, normTarget.length);
         }
         if (globalOffsets.length > 0) {
-          const hitLines = globalOffsets
-            .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length))
-            .join(", ");
-          hint = ` Exact match found outside range at ${hitLines} — adjust startLine/endLine or omit them.`;
+          const effStart = hunk.startLine ?? 1;
+          const effEnd = hunk.endLine ?? lineStarts.length;
+          const effectiveLen =
+            normTarget.length > 1 && normTarget.endsWith("\n")
+              ? normTarget.length - 1
+              : normTarget.length;
+          const hitSpans = globalOffsets.map((o) => {
+            const startLn = offsetToLine(lineStarts, o);
+            const endOffset = o + Math.max(0, effectiveLen - 1);
+            const endLn = offsetToLine(lineStarts, endOffset);
+            return {
+              startLn,
+              endLn,
+              label: formatMatchLineRange(lineStarts, o, normTarget.length),
+            };
+          });
+          const hitLines = hitSpans.map((h) => h.label).join(", ");
+          const overlapping = hitSpans.find(
+            (h) => h.startLn <= effEnd && h.endLn >= effStart,
+          );
+          if (overlapping && hitSpans.length === 1) {
+            if (overlapping.startLn >= effStart && overlapping.endLn > effEnd) {
+              hint = ` Exact match spans ${overlapping.label} (starts inside range but extends past endLine ${effEnd}) — widen startLine/endLine or omit them.`;
+            } else if (overlapping.startLn < effStart && overlapping.endLn <= effEnd) {
+              hint = ` Exact match spans ${overlapping.label} (starts before startLine ${effStart}) — widen startLine/endLine or omit them.`;
+            } else {
+              hint = ` Exact match spans ${overlapping.label} (extends beyond lines ${effStart}-${effEnd}) — widen startLine/endLine or omit them.`;
+            }
+          } else if (overlapping) {
+            hint = ` Exact matches span ${hitLines} (extending beyond lines ${effStart}-${effEnd}) — adjust startLine/endLine or omit them.`;
+          } else {
+            hint = ` Exact match found outside range at ${hitLines} — adjust startLine/endLine or omit them.`;
+          }
         } else {
           const effStart = hunk.startLine ?? 1;
           const effEnd = hunk.endLine ?? lineStarts.length;
