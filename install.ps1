@@ -29,6 +29,7 @@ $__agyFastState = @{ ExitCode = 0 }
   param(
     [string[]]$InputArgs = @(),
     [string]$ScriptRoot = "",
+    [bool]$IsFile = $false,
     [hashtable]$State
   )
 
@@ -36,7 +37,7 @@ $__agyFastState = @{ ExitCode = 0 }
   $defaultRepo = "https://github.com/INK-Q/agy-fast.git"
 
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Error "Node.js >= 20 is required. Install Node.js first: https://nodejs.org/"
+    Write-Error "Node.js >= 20 is required. Install Node.js first: https://nodejs.org/" -ErrorAction Continue
     $State.ExitCode = 1
     return
   }
@@ -52,7 +53,7 @@ $__agyFastState = @{ ExitCode = 0 }
   $nodeMajor = 0
   if ($nodeCheckExit -ne 0 -or -not [int]::TryParse($nodeMajorRaw, [ref]$nodeMajor) -or $nodeMajor -lt 20) {
     $nodeVer = (& node -v 2>$null | Out-String).Trim()
-    Write-Error "Node.js >= 20 is required (found $nodeVer)."
+    Write-Error "Node.js >= 20 is required (found $nodeVer)." -ErrorAction Continue
     $State.ExitCode = 1
     return
   }
@@ -95,26 +96,90 @@ $__agyFastState = @{ ExitCode = 0 }
     }
   }
 
-  $scriptDir = if (-not [string]::IsNullOrEmpty($ScriptRoot)) { $ScriptRoot } else { (Get-Location).Path }
-  $localManifest = Join-Path $scriptDir "plugin.json"
-  $localInstaller = Join-Path $scriptDir "scripts\install.mjs"
+  function Test-LocalAgyFastRepo {
+    param(
+      [string]$Candidate
+    )
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+      return $false
+    }
+    $manifestPath = Join-Path $Candidate "plugin.json"
+    $installerPath = Join-Path (Join-Path $Candidate "scripts") "install.mjs"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or -not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+      return $false
+    }
+    try {
+      $rawManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 -ErrorAction Stop
+      if ([string]::IsNullOrWhiteSpace($rawManifest)) {
+        return $false
+      }
+      $trimmedManifest = $rawManifest.TrimStart([char]0xFEFF).TrimStart()
+      if (-not $trimmedManifest.StartsWith("{")) {
+        return $false
+      }
+      $manifest = ConvertFrom-Json -InputObject $trimmedManifest -ErrorAction Stop
+      return (
+        ($manifest -is [pscustomobject]) -and
+        ($null -ne $manifest.PSObject.Properties["name"]) -and
+        ($manifest.name -is [string]) -and
+        ($manifest.name -ceq "agy-fast")
+      )
+    } catch {
+      return $false
+    }
+  }
 
-  if ((Test-Path $localManifest) -and (Test-Path $localInstaller)) {
+  # Never fall back to CWD when invoked via `irm ... | iex` ($IsFile is $false).
+  # Only trust a local scripts/install.mjs when running an explicit install.ps1 file
+  # whose sibling plugin.json strictly identifies name === "agy-fast".
+  if ($IsFile -and -not [string]::IsNullOrWhiteSpace($ScriptRoot) -and (Test-LocalAgyFastRepo -Candidate $ScriptRoot)) {
+    $localInstaller = Join-Path (Join-Path $ScriptRoot "scripts") "install.mjs"
     Invoke-NodeInstaller -InstallerPath $localInstaller -ForwardArgs $forwardArgs -RunState $State
     return
   }
 
-  $defaultTarget = Join-Path $env:USERPROFILE ".gemini\config\plugins\agy-fast"
-  $installedInstaller = Join-Path $defaultTarget "scripts\install.mjs"
-  if ($hasSubcmd -and ($InputArgs[0] -ne "install") -and (Test-Path $installedInstaller)) {
+  $isWin = ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
+  $userHome = if ($isWin) {
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+      $env:USERPROFILE
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
+      $env:HOME
+    } else {
+      [Environment]::GetFolderPath('UserProfile')
+    }
+  } else {
+    if (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
+      $env:HOME
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+      $env:USERPROFILE
+    } else {
+      [Environment]::GetFolderPath('UserProfile')
+    }
+  }
+  $defaultTarget = if (-not [string]::IsNullOrWhiteSpace($userHome)) {
+    Join-Path $userHome (Join-Path ".gemini" (Join-Path "config" (Join-Path "plugins" "agy-fast")))
+  } else {
+    ""
+  }
+  $installedInstaller = if (-not [string]::IsNullOrWhiteSpace($defaultTarget)) {
+    Join-Path (Join-Path $defaultTarget "scripts") "install.mjs"
+  } else {
+    ""
+  }
+  if ($hasSubcmd -and ($InputArgs[0] -ne "install") -and (-not [string]::IsNullOrEmpty($installedInstaller)) -and (Test-Path -LiteralPath $installedInstaller -PathType Leaf)) {
     Invoke-NodeInstaller -InstallerPath $installedInstaller -ForwardArgs $forwardArgs -RunState $State
     return
   }
 
-  $repoUrl = if ($env:AGY_FAST_REPO) { $env:AGY_FAST_REPO } else { $defaultRepo }
+  $repoUrl = if (-not [string]::IsNullOrWhiteSpace($env:AGY_FAST_REPO)) { $env:AGY_FAST_REPO.Trim() } else { $defaultRepo }
+  if ($repoUrl.StartsWith("-")) {
+    Write-Error "Invalid AGY_FAST_REPO value: repository URL must not start with '-'." -ErrorAction Continue
+    $State.ExitCode = 1
+    return
+  }
 
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Error "git is required for remote installation."
+    Write-Error "git is required for remote installation." -ErrorAction Continue
     $State.ExitCode = 1
     return
   }
@@ -125,25 +190,25 @@ $__agyFastState = @{ ExitCode = 0 }
     $savedEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-      & git clone --depth 1 $repoUrl $tmpClone
+      & git clone --depth 1 -- $repoUrl $tmpClone
       $gitExit = $LASTEXITCODE
     } finally {
       $ErrorActionPreference = $savedEap
     }
     if ($gitExit -ne 0) {
-      Write-Error "git clone failed with exit code $gitExit."
+      Write-Error "git clone failed with exit code $gitExit." -ErrorAction Continue
       $State.ExitCode = $gitExit
       return
     }
 
-    $clonedInstaller = Join-Path $tmpClone "scripts\install.mjs"
+    $clonedInstaller = Join-Path (Join-Path $tmpClone "scripts") "install.mjs"
     Invoke-NodeInstaller -InstallerPath $clonedInstaller -ForwardArgs $forwardArgs -RunState $State
   } finally {
-    if (Test-Path $tmpClone) {
-      Remove-Item -Path $tmpClone -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $tmpClone) {
+      Remove-Item -LiteralPath $tmpClone -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
-} -InputArgs $__agyFastRawArgs -ScriptRoot $__agyFastScriptRoot -State $__agyFastState
+} -InputArgs $__agyFastRawArgs -ScriptRoot $__agyFastScriptRoot -IsFile $__agyFastIsFile -State $__agyFastState
 
 $__agyFastFinalExit = $__agyFastState.ExitCode
 $__agyFastWasFile = $__agyFastIsFile
