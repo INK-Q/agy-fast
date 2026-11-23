@@ -197,7 +197,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | 执行 ≥2 条独立构建、检查、测试或诊断命令 | **`run_checks`** | 受控并发执行，头尾折叠提取核心报错与测试汇总 |
 
 ### 1. `batch_search` — 并发代码检索、模糊路径与只读 Git 查询
-- **单次最多 20 条混合查询**：支持 `text`、`regex`、`glob`、`fuzzy` 与只读 `git`（`status`、`diff`、`log`、`show`、`branch`、`rev-parse`、`ls-files`、`blame`、`shortlog`、`describe`、`tag --list`、`remote -v`），并支持按条传入 `path` 跨目录/跨仓库查询。
+- **单次最多 20 条混合查询**：支持 `text`、`regex`、`glob`、`fuzzy` 与只读 `git`（`status`、`diff`、`log`、`show`、`branch`、`rev-parse`、`ls-files`、`blame`、`shortlog`、`describe`、`tag --list`、`remote -v`、`grep`、`rev-list`、`cat-file`），并支持按条传入 `path` 跨目录/跨仓库查询。
 - **精细控制**：支持 `fileType`（如 `typescript`、`python`、`gdscript`）与 `glob` 过滤、`outputMode`（`content` | `files_with_matches` | `count`）、跨行匹配 `multiline: true`（此时 `count` 统计逐文件匹配次数）、`type: "fuzzy"` 忽略大小写模糊路径查找以及 `glob` 的 `sortBy: "mtime"` 最新修改优先排序。
 - **高容错与内联防溢盘**：优先调用 `rg`（缺失自动回退 Node.js），对常见 `glob` 误传（正则 `|` 与裸关键词）自动容错恢复，默认死守 `≤8.8 KB` UTF-8 内联上限。
 

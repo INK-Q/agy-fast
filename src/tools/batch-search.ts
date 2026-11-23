@@ -60,6 +60,9 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
   "describe",
   "tag",
   "remote",
+  "grep",
+  "rev-list",
+  "cat-file",
 ]);
 
 const FORBIDDEN_GIT_GLOBAL_FLAGS = new Set([
@@ -152,6 +155,19 @@ const ALLOWED_TAG_VALUE_FLAGS = new Set([
 const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "i"]);
 
 const ALLOWED_REMOTE_SUBCOMMANDS = new Set(["show", "get-url"]);
+
+// Only -e and -f can legitimately take a dash-prefixed value in git grep.
+const GREP_SHORT_VALUE_CHARS = new Set(["e", "f"]);
+
+// Strict exact allowlist for git cat-file (no prefix abbreviations, preventing --t -> --textconv).
+const ALLOWED_CAT_FILE_SHORT_FLAGS = new Set(["-t", "-s", "-p", "-e"]);
+const ALLOWED_CAT_FILE_LONG_FLAGS = new Set([
+  "--allow-unknown-type",
+  "--use-mailmap",
+  "--no-use-mailmap",
+  "--mailmap",
+  "--no-mailmap",
+]);
 
 export function tokenizeArgs(input: string): string[] {
   const tokens: string[] = [];
@@ -438,6 +454,65 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         throw new Error(
           `Remote target '${arg}' must be a configured remote name, not a URL or path`,
         );
+      }
+    }
+  } else if (subcmd === "grep") {
+    let expectValue = false;
+    for (const arg of rest) {
+      if (expectValue) {
+        expectValue = false;
+        continue;
+      }
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--op") || flagName.startsWith("--no-ind")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+        }
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        const chars = arg.slice(1);
+        for (let i = 0; i < chars.length; i++) {
+          const ch = chars[i]!;
+          if (ch === "O") {
+            throw new Error(`Flag '${arg}' is not allowed in read-only git grep query`);
+          }
+          if (GREP_SHORT_VALUE_CHARS.has(ch)) {
+            if (i === chars.length - 1) {
+              expectValue = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+  } else if (subcmd === "rev-list") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("--")) {
+        const eqIdx = arg.indexOf("=");
+        const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+        if (flagName.startsWith("--std")) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git rev-list query`);
+        }
+      }
+    }
+  } else if (subcmd === "cat-file") {
+    for (const arg of rest) {
+      if (arg === "--") {
+        break;
+      }
+      if (arg.startsWith("-")) {
+        if (
+          !ALLOWED_CAT_FILE_SHORT_FLAGS.has(arg) &&
+          !ALLOWED_CAT_FILE_LONG_FLAGS.has(arg)
+        ) {
+          throw new Error(`Flag '${arg}' is not allowed in read-only git cat-file query`);
+        }
       }
     }
   }
@@ -1294,9 +1369,9 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
   const rest = validatedArgs.slice(2);
   let subArgs = rest;
 
-  if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
+  if (subcmd === "diff" || subcmd === "log" || subcmd === "show" || subcmd === "rev-list") {
     subArgs = ["--no-ext-diff", "--no-textconv", ...rest];
-  } else if (subcmd === "blame") {
+  } else if (subcmd === "blame" || subcmd === "grep") {
     subArgs = ["--no-textconv", ...rest];
   } else if (subcmd === "remote") {
     const remoteSubIdx = rest.findIndex((a) => !a.startsWith("-"));
@@ -1353,6 +1428,8 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
     "gpg.ssh.program=false",
     "-c",
     "gpg.x509.program=false",
+    "-c",
+    "grep.fallbackToNoIndex=false",
     "--no-pager",
     ...(subcmd ? [subcmd, ...subArgs] : subArgs),
   ];
@@ -1374,6 +1451,14 @@ async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<stri
     throw new Error("git query timed out");
   }
   if (res.exitCode !== 0) {
+    if (
+      gitArgs[1] === "grep" &&
+      res.exitCode === 1 &&
+      !res.stderr.trim() &&
+      !res.stdout.trim()
+    ) {
+      return "(no matches)";
+    }
     const msg = (res.stderr || res.stdout).trim();
     throw new Error(msg || `git exited with code ${res.exitCode}`);
   }
