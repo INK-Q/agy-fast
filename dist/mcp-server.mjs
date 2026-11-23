@@ -7073,80 +7073,586 @@ function extractRustSymbols(lines) {
   }
   return symbols;
 }
+function scanCLikeLine(line, state) {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  if (state.inPreprocessorCont) {
+    const trimmedEnd = line.trimEnd();
+    state.inPreprocessorCont = trimmedEnd.endsWith("\\");
+    return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: true };
+  }
+  if (!state.inBlockComment && state.rawStringDelim === null && !state.inVerbatimString) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("#")) {
+      state.inPreprocessorCont = line.trimEnd().endsWith("\\");
+      return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: true };
+    }
+  }
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < line.length) {
+    const ch = line[i];
+    const next = line[i + 1];
+    if (state.inBlockComment) {
+      if (ch === "*" && next === "/") {
+        state.inBlockComment = false;
+        code += " ";
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+    if (state.rawStringDelim !== null) {
+      const closeSeq = `)${state.rawStringDelim}"`;
+      if (ch === ")" && line.startsWith(closeSeq, i)) {
+        state.rawStringDelim = null;
+        code += '""';
+        i += closeSeq.length;
+      } else {
+        i++;
+      }
+      continue;
+    }
+    if (state.inVerbatimString) {
+      if (ch === '"' && next === '"') {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        state.inVerbatimString = false;
+      }
+      i++;
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") break;
+    if (ch === "/" && next === "*") {
+      state.inBlockComment = true;
+      code += " ";
+      i += 2;
+      continue;
+    }
+    if (ch === "R" && next === '"' && (i === 0 || !/\w/.test(line[i - 1]))) {
+      const parenPos = line.indexOf("(", i + 2);
+      if (parenPos >= 0 && /^[A-Za-z0-9_]{0,16}$/.test(line.slice(i + 2, parenPos))) {
+        state.rawStringDelim = line.slice(i + 2, parenPos);
+        code += '""';
+        i = parenPos + 1;
+        continue;
+      }
+    }
+    if (ch === "@" && next === '"' || (ch === "$" && next === "@" && line[i + 2] === '"' || ch === "@" && next === "$" && line[i + 2] === '"')) {
+      state.inVerbatimString = true;
+      code += '""';
+      i += ch === "@" && next === '"' ? 2 : 3;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      code += "''";
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      code += '""';
+      i++;
+      continue;
+    }
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    i++;
+  }
+  return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: false };
+}
+function findCLikeBlockEnd(lines, startIdx, startFromLineIdx = startIdx, startFromCol = 0) {
+  const state = {
+    inBlockComment: false,
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, startIdx + 2e3);
+  for (let i = startFromLineIdx; i < maxScan; i++) {
+    const rawLine = i === startFromLineIdx ? lines[i].slice(startFromCol) : lines[i];
+    const scan = scanCLikeLine(rawLine, state);
+    if (scan.isPreprocessor) continue;
+    if (scan.openBrace > 0) seenOpen = true;
+    braceDepth += scan.openBrace - scan.closeBrace;
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+    if (seenOpen && braceDepth <= 0) {
+      return { endLine: i + 1, hasBrace: true, closeLineCode: scan.code };
+    }
+    if (!seenOpen && parenDepth === 0 && scan.code.trimEnd().endsWith(";")) {
+      return { endLine: i + 1, hasBrace: false, closeLineCode: scan.code };
+    }
+    if (!seenOpen && i > startIdx + 40) {
+      return { endLine: startIdx + 1, hasBrace: false, closeLineCode: "" };
+    }
+  }
+  return {
+    endLine: seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1,
+    hasBrace: seenOpen,
+    closeLineCode: ""
+  };
+}
+function findCLikeCallableBodyEnd(lines, startIdx, openParenColOnCode, firstLineCode) {
+  const state = {
+    inBlockComment: false,
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false
+  };
+  let parenDepth = 0;
+  let closedParams = false;
+  let inInitList = false;
+  let initBraceDepth = 0;
+  let sawFatArrow = false;
+  const maxHeaderLine = Math.min(lines.length, startIdx + 16);
+  for (let i = startIdx; i < maxHeaderLine; i++) {
+    const code = i === startIdx ? firstLineCode.slice(openParenColOnCode) : scanCLikeLine(lines[i], state).code;
+    for (let c = 0; c < code.length; c++) {
+      const ch = code[c];
+      const next = code[c + 1];
+      if (!closedParams) {
+        if (ch === "(") parenDepth++;
+        else if (ch === ")") {
+          parenDepth--;
+          if (parenDepth <= 0) {
+            closedParams = true;
+            parenDepth = 0;
+          }
+        }
+        continue;
+      }
+      if (sawFatArrow) {
+        if (ch === "{") {
+          return findCLikeBlockEnd(lines, startIdx, i, 0).endLine;
+        }
+        if (ch === "(") parenDepth++;
+        else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+        else if (ch === ";" && parenDepth === 0) return i + 1;
+        continue;
+      }
+      if (ch === "=" && next === ">") {
+        sawFatArrow = true;
+        c++;
+        continue;
+      }
+      if (ch === ":" && next !== ":" && !inInitList) {
+        inInitList = true;
+        continue;
+      }
+      if (inInitList) {
+        if (ch === "(") {
+          parenDepth++;
+          continue;
+        }
+        if (ch === ")") {
+          parenDepth = Math.max(0, parenDepth - 1);
+          continue;
+        }
+        if (ch === "{") {
+          let prevIdx = c - 1;
+          while (prevIdx >= 0 && /\s/.test(code[prevIdx])) prevIdx--;
+          const prevCh = prevIdx >= 0 ? code[prevIdx] : "";
+          if (initBraceDepth > 0 || /[\w>]/.test(prevCh)) {
+            initBraceDepth++;
+            continue;
+          }
+          const rawPos = lines[i].lastIndexOf("{");
+          return findCLikeBlockEnd(lines, startIdx, i, Math.max(0, rawPos)).endLine;
+        }
+        if (ch === "}" && initBraceDepth > 0) {
+          initBraceDepth--;
+          continue;
+        }
+        if (ch === ";" && parenDepth === 0 && initBraceDepth === 0) {
+          return null;
+        }
+        continue;
+      }
+      if (ch === ";") {
+        return null;
+      }
+      if (ch === "{") {
+        const firstBraceCol = i === startIdx ? lines[i].indexOf("{") : lines[i].indexOf("{");
+        return findCLikeBlockEnd(lines, startIdx, i, Math.max(0, firstBraceCol)).endLine;
+      }
+    }
+  }
+  return null;
+}
+var CLIKE_EXCLUDED_NAMES = /* @__PURE__ */ new Set([
+  "if",
+  "for",
+  "while",
+  "switch",
+  "catch",
+  "else",
+  "do",
+  "try",
+  "lock",
+  "using",
+  "fixed",
+  "checked",
+  "unchecked",
+  "unsafe",
+  "foreach",
+  "when",
+  "return",
+  "sizeof",
+  "alignof",
+  "decltype",
+  "typeof",
+  "nameof",
+  "static_assert",
+  "assert",
+  "new",
+  "delete",
+  "throw",
+  "typedef",
+  "case",
+  "requires",
+  "noexcept"
+]);
+var CLIKE_MODIFIERS = /* @__PURE__ */ new Set([
+  "public",
+  "private",
+  "protected",
+  "internal",
+  "file",
+  "static",
+  "final",
+  "abstract",
+  "sealed",
+  "override",
+  "virtual",
+  "inline",
+  "__inline",
+  "__forceinline",
+  "constexpr",
+  "consteval",
+  "constinit",
+  "explicit",
+  "extern",
+  "async",
+  "synchronized",
+  "native",
+  "unsafe",
+  "readonly",
+  "new",
+  "partial",
+  "friend",
+  "open",
+  "suspend",
+  "mutating"
+]);
+function stripInlineTemplatePrefix(code) {
+  const m = /^\s*template\s*</.exec(code);
+  if (!m) return { rest: code, stripped: false };
+  let angle = 0;
+  let paren = 0;
+  for (let i = m[0].length - 1; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "<" && paren === 0) angle++;
+    else if (ch === ">" && paren === 0) {
+      angle--;
+      if (angle === 0) {
+        return { rest: code.slice(i + 1), stripped: true };
+      }
+    }
+  }
+  return { rest: "", stripped: true };
+}
+function matchCLikeCallableHeader(code, inTypeScope, currentTypeName) {
+  const trimmed = code.trimStart();
+  if (!trimmed || trimmed.startsWith("[") || trimmed.startsWith("@") || trimmed.startsWith("}") || trimmed.startsWith(";") || trimmed.startsWith(":")) {
+    return null;
+  }
+  let angle = 0;
+  let paren = 0;
+  let candParenCol = -1;
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === "<" && paren === 0) angle++;
+    else if (ch === ">" && paren === 0 && angle > 0) angle--;
+    else if (ch === "(") {
+      if (paren === 0 && angle === 0) {
+        const before = code.slice(0, i).trimEnd();
+        const wordBefore = /([A-Za-z_~]\w*)\s*(?:<[^>]*>\s*)?$/.exec(before);
+        if (wordBefore && wordBefore[1] && !CLIKE_MODIFIERS.has(wordBefore[1])) {
+          candParenCol = i;
+          break;
+        }
+      }
+      paren++;
+    } else if (ch === ")") {
+      paren = Math.max(0, paren - 1);
+    }
+  }
+  if (candParenCol < 0) return null;
+  let head = code.slice(0, candParenCol).trimEnd();
+  if (head.endsWith(">")) {
+    let d = 0;
+    for (let k = head.length - 1; k >= 0; k--) {
+      if (head[k] === ">") d++;
+      else if (head[k] === "<") {
+        d--;
+        if (d === 0) {
+          head = head.slice(0, k).trimEnd();
+          break;
+        }
+      }
+    }
+  }
+  let rawName = "";
+  let prefix = "";
+  const opMatch = /^(.*?\s)(operator\s*(?:\(\)|\[\]|[+\-*/%^&|~!=<>]+))$/.exec(head);
+  if (opMatch && opMatch[2]) {
+    prefix = opMatch[1].trim();
+    rawName = opMatch[2].replace(/\s+/g, "");
+  } else {
+    const nameMatch = /^([\s\S]*?)((?:[A-Za-z_]\w*::)*~?[A-Za-z_]\w*)$/.exec(head);
+    if (!nameMatch || !nameMatch[2]) return null;
+    prefix = nameMatch[1].trim();
+    rawName = nameMatch[2];
+  }
+  const parts = rawName.split("::");
+  const shortName = parts[parts.length - 1].replace(/^~/, "");
+  if (CLIKE_EXCLUDED_NAMES.has(rawName) || CLIKE_EXCLUDED_NAMES.has(shortName)) {
+    return null;
+  }
+  let rem = prefix.replace(/\[\[[^\]]*\]\]\s*/g, "").trim();
+  while (rem) {
+    const modMatch = /^([A-Za-z_]\w*)\b\s*(?:"C"\s*)?/.exec(rem);
+    if (modMatch && modMatch[1] && CLIKE_MODIFIERS.has(modMatch[1])) {
+      rem = rem.slice(modMatch[0].length).trimStart();
+      continue;
+    }
+    break;
+  }
+  if (rem.length === 0) {
+    const isDestructor = rawName.startsWith("~") || rawName.includes("::~");
+    const isQualifiedCtor = parts.length >= 2 && parts[parts.length - 1] === parts[parts.length - 2];
+    const isInClassCtor = inTypeScope && currentTypeName !== null && rawName === currentTypeName;
+    if (!isDestructor && !isQualifiedCtor && !isInClassCtor) {
+      return null;
+    }
+  } else {
+    if (/[=;{}]|&&|\|\|/.test(rem)) return null;
+    if (!/[A-Za-z_)]/.test(rem)) return null;
+    if (CLIKE_EXCLUDED_NAMES.has(rem)) return null;
+  }
+  return { name: rawName, openParenCol: candParenCol };
+}
 function extractCLikeSymbols(lines) {
   const symbols = [];
-  const typeRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|sealed|data|open|export|partial)\s+)*(class|interface|enum|struct|record|protocol|namespace)\s+([A-Za-z_]\w*)/;
-  const kwFuncRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
-  const cMethodRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|inline|constexpr|extern|async|synchronized|native|unsigned|signed|const)\s+)*(?:[A-Za-z_~][\w:<>,\[\]\s*&]*?\s+)([A-Za-z_~][\w:]*)\s*\([^;]*$/;
-  const excludedNames = /* @__PURE__ */ new Set([
-    "if",
-    "for",
-    "while",
-    "switch",
-    "catch",
-    "else",
-    "return",
-    "sizeof",
-    "alignof",
-    "decltype",
-    "new",
-    "delete",
-    "throw",
-    "typedef",
-    "using",
-    "case"
-  ]);
-  const commentState = {
+  const state = {
     inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false
   };
+  const namespaceRe = /^\s*(?:inline\s+)?namespace\s+([A-Za-z_][\w:.]*)\s*(\{|;|$)/;
+  const typedefBlockRe = /^\s*typedef\s+(struct|enum|union)(?:\s+([A-Za-z_]\w*))?\s*\{/;
+  const typeRe = /^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|private|protected|internal|file|static|final|abstract|sealed|data|open|export|partial|readonly|unsafe|ref)\s+)*(?:(record)\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)|(enum)\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)|(class|interface|struct|protocol)\s+([A-Za-z_]\w*))/;
+  const bareForwardDeclRe = /^\s*(?:class|struct)\s+[A-Za-z_]\w*\s*;/;
+  const kwFuncRe = /^\s*(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
+  const activeContainers = [];
+  let bodyEndLine = -1;
+  let pendingTemplateStartLine = null;
+  let templateAngleDepth = 0;
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const wasInComment = commentState.inBlockComment;
-    scanBracesOnLine(line, commentState, "c");
-    if (wasInComment) continue;
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("#")) {
+    const ln = i + 1;
+    while (activeContainers.length > 0 && ln > activeContainers[activeContainers.length - 1].endLine) {
+      activeContainers.pop();
+    }
+    const wasInSpecial = state.inBlockComment || state.rawStringDelim !== null || state.inVerbatimString || state.inPreprocessorCont;
+    const scan = scanCLikeLine(lines[i], state);
+    if (wasInSpecial || scan.isPreprocessor) continue;
+    const rawCode = scan.code;
+    const trimmed = rawCode.trim();
+    if (!trimmed) continue;
+    if (templateAngleDepth > 0) {
+      for (let c = 0; c < rawCode.length; c++) {
+        if (rawCode[c] === "<") templateAngleDepth++;
+        else if (rawCode[c] === ">") {
+          templateAngleDepth--;
+          if (templateAngleDepth === 0) {
+            const after = rawCode.slice(c + 1).trim();
+            if (!after) break;
+          }
+        }
+      }
+      if (templateAngleDepth > 0 || trimmed.endsWith(">")) continue;
+    }
+    if (ln <= bodyEndLine) continue;
+    if (activeContainers.length > 0 && ln === activeContainers[activeContainers.length - 1].endLine && trimmed.startsWith("}")) {
       continue;
     }
-    const tm = typeRe.exec(line);
-    if (tm && tm[2] && tm[3]) {
-      const indented = (tm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: tm[2],
-        name: tm[3],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0
-      });
-      continue;
+    let code = rawCode;
+    if (/^\s*template\s*</.test(code)) {
+      const tpl = stripInlineTemplatePrefix(code);
+      if (pendingTemplateStartLine === null) {
+        pendingTemplateStartLine = ln;
+      }
+      if (!tpl.rest.trim()) {
+        if (tpl.rest === "" && !code.includes(">")) {
+          let d = 0;
+          for (const ch of code) {
+            if (ch === "<") d++;
+            else if (ch === ">") d = Math.max(0, d - 1);
+          }
+          templateAngleDepth = d;
+        }
+        continue;
+      }
+      code = tpl.rest;
     }
-    const fm = kwFuncRe.exec(line);
-    if (fm && fm[2]) {
-      const indented = (fm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: indented ? "method" : "function",
-        name: fm[2],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0
-      });
-      continue;
-    }
-    const cm = cMethodRe.exec(line);
-    if (cm && cm[2] && !excludedNames.has(cm[2]) && !trimmed.includes("=")) {
-      const { hasBrace } = hasArrowOrBraceWithin(lines, i, 8);
-      if (hasBrace) {
-        const indented = (cm[1]?.length ?? 0) > 0;
+    const symStartLine = pendingTemplateStartLine ?? ln;
+    const curDepth = Math.min(2, activeContainers.length);
+    const inTypeScope = activeContainers.some((c) => c.kind === "type");
+    const currentTypeName = [...activeContainers].reverse().find((c) => c.kind === "type")?.name ?? null;
+    const nm = namespaceRe.exec(code);
+    if (nm && nm[1]) {
+      pendingTemplateStartLine = null;
+      const normalizedNs = nm[1];
+      if (nm[2] === ";") {
         symbols.push({
-          kind: indented ? "method" : "function",
-          name: cm[2],
-          startLine: i + 1,
-          endLine: findBraceBlockEnd(lines, i, "c"),
-          depth: indented ? 1 : 0
+          kind: "namespace",
+          name: normalizedNs,
+          startLine: symStartLine,
+          endLine: ln,
+          depth: curDepth
+        });
+      } else {
+        const blk = findCLikeBlockEnd(lines, i);
+        symbols.push({
+          kind: "namespace",
+          name: normalizedNs,
+          startLine: symStartLine,
+          endLine: blk.endLine,
+          depth: curDepth
+        });
+        if (blk.hasBrace && blk.endLine > ln) {
+          activeContainers.push({
+            kind: "namespace",
+            name: normalizedNs,
+            endLine: blk.endLine
+          });
+        }
+      }
+      continue;
+    }
+    const tdm = typedefBlockRe.exec(code);
+    if (tdm && tdm[1]) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      const aliasMatch = /\}\s*([A-Za-z_]\w*)\s*;/.exec(blk.closeLineCode);
+      const tdName = aliasMatch?.[1] || tdm[2];
+      if (tdName) {
+        symbols.push({
+          kind: tdm[1],
+          name: tdName,
+          startLine: symStartLine,
+          endLine: blk.endLine,
+          depth: curDepth
         });
       }
+      continue;
+    }
+    if (bareForwardDeclRe.test(code)) {
+      pendingTemplateStartLine = null;
+      continue;
+    }
+    const tm = typeRe.exec(code);
+    const typeKind = tm?.[1] || tm?.[3] || tm?.[5];
+    const typeName = tm?.[2] || tm?.[4] || tm?.[6];
+    if (typeKind && typeName) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      symbols.push({
+        kind: typeKind,
+        name: typeName,
+        startLine: symStartLine,
+        endLine: blk.endLine,
+        depth: curDepth
+      });
+      if (blk.hasBrace && blk.endLine > ln && typeKind !== "enum") {
+        activeContainers.push({
+          kind: "type",
+          name: typeName,
+          endLine: blk.endLine
+        });
+      }
+      continue;
+    }
+    const fm = kwFuncRe.exec(code);
+    if (fm && fm[1]) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      symbols.push({
+        kind: inTypeScope ? "method" : "function",
+        name: fm[1],
+        startLine: symStartLine,
+        endLine: blk.endLine,
+        depth: curDepth
+      });
+      if (blk.hasBrace && blk.endLine > ln) {
+        bodyEndLine = blk.endLine;
+      }
+      continue;
+    }
+    const cm = matchCLikeCallableHeader(code, inTypeScope, currentTypeName);
+    if (cm) {
+      const endLine = findCLikeCallableBodyEnd(lines, i, cm.openParenCol, code);
+      if (endLine !== null) {
+        pendingTemplateStartLine = null;
+        const isMethod = inTypeScope || cm.name.includes("::");
+        symbols.push({
+          kind: isMethod ? "method" : "function",
+          name: cm.name,
+          startLine: symStartLine,
+          endLine,
+          depth: curDepth
+        });
+        bodyEndLine = Math.max(bodyEndLine, endLine);
+        continue;
+      }
+    }
+    if (!trimmed.startsWith("[") && !trimmed.startsWith("@")) {
+      pendingTemplateStartLine = null;
     }
   }
   return symbols;
@@ -9213,8 +9719,11 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".c":
     case ".cc":
     case ".cpp":
+    case ".cxx":
     case ".h":
+    case ".hh":
     case ".hpp":
+    case ".hxx":
       return extractCLikeSymbols(lines);
     case ".sh":
     case ".bash":

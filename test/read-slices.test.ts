@@ -1722,4 +1722,131 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("extracts C/C++ (.c/.h/.cpp/.hpp/.cc/.cxx) and C# (.cs) outlines across #define macros, templates, and control flow", () => {
+    const cppDoc = [
+      "#pragma once", // 1
+      "#define DECLARE_FAKE_TYPE(Name) \\", // 2
+      "  class Name { \\", // 3
+      "    void fake() {} \\", // 4
+      "  }", // 5
+      "", // 6
+      "class ForwardOnly;", // 7 (forward decl skipped)
+      "", // 8
+      "namespace engine::core {", // 9
+      "enum class State : int {", // 10
+      "  Idle = 0,", // 11
+      "  Running = 1,", // 12
+      "};", // 13
+      "", // 14
+      "template <typename T>", // 15
+      "class RingBuffer {", // 16
+      "public:", // 17
+      "  explicit RingBuffer(size_t cap) : cap_{cap} {", // 18
+      "    if (cap == 0) {", // 19
+      "      cap_ = 1;", // 20
+      "    }", // 21
+      "  }", // 22
+      "", // 23
+      "  ~RingBuffer() noexcept {", // 24
+      "    clear();", // 25
+      "  }", // 26
+      "", // 27
+      "  bool push(const T& item) {", // 28
+      "    for (size_t i = 0; i < cap_; ++i) {", // 29
+      '      const char* raw = R"(unbalanced { in C++ raw string)";', // 30
+      "      (void)raw;", // 31
+      "    }", // 32
+      "    return true;", // 33
+      "  }", // 34
+      "private:", // 35
+      "  size_t cap_;", // 36
+      "};", // 37
+      "}", // 38
+      "", // 39
+      "template <typename T>", // 40
+      "constexpr T clamp_value(T v, T lo, T hi) {", // 41
+      "  while (false) {}", // 42
+      "  return v < lo ? lo : (v > hi ? hi : v);", // 43
+      "}", // 44
+    ].join("\n");
+
+    const cppSyms = extractSymbols("ring_buffer.hpp", cppDoc);
+    assert.deepEqual(extractSymbols("ring_buffer.cxx", cppDoc), cppSyms);
+    assert.deepEqual(
+      cppSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "namespace:engine::core:9-38:d0",
+        "enum:State:10-13:d1",
+        "class:RingBuffer:15-37:d1",
+        "method:RingBuffer:18-22:d2",
+        "method:~RingBuffer:24-26:d2",
+        "method:push:28-34:d2",
+        "function:clamp_value:40-44:d0",
+      ],
+    );
+
+    const cHeaderDoc = [
+      "#ifndef STORAGE_H", // 1
+      "#define STORAGE_H", // 2
+      "typedef struct {", // 3
+      "  int max_conns;", // 4
+      "} storage_opts_t;", // 5
+      "int storage_open(const storage_opts_t *opts);", // 6 (prototype skipped)
+      "static inline int storage_is_valid(const storage_opts_t *opts) {", // 7
+      "  switch (opts ? opts->max_conns : 0) {", // 8
+      "    case 0: return 0;", // 9
+      "    default: return 1;", // 10
+      "  }", // 11
+      "}", // 12
+      "#endif", // 13
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("storage.h", cHeaderDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["struct:storage_opts_t:3-5", "function:storage_is_valid:7-12"],
+    );
+
+    const csDoc = [
+      "namespace Acme.Billing {", // 1
+      "    public interface IBiller {", // 2
+      "        Task<bool> ChargeAsync(decimal amount);", // 3
+      "    }", // 4
+      "", // 5
+      "    public sealed record InvoiceDto(Guid Id, decimal Total);", // 6
+      "", // 7
+      "    public class StripeBiller : IBiller {", // 8
+      "        public StripeBiller(HttpClient client) {", // 9
+      '            var dir = @"C:\\temp\\";', // 10 (verbatim trailing backslash!)
+      "        }", // 11
+      "", // 12
+      "        public async Task<bool> ChargeAsync(decimal amount) {", // 13
+      "            try {", // 14
+      "                if (amount <= 0) {", // 15
+      "                    return false;", // 16
+      "                }", // 17
+      "            } catch (Exception) {", // 18
+      "                return false;", // 19
+      "            }", // 20
+      "            return true;", // 21
+      "        }", // 22
+      "", // 23
+      "        public string FormatAmount(decimal amount) => amount.ToString();", // 24
+      "    }", // 25
+      "}", // 26
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("StripeBiller.cs", csDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "namespace:Acme.Billing:1-26:d0",
+        "interface:IBiller:2-4:d1",
+        "record:InvoiceDto:6-6:d1",
+        "class:StripeBiller:8-25:d1",
+        "method:StripeBiller:9-11:d2",
+        "method:ChargeAsync:13-22:d2",
+        "method:FormatAmount:24-24:d2",
+      ],
+    );
+  });
 });
