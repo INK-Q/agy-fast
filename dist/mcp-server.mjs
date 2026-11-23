@@ -6752,6 +6752,98 @@ function isPythonFStringPrefix(line, quoteIdx) {
   const prefix = line.slice(k + 1, quoteIdx).toLowerCase();
   return prefix === "f" || prefix === "fr" || prefix === "rf";
 }
+function isPythonPep695TypeAlias(lines, startIdx) {
+  const firstLine = lines[startIdx] ?? "";
+  const m = /^([ \t]*)type\s+([A-Za-z_]\w*)\s*(\[|=)/.exec(firstLine);
+  if (!m || !m[2] || !m[3]) return null;
+  if (m[3] === "=") {
+    return firstLine[m[0].length] === "=" ? null : m[2];
+  }
+  let bracket = 0;
+  let quote = null;
+  const maxLine = Math.min(lines.length - 1, startIdx + 8);
+  for (let ln = startIdx; ln <= maxLine; ln++) {
+    const text = lines[ln] ?? "";
+    const fromCol = ln === startIdx ? m[0].length - 1 : 0;
+    for (let c = fromCol; c < text.length; c++) {
+      const ch = text[c];
+      if (quote) {
+        if (ch === "\\") {
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "#") break;
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "[") bracket++;
+      else if (ch === "]") {
+        bracket--;
+        if (bracket === 0) {
+          for (let a = ln; a <= Math.min(lines.length - 1, ln + 2); a++) {
+            const tail = a === ln ? text.slice(c + 1) : lines[a] ?? "";
+            const trimmedTail = tail.replace(/#.*$/, "").trimStart();
+            if (!trimmedTail) continue;
+            return trimmedTail.startsWith("=") && !trimmedTail.startsWith("==") ? m[2] : null;
+          }
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+function parsePythonMatchSubject(lines, startIdx, isContinuation) {
+  const firstLine = lines[startIdx] ?? "";
+  const m = /^[ \t]*match(?:\s+|\s*(?=[(\[]))(.*)$/.exec(firstLine);
+  if (!m) return null;
+  const chunks = [m[1] ?? ""];
+  let k = startIdx + 1;
+  while (k < lines.length && isContinuation[k]) {
+    chunks.push(lines[k] ?? "");
+    k++;
+  }
+  let cleaned = "";
+  let bracket = 0;
+  let quote = null;
+  for (const rawChunk of chunks) {
+    for (let c = 0; c < rawChunk.length; c++) {
+      const ch = rawChunk[c];
+      if (quote) {
+        cleaned += ch;
+        if (ch === "\\") {
+          if (c + 1 < rawChunk.length) cleaned += rawChunk[c + 1];
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "#") break;
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        cleaned += ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") bracket++;
+      else if (ch === ")" || ch === "]" || ch === "}") bracket = Math.max(0, bracket - 1);
+      else if (bracket === 0 && ch === "=" && rawChunk[c - 1] !== "=" && rawChunk[c - 1] !== "!" && rawChunk[c - 1] !== "<" && rawChunk[c - 1] !== ">" && rawChunk[c - 1] !== ":" && rawChunk[c + 1] !== "=") {
+        return null;
+      }
+      cleaned += ch;
+    }
+    cleaned += " ";
+  }
+  const trimmed = cleaned.trim();
+  if (!trimmed.endsWith(":") || bracket !== 0) return null;
+  const subject = trimmed.slice(0, -1).replace(/\s+/g, " ").trim();
+  if (!subject || /^[=:,]/.test(subject)) return null;
+  return sliceSafeChars(subject, 48);
+}
 function extractPythonSymbols(lines) {
   const symbols = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
@@ -6759,6 +6851,7 @@ function extractPythonSymbols(lines) {
   const isContinuation = new Array(lines.length).fill(false);
   const inStringContinuation = new Array(lines.length).fill(false);
   let activeQuote = null;
+  let activeTripleIsFString = false;
   let activeSingleQuote = null;
   let activeSingleIsFString = false;
   let bracketDepth = 0;
@@ -6794,8 +6887,30 @@ function extractPythonSymbols(lines) {
           j += 2;
           continue;
         }
+        if (activeTripleIsFString) {
+          if (line[j] === "{") {
+            if (line[j + 1] === "{") {
+              j += 2;
+              continue;
+            }
+            fExprStack.push({
+              quote: activeQuote,
+              braceDepth: 1,
+              baseBracketDepth: bracketDepth
+            });
+            activeQuote = null;
+            activeTripleIsFString = false;
+            j++;
+            continue;
+          }
+          if (line[j] === "}" && line[j + 1] === "}") {
+            j += 2;
+            continue;
+          }
+        }
         if (line.startsWith(activeQuote, j)) {
           activeQuote = null;
+          activeTripleIsFString = false;
           j += 3;
           continue;
         }
@@ -6839,13 +6954,9 @@ function extractPythonSymbols(lines) {
         j++;
       } else {
         if (line[j] === "#") break;
-        if (line.startsWith('"""', j)) {
-          activeQuote = '"""';
-          j += 3;
-          continue;
-        }
-        if (line.startsWith("'''", j)) {
-          activeQuote = "'''";
+        if (line.startsWith('"""', j) || line.startsWith("'''", j)) {
+          activeQuote = line.startsWith('"""', j) ? '"""' : "'''";
+          activeTripleIsFString = isPythonFStringPrefix(line, j);
           j += 3;
           continue;
         }
@@ -6871,8 +6982,13 @@ function extractPythonSymbols(lines) {
             }
             if (specDepth === 0) {
               fExprStack.pop();
-              activeSingleQuote = top.quote;
-              activeSingleIsFString = true;
+              if (top.quote === '"""' || top.quote === "'''") {
+                activeQuote = top.quote;
+                activeTripleIsFString = true;
+              } else {
+                activeSingleQuote = top.quote;
+                activeSingleIsFString = true;
+              }
             }
             continue;
           }
@@ -6885,8 +7001,13 @@ function extractPythonSymbols(lines) {
           if (line[j] === "}") {
             if (top.braceDepth === 1) {
               fExprStack.pop();
-              activeSingleQuote = top.quote;
-              activeSingleIsFString = true;
+              if (top.quote === '"""' || top.quote === "'''") {
+                activeQuote = top.quote;
+                activeTripleIsFString = true;
+              } else {
+                activeSingleQuote = top.quote;
+                activeSingleIsFString = true;
+              }
               j++;
               continue;
             }
@@ -6911,47 +7032,100 @@ function extractPythonSymbols(lines) {
   const raw = [];
   for (let i = 0; i < lines.length; i++) {
     if (isContinuation[i]) continue;
-    const m = re.exec(lines[i]);
-    if (!m) continue;
-    const indent = m[1].replace(/\t/g, "    ").length;
-    const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3], defIdx: i });
+    const line = lines[i];
+    const indent = indentOf(line);
+    const m = re.exec(line);
+    if (m && m[3]) {
+      raw.push({
+        indent,
+        rawKind: m[2] === "class" ? "class" : "callable",
+        name: m[3],
+        defIdx: i,
+        isSuiteBlock: true
+      });
+      continue;
+    }
+    const typeAliasName = isPythonPep695TypeAlias(lines, i);
+    if (typeAliasName) {
+      raw.push({
+        indent,
+        rawKind: "type",
+        name: typeAliasName,
+        defIdx: i,
+        isSuiteBlock: false
+      });
+      continue;
+    }
+    const matchSubj = parsePythonMatchSubject(lines, i, isContinuation);
+    if (matchSubj) {
+      raw.push({
+        indent,
+        rawKind: "match",
+        name: matchSubj,
+        defIdx: i,
+        isSuiteBlock: true
+      });
+    }
   }
+  const suiteStack = [];
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx];
+    while (suiteStack.length > 0 && (item.defIdx + 1 > suiteStack[suiteStack.length - 1].endLine || item.indent <= suiteStack[suiteStack.length - 1].indent)) {
+      suiteStack.pop();
+    }
     let startIdx = item.defIdx;
-    for (let j = item.defIdx - 1; j >= 0; j--) {
-      if (isContinuation[j] || !lines[j].trim()) continue;
-      const trimmed = lines[j].trimStart();
-      if (trimmed.startsWith("#")) continue;
-      if (!trimmed.startsWith("@") || indentOf(lines[j]) !== item.indent) break;
-      startIdx = j;
-    }
-    let endIdx = lines.length - 1;
-    for (let j = item.defIdx + 1; j < lines.length; j++) {
-      if (isContinuation[j]) continue;
-      const l = lines[j];
-      const trimmed = l.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      if (indentOf(l) <= item.indent) {
-        endIdx = j - 1;
-        break;
+    if (item.rawKind === "class" || item.rawKind === "callable") {
+      const prevFloor = idx > 0 ? raw[idx - 1].defIdx : -1;
+      for (let j = item.defIdx - 1; j > prevFloor; j--) {
+        if (isContinuation[j] || !lines[j].trim()) continue;
+        const trimmed = lines[j].trimStart();
+        if (trimmed.startsWith("#")) continue;
+        if (!trimmed.startsWith("@") || indentOf(lines[j]) !== item.indent) break;
+        startIdx = j;
       }
     }
-    while (endIdx > item.defIdx) {
-      const trimmed = lines[endIdx].trim();
-      if (trimmed && !(!isContinuation[endIdx] && trimmed.startsWith("#") && indentOf(lines[endIdx]) <= item.indent)) {
-        break;
+    let endIdx = item.defIdx;
+    if (!item.isSuiteBlock) {
+      while (endIdx + 1 < lines.length && isContinuation[endIdx + 1]) {
+        endIdx++;
       }
-      endIdx--;
+    } else {
+      endIdx = lines.length - 1;
+      for (let j = item.defIdx + 1; j < lines.length; j++) {
+        if (isContinuation[j]) continue;
+        const l = lines[j];
+        const trimmed = l.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        if (indentOf(l) <= item.indent) {
+          endIdx = j - 1;
+          break;
+        }
+      }
+      while (endIdx > item.defIdx) {
+        const trimmed = lines[endIdx].trim();
+        if (trimmed && !(!isContinuation[endIdx] && trimmed.startsWith("#") && indentOf(lines[endIdx]) <= item.indent)) {
+          break;
+        }
+        endIdx--;
+      }
     }
+    const inClass = suiteStack.some((s) => s.kind === "class");
+    const finalKind = item.rawKind === "callable" ? inClass ? "method" : "function" : item.rawKind;
+    const depth = suiteStack.length > 0 ? Math.min(2, suiteStack.length) : item.indent > 0 ? 1 : 0;
     symbols.push({
-      kind: item.kind,
+      kind: finalKind,
       name: item.name,
       startLine: startIdx + 1,
       endLine: endIdx + 1,
-      depth: item.indent > 0 ? 1 : 0
+      depth
     });
+    if (item.isSuiteBlock) {
+      suiteStack.push({
+        kind: finalKind,
+        indent: item.indent,
+        endLine: endIdx + 1
+      });
+    }
   }
   return symbols;
 }

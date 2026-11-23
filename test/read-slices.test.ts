@@ -2093,4 +2093,64 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("supports Python PEP 695 type aliases, match blocks, decorator-aware methods, and triple-quoted f-string docstrings", () => {
+    const pyDoc = [
+      "type Scalar = int | float | str", // 1
+      "", // 2
+      "type Matrix[T: (int, float)] = (", // 3
+      "    list[list[T]]", // 4
+      ")", // 5
+      "", // 6
+      'type = "not_a_type_alias"', // 7 (soft-keyword assignment ignored)
+      'match = "not_a_match_stmt"', // 8 (soft-keyword assignment ignored)
+      "", // 9
+      "class Repository[T]:", // 10
+      '    """', // 11
+      "    Docstring example that must be ignored:", // 12
+      "    def fake_in_docstring():", // 13
+      "        pass", // 14
+      '    """', // 15
+      "", // 16
+      "    @classmethod", // 17
+      '    def create(cls, prefix: str) -> "Repository[T]":', // 18
+      '        msg = f"""{prefix.strip(\'"""\')}', // 19
+      "def fake_in_triple_fstring():", // 20
+      '    pass"""', // 21
+      "        _ = msg", // 22
+      "        return cls()", // 23
+      "", // 24
+      "    @staticmethod", // 25
+      "    def normalize_key(key: str) -> str:", // 26
+      "        return key.strip().lower()", // 27
+      "", // 28
+      "    @abstractmethod", // 29
+      "    async def fetch(self, action: str) -> T | None:", // 30
+      "        match action:", // 31
+      '            case "get":', // 32
+      "                return None", // 33
+      "            case _:", // 34
+      "                return None", // 35
+      "", // 36
+      "match sys_mode:", // 37
+      '    case "cli":', // 38
+      "        pass", // 39
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("repo.py", pyDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "type:Scalar:1-1:d0",
+        "type:Matrix:3-5:d0",
+        "class:Repository:10-35:d0",
+        "method:create:17-23:d1",
+        "method:normalize_key:25-27:d1",
+        "method:fetch:29-35:d1",
+        "match:action:31-35:d2",
+        "match:sys_mode:37-39:d0",
+      ],
+    );
+  });
 });
