@@ -2153,4 +2153,82 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("supports Go receiver method labels, grouped type (...) blocks, and Shell (.sh/.bash/.zsh) heredoc-safe outlines", () => {
+    const goDoc = [
+      "package transport", // 1
+      "", // 2
+      "type (", // 3
+      "  // Config holds transport options", // 4
+      "  Config struct {", // 5
+      "    Addr string", // 6
+      "    Inner struct {", // 7
+      "      Timeout int", // 8
+      "    }", // 9
+      "  }", // 10
+      "", // 11
+      "  Codec interface {", // 12
+      "    Encode(v any) ([]byte, error)", // 13
+      "  }", // 14
+      "", // 15
+      "  Middleware func(", // 16
+      "    next Codec,", // 17
+      "  ) Codec", // 18
+      ")", // 19
+      "", // 20
+      "func (c *Config) Validate() error {", // 21
+      "  return nil", // 22
+      "}", // 23
+      "", // 24
+      "func (*Config) Reset() {}", // 25
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("transport.go", goDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      [
+        "struct:Config:5-10",
+        "interface:Codec:12-14",
+        "type:Middleware:16-18",
+        "method:Config.Validate:21-23",
+        "method:Config.Reset:25-25",
+      ],
+    );
+
+    const shDoc = [
+      "#!/usr/bin/env bash", // 1
+      "# fake_comment_fn() { echo nope; }", // 2
+      "", // 3
+      "function log::info {", // 4
+      '  echo "[INFO] $*"', // 5
+      "}", // 6
+      "", // 7
+      "write_template()", // 8
+      "{", // 9
+      "  local mask=$(( 1 << shift_bits ))", // 10 (arithmetic << must NOT open heredoc!)
+      "  cat <<- 'EOF' > /tmp/out.sh", // 11
+      "fake_in_heredoc() {", // 12
+      '  echo "{ unbalanced brace in heredoc"', // 13
+      "}", // 14
+      "  EOF", // 15
+      "}", // 16
+      "", // 17
+      "cleanup_all() {", // 18
+      "  rm -f /tmp/out.sh", // 19
+      "}", // 20
+    ].join("\n");
+
+    const shSyms = extractSymbols("deploy.sh", shDoc);
+    assert.deepEqual(extractSymbols("deploy.bash", shSyms.length ? shDoc : ""), shSyms);
+    assert.deepEqual(extractSymbols("deploy.zsh", shDoc), shSyms);
+    assert.deepEqual(
+      shSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "function:log::info:4-6",
+        "function:write_template:8-16",
+        "function:cleanup_all:18-20",
+      ],
+    );
+  });
 });

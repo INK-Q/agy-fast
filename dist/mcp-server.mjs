@@ -7381,25 +7381,99 @@ function extractGdScriptSymbols(rawLines) {
   }
   return symbols;
 }
+function formatGoReceiverType(rawRecv) {
+  const withoutGenerics = rawRecv.replace(/\[[\s\S]*\]\s*$/, "").trim();
+  const parts = withoutGenerics.split(/\s+/);
+  const last = parts[parts.length - 1] ?? withoutGenerics;
+  return last.replace(/^\*+/, "");
+}
+function findGoSpecEnd(lines, startIdx) {
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  const maxScan = Math.min(lines.length, startIdx + 2e3);
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanBracesOnLine(lines[i], state, "go");
+    braceDepth += scan.open - scan.close;
+    parenDepth += scan.openParen - scan.closeParen;
+    if (braceDepth <= 0 && parenDepth <= 0 && !state.inBlockComment && !state.inBacktick) {
+      return i + 1;
+    }
+  }
+  return startIdx + 1;
+}
 function extractGoSymbols(lines) {
   const symbols = [];
-  const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
-  const typeRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(struct|interface)\b/;
+  const funcRe = /^func\s+(?:\(([^)]+)\)\s*)?([A-Za-z_]\w*)/;
+  const typeGroupOpenRe = /^type\s*\(\s*(?:\/\/.*|\/\*.*\*\/\s*)?$/;
+  const singleTypeBlockRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?(struct|interface)\b/;
+  const singleTypeOtherRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?\S/;
+  const groupedTypeSpecRe = /^[ \t]*([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?(?:(struct|interface)\b|(\S))/;
   const commentState = {
     inBlockComment: false,
     templateExprStack: [],
     inBacktick: false
   };
+  let inTypeGroup = false;
+  let groupParenDepth = 0;
+  let groupBraceDepth = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const wasInComment = commentState.inBlockComment;
     const wasInBacktick = commentState.inBacktick;
-    scanBracesOnLine(line, commentState, "go");
-    if (wasInComment || wasInBacktick) continue;
+    const parenBefore = groupParenDepth;
+    const braceBefore = groupBraceDepth;
+    const scan = scanBracesOnLine(line, commentState, "go");
+    if (inTypeGroup) {
+      groupBraceDepth = Math.max(0, groupBraceDepth + scan.open - scan.close);
+      groupParenDepth = Math.max(0, groupParenDepth + scan.openParen - scan.closeParen);
+    }
+    if (wasInComment || wasInBacktick) {
+      if (inTypeGroup && groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
+      if (inTypeGroup && groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
+    if (inTypeGroup) {
+      if (parenBefore === 1 && braceBefore === 0 && !trimmed.startsWith(")")) {
+        const gm = groupedTypeSpecRe.exec(line);
+        if (gm && gm[1]) {
+          const kind = gm[2] ?? "type";
+          const endLine = gm[2] ? findBraceBlockEnd(lines, i, "go") : findGoSpecEnd(lines, i);
+          symbols.push({
+            kind,
+            name: gm[1],
+            startLine: i + 1,
+            endLine,
+            depth: 0
+          });
+        }
+      }
+      if (groupParenDepth === 0) {
+        inTypeGroup = false;
+      }
+      continue;
+    }
+    if (typeGroupOpenRe.test(trimmed)) {
+      inTypeGroup = true;
+      groupParenDepth = Math.max(1, scan.openParen - scan.closeParen);
+      groupBraceDepth = Math.max(0, scan.open - scan.close);
+      if (groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
     const fm = funcRe.exec(line);
     if (fm && fm[2]) {
       const recv = fm[1]?.trim();
-      const name = recv ? `(${recv}) ${fm[2]}` : fm[2];
+      const recvType = recv ? formatGoReceiverType(recv) : "";
+      const name = recvType ? `${recvType}.${fm[2]}` : fm[2];
       symbols.push({
         kind: recv ? "method" : "function",
         name,
@@ -7409,13 +7483,24 @@ function extractGoSymbols(lines) {
       });
       continue;
     }
-    const tm = typeRe.exec(line);
+    const tm = singleTypeBlockRe.exec(line);
     if (tm && tm[1] && tm[2]) {
       symbols.push({
         kind: tm[2],
         name: tm[1],
         startLine: i + 1,
         endLine: findBraceBlockEnd(lines, i, "go"),
+        depth: 0
+      });
+      continue;
+    }
+    const to = singleTypeOtherRe.exec(line);
+    if (to && to[1]) {
+      symbols.push({
+        kind: "type",
+        name: to[1],
+        startLine: i + 1,
+        endLine: findGoSpecEnd(lines, i),
         depth: 0
       });
     }
@@ -8038,21 +8123,201 @@ function extractCLikeSymbols(lines) {
   }
   return symbols;
 }
+function scanShellLine(line, state) {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  if (state.heredocs.length > 0) {
+    const cur = state.heredocs[0];
+    const candidate = cur.indented ? line.trim() : line.trimEnd();
+    if (candidate === cur.delim) {
+      state.heredocs.shift();
+    }
+    return {
+      code,
+      openBrace,
+      closeBrace,
+      openParen,
+      closeParen,
+      wasInHeredocOrQuote: true
+    };
+  }
+  const wasInQuote = state.inSingleQuote || state.inDoubleQuote;
+  let arithDepth = 0;
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    const next = line[i + 1];
+    if (state.inSingleQuote) {
+      if (ch === "'") state.inSingleQuote = false;
+      i++;
+      continue;
+    }
+    if (state.inDoubleQuote) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') state.inDoubleQuote = false;
+      i++;
+      continue;
+    }
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) {
+      break;
+    }
+    if (ch === "'") {
+      state.inSingleQuote = true;
+      code += "''";
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      state.inDoubleQuote = true;
+      code += '""';
+      i++;
+      continue;
+    }
+    if (ch === "(" && next === "(") {
+      arithDepth++;
+      openParen += 2;
+      code += "((";
+      i += 2;
+      continue;
+    }
+    if (ch === ")" && next === ")" && arithDepth > 0) {
+      arithDepth--;
+      closeParen += 2;
+      code += "))";
+      i += 2;
+      continue;
+    }
+    if (arithDepth === 0 && ch === "<" && next === "<" && line[i + 2] !== "<") {
+      const hm = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/.exec(
+        line.slice(i)
+      );
+      const delim = hm?.[2] || hm?.[3] || hm?.[4];
+      if (hm && delim) {
+        state.heredocs.push({ delim, indented: hm[1] === "-" });
+        code += "<<";
+        i += hm[0].length;
+        continue;
+      }
+    }
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    i++;
+  }
+  return {
+    code,
+    openBrace,
+    closeBrace,
+    openParen,
+    closeParen,
+    wasInHeredocOrQuote: wasInQuote
+  };
+}
+function findShellFunctionEnd(lines, startIdx, bodyKind, openLineIdx) {
+  const state = {
+    inSingleQuote: false,
+    inDoubleQuote: false,
+    heredocs: []
+  };
+  let depth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, startIdx + 2e3);
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanShellLine(lines[i], state);
+    if (i < openLineIdx) continue;
+    if (bodyKind === "{") {
+      if (scan.openBrace > 0) seenOpen = true;
+      depth += scan.openBrace - scan.closeBrace;
+    } else {
+      let openP = scan.openParen;
+      let closeP = scan.closeParen;
+      if (i === startIdx && openLineIdx === startIdx) {
+        const sigParens = /\(\s*\)/.test(scan.code) ? 1 : 0;
+        openP = Math.max(0, openP - sigParens);
+        closeP = Math.max(0, closeP - sigParens);
+      }
+      if (openP > 0) seenOpen = true;
+      depth += openP - closeP;
+    }
+    if (seenOpen && depth <= 0 && state.heredocs.length === 0) {
+      return i + 1;
+    }
+  }
+  return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
+}
 function extractShellSymbols(lines) {
   const symbols = [];
-  const re = /^(?:function\s+([A-Za-z_][\w-]*)\s*(?:\(\))?|([A-Za-z_][\w-]*)\s*\(\))\s*\{/;
+  const state = {
+    inSingleQuote: false,
+    inDoubleQuote: false,
+    heredocs: []
+  };
+  const sameLineFnRe = /^[ \t]*(?:function\s+([A-Za-z_][\w.:-]*)(?:\s*\(\s*\))?|([A-Za-z_][\w.:-]*)\s*\(\s*\))\s*([{(])/;
+  const headerOnlyFnRe = /^[ \t]*(?:function\s+([A-Za-z_][\w.:-]*)(?:\s*\(\s*\))?|([A-Za-z_][\w.:-]*)\s*\(\s*\))\s*$/;
+  const shellReserved = /* @__PURE__ */ new Set([
+    "if",
+    "for",
+    "while",
+    "until",
+    "case",
+    "select",
+    "function",
+    "time",
+    "coproc"
+  ]);
   for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]);
-    if (!m) continue;
-    const name = m[1] || m[2];
-    if (!name) continue;
-    symbols.push({
-      kind: "function",
-      name,
-      startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "shell"),
-      depth: 0
-    });
+    const scan = scanShellLine(lines[i], state);
+    if (scan.wasInHeredocOrQuote) continue;
+    const code = scan.code;
+    if (!code.trim()) continue;
+    const mSame = sameLineFnRe.exec(code);
+    if (mSame) {
+      const fnName = mSame[1] || mSame[2];
+      const opener = mSame[3];
+      if (fnName && !shellReserved.has(fnName)) {
+        symbols.push({
+          kind: "function",
+          name: fnName,
+          startLine: i + 1,
+          endLine: findShellFunctionEnd(lines, i, opener, i),
+          depth: 0
+        });
+        continue;
+      }
+    }
+    const mHead = headerOnlyFnRe.exec(code);
+    if (mHead) {
+      const fnName = mHead[1] || mHead[2];
+      if (fnName && !shellReserved.has(fnName)) {
+        for (let k = i + 1; k < Math.min(lines.length, i + 5); k++) {
+          const nextTrim = lines[k].trim();
+          if (!nextTrim || nextTrim.startsWith("#")) continue;
+          if (nextTrim.startsWith("{") || nextTrim.startsWith("(")) {
+            const opener = nextTrim[0];
+            symbols.push({
+              kind: "function",
+              name: fnName,
+              startLine: i + 1,
+              endLine: findShellFunctionEnd(lines, i, opener, k),
+              depth: 0
+            });
+          }
+          break;
+        }
+      }
+    }
   }
   return symbols;
 }
