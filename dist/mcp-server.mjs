@@ -1262,6 +1262,31 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
   });
 }
+var WATCH_MODE_TIMEOUT_HINT = "Hint: command looks like a watch/dev-server process; pass --run or a non-watch command.";
+var WATCH_MODE_PATTERNS = [
+  /\bvitest\b(?!.*(?:^|\s)(?:run|--run|bench|--version|-v|--help|-h|--watch=false|--watch=0)(?=\s|$|=))/i,
+  /(?:^|\s)--watch(?:All)?(?:=(?!false\b|0\b)\S*)?(?=\s|$)/i,
+  /\b(?:jest|vitest|tsc|tsx|esbuild|webpack|rollup|babel|sass|tailwindcss|nodemon|cargo\s+watch|ptw|pytest-watch)\b.*(?:^|\s)-w(?=\s|$|=)/i,
+  /\b(?:vite|next|nuxt|astro|remix)\s+dev\b/i,
+  /\b(?:nodemon|ptw|pytest-watch)\b/i,
+  /\b(?:tsx|cargo)\s+watch\b/i
+];
+function detectWatchModeHint(command) {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  for (const re of WATCH_MODE_PATTERNS) {
+    if (re.test(trimmed)) return WATCH_MODE_TIMEOUT_HINT;
+  }
+  return null;
+}
+function buildNonInteractiveCheckEnv(baseEnv = process.env) {
+  for (const key of Object.keys(baseEnv)) {
+    if (key.toUpperCase() === "CI" && baseEnv[key] !== void 0) {
+      return { ...baseEnv };
+    }
+  }
+  return { ...baseEnv, CI: "1" };
+}
 var cachedRgAvailable = null;
 var pendingRgProbe = null;
 async function isRipgrepAvailable() {
@@ -4022,14 +4047,15 @@ ${summaryLines.join("\n")}`;
     const maxVerifyChars = Number.isFinite(rawMaxVerifyChars) ? Math.max(300, Math.min(7500, Math.trunc(rawMaxVerifyChars))) : 4e3;
     const res = await runShellCommandAsync(verifySpec.command, {
       cwd: verifyCwd,
-      timeoutMs
+      timeoutMs,
+      env: buildNonInteractiveCheckEnv()
     });
     const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (${formatExitFailureLabel(res.exitCode, res.signal)})`;
     const verifyPrefix = `
 
 Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 `;
-    const preparedVerify = prepareCompactCommandOutput({
+    const rawPreparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
@@ -4037,6 +4063,9 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
       timedOut: res.timedOut,
       error: res.error
     });
+    const watchHint = res.timedOut ? detectWatchModeHint(verifySpec.command) : null;
+    const preparedVerify = watchHint ? { ...rawPreparedVerify, bodyText: `${rawPreparedVerify.bodyText}
+${watchHint}` } : rawPreparedVerify;
     const minApplied = `${header} (${formatAppliedSummaryCompact(summaryLines.length, noOpCount, false)}; list omitted to preserve verify diagnostics)`;
     const reservedForApplied = status === "PASS" ? Math.min(
       Buffer.byteLength(appliedFull, "utf8"),
@@ -8906,6 +8935,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   const safeBudgetMs = Number.isFinite(budgetMs) && budgetMs > 0 ? Math.max(100, Math.trunc(budgetMs)) : MCP_CALL_BUDGET_SEC * 1e3;
   const wallStart = performance.now();
   const deadline = wallStart + safeBudgetMs;
+  const checkEnv = buildNonInteractiveCheckEnv();
   const outcomes = await mapWithConcurrency(
     normalized,
     concurrency,
@@ -8914,7 +8944,8 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       if (remainingMs < 100) return { spec, result: null, passed: false };
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
-        timeoutMs: Math.min(spec.timeoutMs, remainingMs)
+        timeoutMs: Math.min(spec.timeoutMs, remainingMs),
+        env: checkEnv
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
       return { spec, result, passed };
@@ -9016,7 +9047,10 @@ $ ${spec.command}
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr)
       ].filter(Boolean).join("\n");
-      const rawBody = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+      const baseBody = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+      const watchHint = result.timedOut ? detectWatchModeHint(spec.command) : null;
+      const rawBody = watchHint ? `${baseBody}
+${watchHint}` : baseBody;
       const fullBlock = `${fullPrefix}${rawBody}`;
       return {
         notRun: false,
@@ -9103,7 +9137,7 @@ $ ${spec.command}
       const header = `${badgeLine}
 $ ${spec.command}
 `;
-      const prepared = prepareCompactCommandOutput({
+      const rawPrepared = prepareCompactCommandOutput({
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
@@ -9111,6 +9145,9 @@ $ ${spec.command}
         timedOut: result.timedOut,
         error: result.error
       });
+      const watchHint = result.timedOut ? detectWatchModeHint(spec.command) : null;
+      const prepared = watchHint ? { ...rawPrepared, bodyText: `${rawPrepared.bodyText}
+${watchHint}` } : rawPrepared;
       const pass1Ceiling = Math.max(
         bodyBudget,
         prepared.bodyText.length + 256
