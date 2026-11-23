@@ -47,6 +47,7 @@ interface ScanState {
   templateExprStack: number[]; // tracks open `{` depth inside `${...}` of nested template strings
   inBacktick: boolean;
   parenDepth?: number;
+  rustRawHashes?: number;
 }
 
 function isRegexStartContext(line: string, slashIdx: number): boolean {
@@ -54,6 +55,19 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
   while (j >= 0 && /\s/.test(line[j]!)) j--;
   if (j < 0) return true;
   const prev = line[j]!;
+  if (prev === "!") {
+    // TypeScript postfix non-null assertion (`arr[0]! / 2`, `fn()! / n`, `x! / y`) is a value, not unary `!`
+    let b = j - 1;
+    while (b >= 0 && /\s/.test(line[b]!)) b--;
+    if (b >= 0 && /[\w$)\]'`"]/.test(line[b]!)) return false;
+    return true;
+  }
+  if ((prev === "+" || prev === "-") && j > 0 && line[j - 1] === prev) {
+    // Postfix `i++ / 2` or `i-- / 2` ends an expression
+    let b = j - 2;
+    while (b >= 0 && /\s/.test(line[b]!)) b--;
+    if (b >= 0 && /[\w$)\]]/.test(line[b]!)) return false;
+  }
   if ("=(,:![&|?{};~+-*%^<>".includes(prev)) return true;
   // Check preceding keyword (return, case, throw, in, of, typeof, void, delete, new)
   let k = j;
@@ -70,6 +84,34 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
     word === "delete" ||
     word === "new"
   );
+}
+
+function hasClosingRegexSlashOnLine(line: string, openSlashIdx: number): boolean {
+  let escaped = false;
+  let inClass = false;
+  for (let i = openSlashIdx + 1; i < line.length; i++) {
+    const ch = line[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      continue;
+    }
+    if (ch === "]") {
+      inClass = false;
+      continue;
+    }
+    if (ch === "/" && !inClass) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isJsxSelfClosingSlash(line: string, slashIdx: number): boolean {
@@ -117,6 +159,25 @@ function scanBracesOnLine(
       if (ch === "*" && next === "/") {
         state.inBlockComment = false;
         i++;
+      }
+      continue;
+    }
+
+    if (lang === "rust" && (state.rustRawHashes ?? -1) >= 0) {
+      if (ch === '"') {
+        const needed = state.rustRawHashes!;
+        let matchedHashes = true;
+        for (let h = 0; h < needed; h++) {
+          if (line[i + 1 + h] !== "#") {
+            matchedHashes = false;
+            break;
+          }
+        }
+        if (matchedHashes) {
+          state.rustRawHashes = -1;
+          i += needed;
+          lastCodeChar = '"';
+        }
       }
       continue;
     }
@@ -187,7 +248,7 @@ function scanBracesOnLine(
       continue;
     }
 
-    // Regex literal (JS/TS only); never treat JSX closing `</Tag>` or self-closing `/>` as a regex start
+    // Regex literal (JS/TS only); never treat JSX closing `</Tag>`, self-closing `/>`, or single-slash division as regex
     if (
       lang === "js" &&
       ch === "/" &&
@@ -195,11 +256,28 @@ function scanBracesOnLine(
       next !== "*" &&
       !isJsxSelfClosingSlash(line, i) &&
       line[i - 1] !== "<" &&
-      isRegexStartContext(line, i)
+      isRegexStartContext(line, i) &&
+      hasClosingRegexSlashOnLine(line, i)
     ) {
       inRegex = true;
       inRegexClass = false;
       continue;
+    }
+
+    // Rust raw strings: r"...", r#"..."#, br#"..."#, cr#"..."#
+    if (
+      lang === "rust" &&
+      (ch === "r" || ((ch === "b" || ch === "c") && next === "r")) &&
+      (i === 0 || !/[\w']/.test(line[i - 1]!))
+    ) {
+      const rIdx = ch === "r" ? i : i + 1;
+      let hashEnd = rIdx + 1;
+      while (hashEnd < line.length && line[hashEnd] === "#") hashEnd++;
+      if (line[hashEnd] === '"') {
+        state.rustRawHashes = hashEnd - (rIdx + 1);
+        i = hashEnd;
+        continue;
+      }
     }
 
     if (ch === "'" && lang !== "json") {
@@ -313,10 +391,96 @@ function findBraceBlockEnd(
   return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
 }
 
-function findTypeAliasEnd(lines: string[], startIdx: number): number {
+function skipBalancedTypeParams(
+  lines: string[],
+  startLineIdx: number,
+  startCol: number,
+  maxLines = 6,
+): { lineIdx: number; col: number } | null {
+  const firstLine = lines[startLineIdx] ?? "";
+  let i = startCol;
+  while (i < firstLine.length && /\s/.test(firstLine[i]!)) i++;
+  if (firstLine[i] !== "<") {
+    return { lineIdx: startLineIdx, col: i };
+  }
+
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  const limitLine = Math.min(lines.length - 1, startLineIdx + maxLines);
+
+  for (let ln = startLineIdx; ln <= limitLine; ln++) {
+    const text = lines[ln] ?? "";
+    const fromCol = ln === startLineIdx ? i : 0;
+    for (let c = fromCol; c < text.length; c++) {
+      const ch = text[c]!;
+      const prev = c > 0 ? text[c - 1] : "";
+      if (quote) {
+        if (ch === "\\") {
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "/" && text[c + 1] === "/") break;
+      if (ch === "(") {
+        parenDepth++;
+      } else if (ch === ")") {
+        parenDepth = Math.max(0, parenDepth - 1);
+      } else if (ch === "<") {
+        angleDepth++;
+      } else if (ch === ">" && prev !== "=") {
+        angleDepth--;
+        if (angleDepth === 0 && parenDepth === 0) {
+          return { lineIdx: ln, col: c + 1 };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function findTypeAliasEqualsPos(
+  lines: string[],
+  startIdx: number,
+): { lineIdx: number; col: number } | null {
   const firstLine = lines[startIdx] ?? "";
-  const eqIdx = firstLine.indexOf("=");
-  const rhs = eqIdx >= 0 ? firstLine.slice(eqIdx + 1) : firstLine;
+  const headMatch = /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)/.exec(
+    firstLine,
+  );
+  if (!headMatch) return null;
+  const afterGenerics = skipBalancedTypeParams(
+    lines,
+    startIdx,
+    headMatch[0].length,
+  );
+  if (!afterGenerics) return null;
+
+  const limitLine = Math.min(lines.length - 1, afterGenerics.lineIdx + 2);
+  for (let ln = afterGenerics.lineIdx; ln <= limitLine; ln++) {
+    const text = lines[ln] ?? "";
+    let col = ln === afterGenerics.lineIdx ? afterGenerics.col : 0;
+    while (col < text.length && /\s/.test(text[col]!)) col++;
+    if (col < text.length) {
+      if (text[col] === "=" && text[col + 1] !== ">") {
+        return { lineIdx: ln, col };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function findTypeAliasEnd(lines: string[], startIdx: number): number {
+  const eqPos = findTypeAliasEqualsPos(lines, startIdx);
+  const eqLineIdx = eqPos ? eqPos.lineIdx : startIdx;
+  const eqLine = lines[eqLineIdx] ?? "";
+  const rhs = eqPos ? eqLine.slice(eqPos.col + 1) : eqLine;
   const state: ScanState = {
     inBlockComment: false,
     templateExprStack: [],
@@ -325,14 +489,14 @@ function findTypeAliasEnd(lines: string[], startIdx: number): number {
   };
   const firstScan = scanBracesOnLine(rhs, state, "js");
   if (firstScan.open > firstScan.close) {
-    return findBraceBlockEnd(lines, startIdx, "js");
+    return findBraceBlockEnd(lines, eqLineIdx, "js");
   }
   if (firstScan.endsWithSemi && firstScan.openParen <= firstScan.closeParen) {
-    return startIdx + 1;
+    return eqLineIdx + 1;
   }
 
   // Handle multiline union/intersection/mapped types without braces (including semi: false style)
-  let endIdx = startIdx;
+  let endIdx = eqLineIdx;
   let parenBal = firstScan.openParen - firstScan.closeParen;
   let prevLast = firstScan.lastCodeChar;
   const maxScan = Math.min(lines.length - 1, startIdx + 40);
@@ -416,11 +580,6 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
       nameGroup: 1,
     },
     {
-      re: /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*=/,
-      kind: "type",
-      nameGroup: 1,
-    },
-    {
       re: /^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)/,
       kind: "enum",
       nameGroup: 1,
@@ -439,8 +598,9 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
   const multilineArrowStartRe =
     /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\(/;
 
-  const methodHeaderRe =
-    /^([ \t]{1,4})(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(/;
+  const typeHeaderRe = /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)/;
+  const classMemberStartRe =
+    /^([ \t]{1,6})(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*(\*\s*)?(#?[A-Za-z_$][\w$]*)/;
   const controlKeywords = new Set([
     "if",
     "for",
@@ -513,6 +673,21 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
       }
 
       if (!matchedTop) {
+        const mtp = typeHeaderRe.exec(line);
+        if (mtp && mtp[1] && findTypeAliasEqualsPos(lines, i) !== null) {
+          const endLine = findTypeAliasEnd(lines, i);
+          symbols.push({
+            kind: "type",
+            name: mtp[1],
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+          matchedTop = true;
+        }
+      }
+
+      if (!matchedTop) {
         const ma = multilineArrowStartRe.exec(line);
         if (ma && ma[1]) {
           const { hasArrow } = hasArrowOrBraceWithin(lines, i, 12);
@@ -551,23 +726,46 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
     }
 
     if (!matchedTop && i + 1 <= currentClassEnd) {
-      const mm = methodHeaderRe.exec(line);
-      if (mm && mm[1] && mm[2] && !controlKeywords.has(mm[2])) {
-        const indentWidth = mm[1].replace(/\t/g, "  ").length;
-        if (currentClassIndent === -1) {
-          currentClassIndent = indentWidth;
-        }
-        if (indentWidth === currentClassIndent) {
-          const { hasBrace } = hasArrowOrBraceWithin(lines, i, 10);
-          if (hasBrace) {
-            const endLine = findBraceBlockEnd(lines, i, "js");
-            symbols.push({
-              kind: "method",
-              name: mm[2],
-              startLine: i + 1,
-              endLine,
-              depth: 1,
-            });
+      const mm = classMemberStartRe.exec(line);
+      const indentRaw = mm?.[1];
+      const memberName = mm?.[3];
+      if (indentRaw && memberName && !controlKeywords.has(memberName)) {
+        const indentWidth = indentRaw.replace(/\t/g, "  ").length;
+        const afterGen = skipBalancedTypeParams(lines, i, mm[0].length, 4);
+        const tailOnLine =
+          afterGen && afterGen.lineIdx === i
+            ? line.slice(afterGen.col).trimStart()
+            : afterGen
+              ? (lines[afterGen.lineIdx] ?? "").slice(afterGen.col).trimStart()
+              : "";
+        const isMethodCallSig = tailOnLine.startsWith("(");
+        const restAfterName = line.slice(mm[0].length);
+        const isArrowProp =
+          !mm[2] &&
+          /^\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\(|[A-Za-z_$][\w$]*\s*=>)/.test(
+            restAfterName,
+          );
+
+        if (isMethodCallSig || isArrowProp) {
+          if (currentClassIndent === -1) {
+            currentClassIndent = indentWidth;
+          }
+          if (indentWidth === currentClassIndent) {
+            const probe = hasArrowOrBraceWithin(
+              lines,
+              afterGen ? afterGen.lineIdx : i,
+              10,
+            );
+            if (isMethodCallSig ? probe.hasBrace : probe.hasArrow) {
+              const endLine = findBraceBlockEnd(lines, i, "js");
+              symbols.push({
+                kind: "method",
+                name: memberName,
+                startLine: i + 1,
+                endLine,
+                depth: 1,
+              });
+            }
           }
         }
       }
@@ -1216,8 +1414,9 @@ function extractRustSymbols(lines: string[]): SymbolEntry[] {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const wasInComment = commentState.inBlockComment;
+    const wasInRaw = (commentState.rustRawHashes ?? -1) >= 0;
     scanBracesOnLine(line, commentState, "rust");
-    if (wasInComment) continue;
+    if (wasInComment || wasInRaw) continue;
 
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
@@ -1348,15 +1547,30 @@ function extractShellSymbols(lines: string[]): SymbolEntry[] {
 
 function extractMarkdownSymbols(lines: string[]): SymbolEntry[] {
   const raw: Array<{ level: number; name: string; startLine: number }> = [];
-  let inFence = false;
+  let fenceChar: "`" | "~" | null = null;
+  let fenceLen = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    if (/^\s*(`{3,}|~{3,})/.test(line)) {
-      inFence = !inFence;
-      continue;
+    const fenceMatch = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenceMatch) {
+      const seq = fenceMatch[1]!;
+      const ch = seq[0] as "`" | "~";
+      const rest = fenceMatch[2] ?? "";
+      if (fenceChar === null) {
+        // CommonMark: backtick fence info strings cannot contain backticks (e.g. inline ```code```)
+        if (ch === "~" || !rest.includes("`")) {
+          fenceChar = ch;
+          fenceLen = seq.length;
+          continue;
+        }
+      } else if (ch === fenceChar && seq.length >= fenceLen && /^[ \t]*$/.test(rest)) {
+        fenceChar = null;
+        fenceLen = 0;
+        continue;
+      }
     }
-    if (inFence) continue;
+    if (fenceChar !== null) continue;
     const m = /^(#{1,4})\s+(.+?)\s*#*$/.exec(line);
     if (m && m[1] && m[2]) {
       raw.push({ level: m[1].length, name: m[2], startLine: i + 1 });
@@ -1384,46 +1598,105 @@ function extractMarkdownSymbols(lines: string[]): SymbolEntry[] {
 function extractJsonYamlSymbols(lines: string[], isJson: boolean): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   if (isJson) {
-    // Detect top-level key indentation dynamically (supports 2-space, 4-space, or tabs)
-    let keyIndent: string | null = null;
+    // Track structural JSON container depth (`{` vs `[`) outside strings so 0-indent,
+    // 2/4-space, and tab-formatted root objects emit exact root keys while root arrays skip element duplicates.
+    const stack: Array<"{" | "["> = [];
+    const activeSymStack: Array<SymbolEntry | null> = [];
+    let inString = false;
+    let escape = false;
+
     for (let i = 0; i < lines.length; i++) {
-      const m = /^([ \t]+)"([^"]+)"\s*:/.exec(lines[i]!);
-      if (m && m[1] && m[2]) {
-        if (keyIndent === null) {
-          keyIndent = m[1];
+      const line = lines[i]!;
+      for (let c = 0; c < line.length; c++) {
+        const ch = line[c]!;
+        if (escape) {
+          escape = false;
+          continue;
         }
-        if (m[1] === keyIndent) {
-          symbols.push({
-            kind: "key",
-            name: m[2],
-            startLine: i + 1,
-            endLine: i + 1,
-            depth: 0,
-          });
+        if (inString) {
+          if (ch === "\\") escape = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        // JSONC comments
+        if (ch === "/" && line[c + 1] === "/") break;
+        if (ch === '"') {
+          if (stack.length === 1 && stack[0] === "{") {
+            let endQuote = c + 1;
+            let strEsc = false;
+            while (endQuote < line.length) {
+              const sc = line[endQuote]!;
+              if (strEsc) strEsc = false;
+              else if (sc === "\\") strEsc = true;
+              else if (sc === '"') break;
+              endQuote++;
+            }
+            if (endQuote < line.length) {
+              const keyName = line.slice(c + 1, endQuote);
+              let colonIdx = endQuote + 1;
+              while (colonIdx < line.length && /\s/.test(line[colonIdx]!)) {
+                colonIdx++;
+              }
+              if (line[colonIdx] === ":") {
+                if (activeSymStack[0]) {
+                  activeSymStack[0].endLine = Math.max(
+                    activeSymStack[0].startLine,
+                    i,
+                  );
+                }
+                const entry: SymbolEntry = {
+                  kind: "key",
+                  name: keyName,
+                  startLine: i + 1,
+                  endLine: i + 1,
+                  depth: 0,
+                };
+                symbols.push(entry);
+                activeSymStack[0] = entry;
+                c = colonIdx;
+                continue;
+              }
+            }
+          }
+          inString = true;
+          continue;
+        }
+        if (ch === "{" || ch === "[") {
+          stack.push(ch);
+          if (stack.length === 1) activeSymStack[0] = null;
+        } else if (ch === "}" || ch === "]") {
+          if (stack.length === 1 && activeSymStack[0]) {
+            activeSymStack[0].endLine = Math.max(
+              activeSymStack[0].startLine,
+              i > activeSymStack[0].startLine - 1 ? i : i + 1,
+            );
+            activeSymStack[0] = null;
+          }
+          stack.pop();
+        } else if (ch === "," && stack.length === 1 && activeSymStack[0]) {
+          activeSymStack[0].endLine = i + 1;
+          activeSymStack[0] = null;
         }
       }
     }
-    for (let idx = 0; idx < symbols.length; idx++) {
-      const cur = symbols[idx]!;
-      const nextStart =
-        idx + 1 < symbols.length ? symbols[idx + 1]!.startLine - 1 : lines.length - 1;
-      let endLine = Math.max(cur.startLine, nextStart);
-      while (endLine > cur.startLine && /^\s*[}\]]?,?\s*$/.test(lines[endLine - 1] ?? "") && idx === symbols.length - 1) {
-        endLine--;
-      }
-      cur.endLine = endLine;
+    if (activeSymStack[0]) {
+      activeSymStack[0].endLine = Math.max(
+        activeSymStack[0].startLine,
+        lines.length,
+      );
     }
     return symbols;
   }
 
-  // YAML top-level keys
-  const re = /^([A-Za-z0-9_.-]+)\s*:/;
+  // YAML top-level keys (including quoted keys like `"on":` in GitHub Actions, while rejecting bare `https://...`)
+  const re = /^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(?:\s*(?:#.*)?$|\s+\S)/;
   for (let i = 0; i < lines.length; i++) {
     const m = re.exec(lines[i]!);
-    if (m && m[1]) {
+    const keyName = m?.[1] || m?.[2] || m?.[3];
+    if (keyName) {
       symbols.push({
         kind: "key",
-        name: m[1],
+        name: keyName,
         startLine: i + 1,
         endLine: i + 1,
         depth: 0,

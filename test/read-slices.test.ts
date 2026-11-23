@@ -1271,4 +1271,120 @@ describe("read_slices", () => {
     assert.match(encRes.text, /be\.rc\nERROR: UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 BE\]/);
     assert.match(encRes.text, /u32\.txt\nERROR: Binary file cannot be read as text:/);
   });
+
+  it("accurately outlines TS non-null division, nested generics & arrow methods, 4-backtick Markdown fences, Rust raw strings, 0-indent JSON, and quoted YAML keys", () => {
+    // 1. TS postfix non-null assertion `arr[0]! / 2` before `{` must NOT enter regex mode and truncate endLine
+    const tsNonNull = extractSymbols(
+      "weights.ts",
+      [
+        "export function computeWeights(arr: number[]) {",
+        "  if (arr[0]! / 2 > 1) {",
+        "    return arr[0]!;",
+        "  }",
+        "  const extra = 42;",
+        "  return extra;",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsNonNull.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:computeWeights:1-7"],
+    );
+
+    // 2. TS nested generics (`Record<string, unknown>`), ES `#private` / `*generator` methods, and class arrow properties
+    const tsGenerics = extractSymbols(
+      "service.ts",
+      [
+        "export type Handler<T = Record<string, unknown>> = {",
+        "  handle(input: T): void;",
+        "};",
+        "export class EventService {",
+        "  async fetchAll<T = Array<string>>(url: string): Promise<T> {",
+        "    return url as unknown as T;",
+        "  }",
+        "  private onMessage = async (payload: string) => {",
+        "    return payload.trim();",
+        "  };",
+        "  #flushQueue() {",
+        "    return true;",
+        "  }",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsGenerics.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "type:Handler:1-3",
+        "class:EventService:4-14",
+        "method:fetchAll:5-7",
+        "method:onMessage:8-10",
+        "method:#flushQueue:11-13",
+      ],
+    );
+
+    // 3. CommonMark 4-backtick outer fence containing 3-backtick inner fence
+    const mdNested = extractSymbols(
+      "GUIDE.md",
+      [
+        "# Overview",
+        "````markdown",
+        "```bash",
+        "# Fake Heading Inside Nested Code Fence",
+        "```",
+        "````",
+        "## Real Section After Example",
+        "Body line",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      mdNested.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["h1:Overview:1-8", "h2:Real Section After Example:7-8"],
+    );
+
+    // 4. Rust multiline raw string r#"..."# with unbalanced `{` and fake `fn`
+    const rsRaw = extractSymbols(
+      "shader.rs",
+      [
+        "pub fn build_shader() -> &'static str {",
+        '    let wgsl = r#"',
+        "fn vertex_main() {",
+        '    "#;',
+        "    wgsl",
+        "}",
+        "pub fn after_shader() {}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      rsRaw.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["fn:build_shader:1-6", "fn:after_shader:7-7"],
+    );
+
+    // 5. GitHub Actions YAML quoted `"on":` + 0-indent JSON root keys + array-root JSON
+    const ymlCi = extractSymbols(
+      "ci.yml",
+      [
+        "name: CI",
+        '"on":',
+        "  push:",
+        "    branches: [main, dev]",
+        "jobs:",
+        "  verify:",
+        "    runs-on: ubuntu-latest",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      ymlCi.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["key:name:1-1", "key:on:2-4", "key:jobs:5-7"],
+    );
+
+    const zeroIndentJson = extractSymbols(
+      "package.json",
+      '{\n"name": "pkg",\n"scripts": {\n  "build": "tsc"\n}\n}',
+    );
+    assert.deepEqual(
+      zeroIndentJson.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["key:name:2-2", "key:scripts:3-5"],
+    );
+    assert.deepEqual(extractSymbols("items.json", '[\n  { "id": 1 },\n  { "id": 2 }\n]'), []);
+  });
 });
