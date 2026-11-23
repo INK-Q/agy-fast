@@ -1849,4 +1849,91 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("outlines TS/JS component/store/context wrappers and export default blocks with true multi-line endLine", () => {
+    const reactAndStoreDoc = [
+      "export const ThemeContext = createContext<ThemeState>({", // 1
+      '  mode: "dark",', // 2
+      "});", // 3
+      "", // 4
+      "export const PrimaryButton = React.memo(", // 5
+      "  forwardRef<", // 6
+      "    HTMLButtonElement,", // 7
+      "    { label: string; onClick?: (ev: MouseEvent) => void }", // 8
+      "  >(function PrimaryButton(props, ref) {", // 9
+      "    return <button ref={ref}>{props.label}</button>;", // 10
+      "  }),", // 11
+      ");", // 12
+      "", // 13
+      "export const SearchInput = React.forwardRef<HTMLInputElement, InputProps>((props, ref) => {", // 14
+      "  return <input ref={ref} {...props} />;", // 15
+      "});", // 16
+      "", // 17
+      "export const VueWidget = defineComponent({", // 18
+      '  name: "VueWidget",', // 19
+      "  setup() {", // 20
+      "    return {};", // 21
+      "  },", // 22
+      "});", // 23
+      "", // 24
+      'export const useCartStore = defineStore("cart", () => {', // 25
+      "  const items: string[] = [];", // 26
+      "  return { items };", // 27
+      "});", // 28
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("components.tsx", reactAndStoreDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      [
+        "const:ThemeContext:1-3",
+        "component:PrimaryButton:5-12",
+        "component:SearchInput:14-16",
+        "component:VueWidget:18-23",
+        "const:useCartStore:25-28",
+      ],
+    );
+
+    const viteConfigDoc = [
+      'import { defineConfig } from "vite";', // 1
+      "", // 2
+      "export default defineConfig({", // 3
+      "  server: {", // 4
+      "    port: 5173,", // 5
+      "  },", // 6
+      "});", // 7
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("vite.config.ts", viteConfigDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["export:default:3-7"],
+    );
+
+    const objDefaultDoc = [
+      "export default {", // 1
+      "  reactStrictMode: true,", // 2
+      "  experimental: { typedRoutes: true },", // 3
+      "} satisfies NextConfig;", // 4
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("next.config.ts", objDefaultDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["export:default:1-4"],
+    );
+
+    const fnDefaultDoc = [
+      "export default async function (req: Request) {", // 1
+      '  return new Response("ok");', // 2
+      "}", // 3
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("route.ts", fnDefaultDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["function:default:1-3"],
+    );
+  });
 });

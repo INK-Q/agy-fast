@@ -5977,6 +5977,8 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
   let close = 0;
   let openParen = 0;
   let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
   let parenDepth = state.parenDepth ?? 0;
   let seenOpen = alreadySeenOpen;
   let inSingle = false;
@@ -6130,6 +6132,12 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       closeParen++;
       parenDepth = Math.max(0, parenDepth - 1);
       lastCodeChar = ")";
+    } else if (ch === "[") {
+      openBracket++;
+      lastCodeChar = "[";
+    } else if (ch === "]") {
+      closeBracket++;
+      lastCodeChar = "]";
     } else if (!/\s/.test(ch)) {
       lastCodeChar = ch;
     }
@@ -6140,6 +6148,8 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
     close,
     openParen,
     closeParen,
+    openBracket,
+    closeBracket,
     endsWithSemi: lastCodeChar === ";",
     lastCodeChar
   };
@@ -6300,7 +6310,7 @@ function findParenCallEnd(lines, startIdx) {
     parenDepth: 0
   };
   let seenParen = false;
-  const maxScan = Math.min(lines.length, startIdx + 400);
+  const maxScan = Math.min(lines.length, startIdx + 2e3);
   for (let i = startIdx; i < maxScan; i++) {
     const { openParen } = scanBracesOnLine(lines[i], state, "js");
     if (openParen > 0) seenParen = true;
@@ -6309,6 +6319,86 @@ function findParenCallEnd(lines, startIdx) {
     }
   }
   return startIdx + 1;
+}
+function findJsBalancedExprEnd(lines, fromLineIdx, fromCol = 0) {
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, fromLineIdx + 2e3);
+  for (let i = fromLineIdx; i < maxScan; i++) {
+    const slice = i === fromLineIdx ? lines[i].slice(fromCol) : lines[i];
+    const scan = scanBracesOnLine(slice, state, "js");
+    if (scan.open > 0 || scan.openParen > 0 || scan.openBracket > 0) {
+      seenOpen = true;
+    }
+    braceDepth += scan.open - scan.close;
+    parenDepth += scan.openParen - scan.closeParen;
+    bracketDepth += scan.openBracket - scan.closeBracket;
+    if (seenOpen && braceDepth <= 0 && parenDepth <= 0 && bracketDepth <= 0) {
+      return i + 1;
+    }
+  }
+  return seenOpen ? Math.min(lines.length, maxScan) : fromLineIdx + 1;
+}
+function findConstAssignEq(line) {
+  const m = /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b/.exec(line);
+  if (!m || !m[1]) return null;
+  let angle = 0;
+  let paren = 0;
+  let brace = 0;
+  let bracket = 0;
+  let quote = null;
+  for (let k = m[0].length; k < line.length; k++) {
+    const ch = line[k];
+    const prev = k > 0 ? line[k - 1] : "";
+    if (quote) {
+      if (ch === "\\") {
+        k++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "/" && line[k + 1] === "/") break;
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    else if (ch === "<") angle++;
+    else if (ch === ">" && prev !== "=" && angle > 0) angle--;
+    else if (ch === "=" && prev !== "=" && prev !== "!" && line[k + 1] !== "=" && line[k + 1] !== ">" && angle === 0 && paren === 0 && brace === 0 && bracket === 0) {
+      return { name: m[1], eqCol: k };
+    }
+  }
+  return null;
+}
+var TS_COMPONENT_WRAPPER_RE = /^(?:(?:React\s*\.\s*)?(?:memo|forwardRef|lazy)|defineComponent|defineAsyncComponent|observer)\b/;
+var TS_STATE_CONFIG_WRAPPER_RE = /^(?:(?:React\s*\.\s*)?createContext|defineStore|createStore|defineConfig|createSlice|createAsyncThunk)\b/;
+function matchWrapperCallEnd(lines, lineIdx, colAfterWrapper) {
+  const afterGen = skipBalancedTypeParams(lines, lineIdx, colAfterWrapper, 8);
+  if (!afterGen) return null;
+  for (let ln = afterGen.lineIdx; ln <= Math.min(lines.length - 1, afterGen.lineIdx + 2); ln++) {
+    const text = lines[ln] ?? "";
+    let c = ln === afterGen.lineIdx ? afterGen.col : 0;
+    while (c < text.length && /\s/.test(text[c])) c++;
+    if (c < text.length) {
+      return text[c] === "(" ? findJsBalancedExprEnd(lines, ln, c) : null;
+    }
+  }
+  return null;
 }
 function hasArrowOrBraceWithin(lines, startIdx, maxLookahead = 12) {
   const state = { inBlockComment: false, templateExprStack: [], inBacktick: false };
@@ -6455,6 +6545,122 @@ function extractTsJsSymbols(lines) {
               currentFnEnd = endLine;
             }
             matchedTop = true;
+          }
+        }
+      }
+      if (!matchedTop) {
+        const assign = findConstAssignEq(line);
+        if (assign) {
+          let rhsLineIdx = i;
+          let rhsCol = assign.eqCol + 1;
+          while (rhsCol < line.length && /\s/.test(line[rhsCol])) rhsCol++;
+          if (rhsCol >= line.length && i + 1 < lines.length) {
+            rhsLineIdx = i + 1;
+            const nextL = lines[rhsLineIdx];
+            rhsCol = 0;
+            while (rhsCol < nextL.length && /\s/.test(nextL[rhsCol])) rhsCol++;
+          }
+          const rhsSlice = (lines[rhsLineIdx] ?? "").slice(rhsCol);
+          const compMatch = TS_COMPONENT_WRAPPER_RE.exec(rhsSlice);
+          const stateMatch = !compMatch ? TS_STATE_CONFIG_WRAPPER_RE.exec(rhsSlice) : null;
+          const wrapperMatch = compMatch ?? stateMatch;
+          if (wrapperMatch) {
+            const endLine = matchWrapperCallEnd(
+              lines,
+              rhsLineIdx,
+              rhsCol + wrapperMatch[0].length
+            );
+            if (endLine !== null) {
+              symbols.push({
+                kind: compMatch ? "component" : "const",
+                name: assign.name,
+                startLine: i + 1,
+                endLine,
+                depth: 0
+              });
+              if (endLine - (i + 1) >= 40) {
+                currentFnEnd = endLine;
+              }
+              matchedTop = true;
+            }
+          }
+        }
+      }
+      if (!matchedTop && /^export\s+default\b/.test(line)) {
+        const prefixMatch = /^export\s+default\s+/.exec(line);
+        if (prefixMatch) {
+          const restCol = prefixMatch[0].length;
+          const rest = line.slice(restCol);
+          if (/^(?:async\s+)?function\*?\s*\(/.test(rest)) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "function",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0
+            });
+            matchedTop = true;
+          } else if (/^(?:abstract\s+)?class\b/.test(rest)) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "class",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0
+            });
+            currentClassEnd = endLine;
+            currentClassIndent = -1;
+            matchedTop = true;
+          } else if (/^(?:async\s+)?(?:\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/.test(rest) || /^(?:async\s+)?\(/.test(rest) && hasArrowOrBraceWithin(lines, i, 12).hasArrow) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "function",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0
+            });
+            matchedTop = true;
+          } else if (rest.startsWith("{") || rest.startsWith("[")) {
+            const endLine = findJsBalancedExprEnd(lines, i, restCol);
+            symbols.push({
+              kind: "export",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0
+            });
+            matchedTop = true;
+          } else {
+            const compWrap = TS_COMPONENT_WRAPPER_RE.exec(rest);
+            const anyCallWrap = /^([A-Za-z_$][\w$.]*)/.exec(rest);
+            if (compWrap) {
+              const endLine = matchWrapperCallEnd(lines, i, restCol + compWrap[0].length);
+              if (endLine !== null) {
+                symbols.push({
+                  kind: "component",
+                  name: "default",
+                  startLine: i + 1,
+                  endLine,
+                  depth: 0
+                });
+                matchedTop = true;
+              }
+            } else if (anyCallWrap && anyCallWrap[1]) {
+              const endLine = matchWrapperCallEnd(lines, i, restCol + anyCallWrap[0].length);
+              if (endLine !== null) {
+                symbols.push({
+                  kind: "export",
+                  name: "default",
+                  startLine: i + 1,
+                  endLine,
+                  depth: 0
+                });
+                matchedTop = true;
+              }
+            }
           }
         }
       }
