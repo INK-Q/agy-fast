@@ -1257,6 +1257,60 @@ describe("batch_search", () => {
       assert.equal(fitRes.isError, false);
       assert.doesNotMatch(fitRes.text, /\(\+\d+ more match/);
       assert.match(fitRes.text, /\.\.\. \[truncated at 10 matches\]$/);
+
+      // 6. Tight budget with contextLines: 5 and maxResults: 1 NEVER emits orphan context lines without the match line
+      const ctxTightFile = path.join(budgetDir, "ctx-tight.ts");
+      await fs.writeFile(
+        ctxTightFile,
+        [
+          ...Array.from({ length: 6 }, (_, i) => `const preContextLine_${i} = "padding_context_before_${"x".repeat(24)}";`),
+          'export function targetValidationEntrypoint() { return "EXACT_MATCH_LINE"; }',
+          ...Array.from({ length: 6 }, (_, i) => `const postContextLine_${i} = "padding_context_after_${"y".repeat(24)}";`),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      const tightCtxRes = await runBatchSearch({
+        cwd: budgetDir,
+        maxChars: 500,
+        queries: [
+          { type: "text", pattern: "padding_context_before", path: "ctx-tight.ts", maxResults: 2 },
+          { type: "text", pattern: "targetValidationEntrypoint", path: "ctx-tight.ts", contextLines: 5, maxResults: 1 },
+        ],
+      });
+      assert.equal(tightCtxRes.isError, false);
+      const q2Tight = tightCtxRes.text.split("\n\n")[1] ?? "";
+      assert.match(q2Tight, /7: export function targetValidationEntrypoint/);
+      assertNoOrphanContext(q2Tight, 5);
+
+      // 7. Hidden-dir glob parity (.github/**), glob fileType filter, fuzzy hidden/glob + minimal-span boundary ranking
+      await fs.mkdir(path.join(budgetDir, ".github", "workflows"), { recursive: true });
+      await fs.writeFile(path.join(budgetDir, ".github", "workflows", "ci.yml"), "runs-on: ubuntu-latest\n", "utf8");
+      await fs.writeFile(path.join(budgetDir, "u_long_irrelevant_prefix_user_service.ts"), "// svc\n", "utf8");
+      await fs.writeFile(path.join(budgetDir, "u_short_x_s_r_s_v_c.ts"), "// scattered\n", "utf8");
+
+      const rgHidden = await runBatchSearch({
+        cwd: budgetDir,
+        queries: [
+          { type: "text", pattern: "ubuntu-latest", glob: ".github/**" },
+          { type: "glob", pattern: "**/*", path: "four", fileType: "json" },
+          { type: "fuzzy", pattern: ".github/ci" },
+          { type: "fuzzy", pattern: "usrsvc", fileType: "ts" },
+        ],
+      });
+      const nodeHidden = await runBatchSearch(
+        {
+          cwd: budgetDir,
+          queries: [{ type: "text", pattern: "ubuntu-latest", glob: ".github/**" }],
+        },
+        { forceNodeFallback: true },
+      );
+      const hSecs = rgHidden.text.split("\n\n");
+      assert.match(hSecs[0]!, /\.github\/workflows\/ci\.yml/);
+      assert.equal(hSecs[0], nodeHidden.text);
+      assert.match(hSecs[1]!, /\(no files matched\)/);
+      assert.match(hSecs[2]!, /\.github\/workflows\/ci\.yml/);
+      const fuzzyRankLines = hSecs[3]!.split("\n").slice(1);
+      assert.equal(fuzzyRankLines[0], "u_long_irrelevant_prefix_user_service.ts");
     } finally {
       await fs.rm(budgetDir, { recursive: true, force: true });
     }

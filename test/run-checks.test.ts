@@ -863,4 +863,19 @@ describe("run_checks", () => {
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
   });
+
+  it("caps and sanitizes multiline inline scripts in compact [PASS] bullets", async () => {
+    const multilineInlineCmd = `${nodeBin} -e "\nconst payload = '${"z".repeat(1600)}';\nconsole.log('INLINE_OK');\n"`;
+    const res = await runChecks({
+      outputMode: "compact",
+      maxChars: 4000,
+      commands: [{ name: "inline-pass", command: multilineInlineCmd }],
+    });
+    assert.equal(res.isError, false);
+    const lines = res.text.trim().split("\n");
+    // Header + blank separator + 1 single-line PASS bullet
+    assert.equal(lines.length, 3, `Expected 1-line PASS bullet, got:\n${res.text}`);
+    assert.ok(lines[2]!.length < 350, `Expected compact PASS bullet < 350 chars, got ${lines[2]!.length}`);
+    assert.match(lines[2]!, /INLINE_OK/);
+  });
 });

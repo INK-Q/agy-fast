@@ -527,6 +527,56 @@ interface FileMatches {
   count?: number;
 }
 
+const SAFE_RG_IDENTITY_ESCAPE_CHARS = new Set([
+  ":",
+  "/",
+  "#",
+  "!",
+  '"',
+  "'",
+  ";",
+  ",",
+  "@",
+  "%",
+  "=",
+  "~",
+  "`",
+]);
+
+/**
+ * Strips unnecessary backslashes before non-meta ASCII punctuation (`\:`, `\/`, `\#`, etc.)
+ * that LLMs frequently emit in regexes and that older ripgrep (< 14.0, e.g. Ubuntu 22.04 /
+ * Debian 12 / @vscode/ripgrep 13.0) rejects with `error: unrecognized escape sequence`.
+ */
+function sanitizeRgIdentityEscapes(pattern: string): string {
+  if (!pattern.includes("\\")) return pattern;
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "\\" && i + 1 < pattern.length) {
+      const next = pattern[i + 1]!;
+      if (SAFE_RG_IDENTITY_ESCAPE_CHARS.has(next)) {
+        out += next;
+        i += 1;
+        continue;
+      }
+      out += ch + next;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function patternTargetsHiddenPath(raw?: string): boolean {
+  if (!raw) return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith("!")) return false;
+  const norm = trimmed.replace(/\\/g, "/");
+  return /(?:^|[/{,!])\.(?!\.?(?:\/|$|,|\}))/.test(norm);
+}
+
 async function runTextOrRegexWithRg(
   query: SearchQuery,
   searchRoot: string,
@@ -570,6 +620,13 @@ async function runTextOrRegexWithRg(
   const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
 
   const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  const relSearchRoot = toPosixPath(path.relative(baseCwd, searchRoot));
+  if (
+    patternTargetsHiddenPath(query.glob) ||
+    (!relSearchRoot.startsWith("..") && patternTargetsHiddenPath(relSearchRoot))
+  ) {
+    args.push("--hidden");
+  }
   if (query.multiline) args.push("--multiline", "--multiline-dotall");
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
@@ -627,6 +684,9 @@ async function runTextOrRegexWithRg(
     }
   }
 
+  const rgPattern =
+    query.type === "regex" ? sanitizeRgIdentityEscapes(query.pattern) : query.pattern;
+
   const runRg = async (
     runArgs: string[],
     opts?: { allowPartialError?: boolean },
@@ -658,7 +718,7 @@ async function runTextOrRegexWithRg(
         ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"]
         : ["--files-with-matches", "--null"]),
       "--",
-      query.pattern,
+      rgPattern,
       rgSearchTarget,
     ]);
     const files: FileMatches[] = [];
@@ -714,7 +774,7 @@ async function runTextOrRegexWithRg(
       "--with-filename",
       "--null",
       "--",
-      query.pattern,
+      rgPattern,
       rgSearchTarget,
     ]);
     const counted: Array<{ rawFile: string; relFile: string; count: number }> = [];
@@ -781,7 +841,7 @@ async function runTextOrRegexWithRg(
         "--json",
         ...(contextLines > 0 ? ["-C", String(contextLines)] : []),
         "--",
-        query.pattern,
+        rgPattern,
         ...chunk,
       ],
       { allowPartialError: !isFileTarget },
@@ -1044,7 +1104,7 @@ async function runTextOrRegexWithNode(
       : [];
   } else {
     const includeHidden = Boolean(
-      rawGlob && !globNegated && patternTargetsHidden(rawGlob),
+      rawGlob && !globNegated && patternTargetsHiddenPath(rawGlob),
     );
     let ignoreDirs: Set<string> | undefined;
     if (rawGlob && !globNegated) {
@@ -1376,10 +1436,12 @@ async function runGlobQuery(
   const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
+  const matchesType = fileTypeMatcher(query.fileType);
   const matchBasename = !pattern.includes("/");
-  const includeHidden = patternTargetsHidden(pattern);
+  const includeHidden = patternTargetsHiddenPath(pattern);
 
   if (isFileTarget) {
+    if (!matchesType(searchRoot)) return "(no files matched)";
     const rel = toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
     const base = path.basename(searchRoot);
     const matched = matcher.test(rel) || (matchBasename && matcher.test(base));
@@ -1398,6 +1460,7 @@ async function runGlobQuery(
     maxFiles: scanLimit,
     includeHidden,
     fileFilter: (relPosix) => {
+      if (!matchesType(relPosix)) return false;
       if (matcher.test(relPosix)) return true;
       if (matchBasename) {
         const base = relPosix.split("/").pop() ?? relPosix;
@@ -1417,6 +1480,7 @@ async function runGlobQuery(
       maxFiles: scanLimit,
       includeHidden,
       fileFilter: (relPosix) => {
+        if (!matchesType(relPosix)) return false;
         const base = relPosix.split("/").pop() ?? relPosix;
         return fallback.match(relPosix, base);
       },
@@ -1450,18 +1514,41 @@ async function runFuzzyQuery(
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
+  const globNegated = Boolean(query.glob && query.glob.startsWith("!"));
+  const rawGlob = query.glob ? (globNegated ? query.glob.slice(1) : query.glob) : null;
+  const globRe = rawGlob ? globToRegExp(rawGlob) : null;
+  const matchesCandidate = (relPosix: string): boolean => {
+    if (!matchesType(relPosix)) return false;
+    if (!globRe) return true;
+    const hit =
+      globRe.test(relPosix) ||
+      (!rawGlob!.includes("/") && globRe.test(relPosix.split("/").pop() ?? relPosix));
+    return globNegated ? !hit : hit;
+  };
+  const includeHidden =
+    patternTargetsHiddenPath(pattern) || patternTargetsHiddenPath(query.glob);
   const maxResults = clampInt(query.maxResults, 1, 200, 30);
   const walked = isFileTarget
     ? { files: [searchRoot], truncated: false }
-    : await walkFiles(searchRoot, { maxFiles: 8000, fileFilter: matchesType });
+    : await walkFiles(searchRoot, {
+        maxFiles: 8000,
+        includeHidden,
+        fileFilter: matchesCandidate,
+      });
   const candidates = walked.files
-    .filter(matchesType)
-    .map((file) => relativeFile(baseCwd, path.resolve(searchRoot, file)));
+    .map((file) => relativeFile(baseCwd, path.resolve(searchRoot, file)))
+    .filter((rel) => !isFileTarget || matchesCandidate(rel));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
-  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
-  const footer = walked.truncated || totalMatched > maxResults
-    ? `\n... [truncated; showing ${matches.length} files]`
-    : "";
+  if (matches.length === 0) {
+    return walked.truncated
+      ? "(no files matched in first 8000 scanned files; narrow 'path' or 'fileType')"
+      : "(no files matched)";
+  }
+  const body = matches.map((match) => match.path).join("\n");
+  const footer =
+    walked.truncated || totalMatched > maxResults
+      ? `\n... [truncated; showing ${matches.length} files]`
+      : "";
   return body + footer;
 }
 
@@ -1715,7 +1802,7 @@ function buildTruncatedNotice(
         ? "in 1 file"
         : `across ${totalFiles} files`;
   if (omittedContextOnly) {
-    return `\n... [truncated: showed all ${shownMatches} ${shownMatches === 1 ? "match" : "matches"} ${filesLabel}; omitted context lines${maxResultsTruncated ? `; capped at ${totalMatches} matches` : ""}]`;
+    return `\n... [truncated: showed all ${shownMatches} ${shownMatches === 1 ? "match" : "matches"} ${filesLabel}; omitted context lines${maxResultsTruncated ? `; capped at ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}` : ""}]`;
   }
   return `\n... [truncated: showed ${shownMatches} of ${totalLabel} matches ${filesLabel}]`;
 }
@@ -1866,7 +1953,7 @@ function formatBudgetedContentSection(params: {
       shownFiles += 1;
     }
   } else {
-    const worstTruncNotice = measureCost(
+    const stdTruncNotice = measureCost(
       buildTruncatedNotice(
         actualTotalMatches,
         actualTotalMatches,
@@ -1876,6 +1963,23 @@ function formatBudgetedContentSection(params: {
         false,
       ),
     );
+    const ctxTruncNotice =
+      totalContextCount > 0
+        ? measureCost(
+            buildTruncatedNotice(
+              actualTotalMatches,
+              actualTotalMatches,
+              totalFiles,
+              totalFiles,
+              maxResultsTruncated,
+              true,
+            ),
+          )
+        : stdTruncNotice;
+    const worstTruncNotice = {
+      chars: Math.max(stdTruncNotice.chars, ctxTruncNotice.chars),
+      bytes: Math.max(stdTruncNotice.bytes, ctxTruncNotice.bytes),
+    };
     const minOmittedNotice =
       totalFiles > 1
         ? measureCost(
@@ -2194,9 +2298,33 @@ function formatBudgetedContentSection(params: {
     }
   }
 
-  const result = `${parts.join("")}${omittedFilesLine}${truncLine}`;
+  const bodyText = parts.join("");
+  const result = `${bodyText}${omittedFilesLine}${truncLine}`;
   if (result.length <= charBudget && Buffer.byteLength(result, "utf8") <= byteBudget) {
     return result;
+  }
+  if (omittedContextOnly) {
+    const compactTrunc = buildTruncatedNotice(
+      shownMatches,
+      actualTotalMatches,
+      shownFiles,
+      totalFiles,
+      maxResultsTruncated,
+      false,
+    );
+    const compactResult = `${bodyText}${omittedFilesLine}${compactTrunc}`;
+    if (
+      compactResult.length <= charBudget &&
+      Buffer.byteLength(compactResult, "utf8") <= byteBudget
+    ) {
+      return compactResult;
+    }
+    if (
+      bodyText.length <= charBudget &&
+      Buffer.byteLength(bodyText, "utf8") <= byteBudget
+    ) {
+      return bodyText;
+    }
   }
   return null;
 }
@@ -2262,8 +2390,12 @@ async function executeSingleQuery(
         try {
           res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
         } catch (err) {
-          // Only fallback on spawn error; surface regex errors directly
-          if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
+          // Fall back to Node regex engine on spawn error or older rg (< 14.0) escape syntax rejections
+          if (
+            err instanceof Error &&
+            (err.message.startsWith("rg spawn error:") ||
+              (query.type === "regex" && /unrecognized escape sequence/i.test(err.message)))
+          ) {
             res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
           } else {
             throw err;
@@ -2447,11 +2579,6 @@ export async function runBatchSearch(
     text: fitSectionsToByteBudget(finalSections, maxChars, maxBytes, separator),
     isError: false,
   };
-}
-
-function patternTargetsHidden(pattern: string): boolean {
-  const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
-  return /(?:^|[/,{])\.[^./]/.test(normalized);
 }
 
 function globTargetsDir(glob: string, dir: string): boolean {
