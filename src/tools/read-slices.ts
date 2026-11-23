@@ -2586,6 +2586,467 @@ function extractGraphqlSymbols(lines: string[]): SymbolEntry[] {
   return symbols;
 }
 
+interface HclScanState {
+  inBlockComment: boolean;
+  inString: boolean;
+  interpBraceStack: number[];
+  heredoc: { delim: string; indented: boolean } | null;
+}
+
+function scanHclLine(
+  line: string,
+  state: HclScanState,
+): {
+  code: string;
+  openBrace: number;
+  closeBrace: number;
+  openBracket: number;
+  closeBracket: number;
+  openParen: number;
+  closeParen: number;
+  lastCodeChar: string;
+} {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  let lastCodeChar = "";
+
+  if (state.heredoc) {
+    const check = state.heredoc.indented ? line.trim() : line.trimEnd();
+    if (check === state.heredoc.delim) {
+      state.heredoc = null;
+      lastCodeChar = check[check.length - 1] ?? "";
+    }
+    return {
+      code,
+      openBrace,
+      closeBrace,
+      openBracket,
+      closeBracket,
+      openParen,
+      closeParen,
+      lastCodeChar,
+    };
+  }
+
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i]!;
+    const next = line[i + 1];
+
+    if (state.inBlockComment) {
+      if (ch === "*" && next === "/") {
+        state.inBlockComment = false;
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+
+    if (state.inString) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "$" && next === "{") {
+        state.inString = false;
+        state.interpBraceStack.push(0);
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        state.inString = false;
+        lastCodeChar = '"';
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "#" || (ch === "/" && next === "/")) {
+      break;
+    }
+
+    if (ch === "/" && next === "*") {
+      state.inBlockComment = true;
+      code += " ";
+      i += 2;
+      continue;
+    }
+
+    if (ch === '"') {
+      state.inString = true;
+      if (state.interpBraceStack.length === 0) {
+        let endQ = i + 1;
+        while (endQ < line.length) {
+          if (line[endQ] === "\\") {
+            endQ += 2;
+            continue;
+          }
+          if (line[endQ] === "$" && line[endQ + 1] === "{") break;
+          if (line[endQ] === '"') break;
+          endQ++;
+        }
+        if (endQ < line.length && line[endQ] === '"') {
+          code += line.slice(i, endQ + 1);
+          state.inString = false;
+          lastCodeChar = '"';
+          i = endQ + 1;
+          continue;
+        }
+      }
+      code += '""';
+      i++;
+      continue;
+    }
+
+    if (state.interpBraceStack.length > 0) {
+      if (ch === "{") {
+        state.interpBraceStack[state.interpBraceStack.length - 1]! += 1;
+      } else if (ch === "}") {
+        const top = state.interpBraceStack[state.interpBraceStack.length - 1]!;
+        if (top === 0) {
+          state.interpBraceStack.pop();
+          state.inString = true;
+        } else {
+          state.interpBraceStack[state.interpBraceStack.length - 1] = top - 1;
+        }
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "<" && next === "<") {
+      const hm = /^<<(-?)([A-Za-z_]\w*)/.exec(line.slice(i));
+      if (hm && hm[2]) {
+        state.heredoc = { delim: hm[2], indented: hm[1] === "-" };
+        code += "<<";
+        lastCodeChar = "<";
+        i += hm[0].length;
+        continue;
+      }
+    }
+
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "[") openBracket++;
+    else if (ch === "]") closeBracket++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    if (!/\s/.test(ch)) lastCodeChar = ch;
+    i++;
+  }
+
+  return {
+    code,
+    openBrace,
+    closeBrace,
+    openBracket,
+    closeBracket,
+    openParen,
+    closeParen,
+    lastCodeChar,
+  };
+}
+
+function findHclEndLine(
+  lines: string[],
+  startIdx: number,
+  isAssignment: boolean,
+): number {
+  const state: HclScanState = {
+    inBlockComment: false,
+    inString: false,
+    interpBraceStack: [],
+    heredoc: null,
+  };
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let seenOpenBrace = false;
+  const maxScan = Math.min(lines.length, startIdx + 2000);
+
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanHclLine(lines[i]!, state);
+    if (scan.openBrace > 0) seenOpenBrace = true;
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    bracketDepth = Math.max(0, bracketDepth + scan.openBracket - scan.closeBracket);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (isAssignment) {
+      if (i === startIdx && scan.lastCodeChar === "=") {
+        continue;
+      }
+      if (
+        braceDepth === 0 &&
+        bracketDepth === 0 &&
+        parenDepth === 0 &&
+        !state.heredoc &&
+        !state.inBlockComment &&
+        !state.inString &&
+        state.interpBraceStack.length === 0
+      ) {
+        return i + 1;
+      }
+    } else if (
+      seenOpenBrace &&
+      braceDepth === 0 &&
+      bracketDepth === 0 &&
+      parenDepth === 0 &&
+      !state.heredoc
+    ) {
+      return i + 1;
+    }
+  }
+
+  return Math.min(lines.length, maxScan);
+}
+
+function extractTerraformSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: HclScanState = {
+    inBlockComment: false,
+    inString: false,
+    interpBraceStack: [],
+    heredoc: null,
+  };
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  const twoLabelRe =
+    /^(resource|data)\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*\{/;
+  const oneLabelRe =
+    /^(variable|output|module|provider|check)\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*\{/;
+  const zeroLabelRe = /^(locals|terraform|moved|import)\s*\{/;
+  const assignRe = /^([A-Za-z_][\w-]*)\s*=(?!=)/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const wasInComment = state.inBlockComment;
+    const wasInHeredoc = state.heredoc !== null;
+    const wasInString = state.inString || state.interpBraceStack.length > 0;
+    const atTop = braceDepth === 0 && bracketDepth === 0 && parenDepth === 0;
+
+    const scan = scanHclLine(lines[i]!, state);
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    bracketDepth = Math.max(0, bracketDepth + scan.openBracket - scan.closeBracket);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (!atTop || wasInComment || wasInHeredoc || wasInString) continue;
+    const code = scan.code.trim();
+    if (!code) continue;
+
+    const m2 = twoLabelRe.exec(code);
+    if (m2 && m2[1]) {
+      const typeName = m2[2] || m2[3];
+      const localName = m2[4] || m2[5];
+      if (typeName && localName) {
+        symbols.push({
+          kind: m2[1],
+          name: `${typeName}.${localName}`,
+          startLine: i + 1,
+          endLine: findHclEndLine(lines, i, false),
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const m1 = oneLabelRe.exec(code);
+    if (m1 && m1[1]) {
+      const label = m1[2] || m1[3];
+      if (label) {
+        symbols.push({
+          kind: m1[1],
+          name: label,
+          startLine: i + 1,
+          endLine: findHclEndLine(lines, i, false),
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const m0 = zeroLabelRe.exec(code);
+    if (m0 && m0[1]) {
+      symbols.push({
+        kind: m0[1],
+        name: m0[1],
+        startLine: i + 1,
+        endLine: findHclEndLine(lines, i, false),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const ma = assignRe.exec(code);
+    if (ma && ma[1]) {
+      symbols.push({
+        kind: "key",
+        name: ma[1],
+        startLine: i + 1,
+        endLine: findHclEndLine(lines, i, true),
+        depth: 0,
+      });
+    }
+  }
+
+  return symbols;
+}
+
+function extractDockerfileSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const stageEntries: SymbolEntry[] = [];
+  let escapeChar = "\\";
+
+  // Check optional Dockerfile parser directive `# escape=\` or `# escape=\`` at top of file
+  for (let i = 0; i < Math.min(lines.length, 5); i++) {
+    const trimmed = lines[i]!.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("#")) break;
+    const escMatch = /^#\s*escape\s*=\s*([\\`])\s*$/i.exec(trimmed);
+    if (escMatch && escMatch[1]) {
+      escapeChar = escMatch[1];
+      break;
+    }
+  }
+
+  let i = 0;
+  let activeStage: SymbolEntry | null = null;
+
+  while (i < lines.length) {
+    const trimmed = lines[i]!.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      i++;
+      continue;
+    }
+
+    const startIdx = i;
+    const parts: string[] = [];
+    let endIdx = i;
+    let heredocDelim: { delim: string; indented: boolean } | null = null;
+
+    while (endIdx < lines.length) {
+      const cur = lines[endIdx]!;
+      const curTrim = cur.trim();
+      if (endIdx > startIdx && curTrim.startsWith("#")) {
+        endIdx++;
+        continue;
+      }
+      const rtrimmed = cur.trimEnd();
+      const hasCont =
+        rtrimmed.length > 0 &&
+        rtrimmed[rtrimmed.length - 1] === escapeChar &&
+        (rtrimmed.length < 2 || rtrimmed[rtrimmed.length - 2] !== escapeChar);
+      const cleanPart = hasCont ? rtrimmed.slice(0, -1).trim() : curTrim;
+      if (cleanPart) parts.push(cleanPart);
+
+      if (!heredocDelim) {
+        const hm = /<<(-?)(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))/.exec(cleanPart);
+        if (hm) {
+          const delim = hm[2] || hm[3] || hm[4];
+          if (delim) {
+            heredocDelim = { delim, indented: hm[1] === "-" };
+          }
+        }
+      }
+
+      if (hasCont) {
+        endIdx++;
+        continue;
+      }
+      break;
+    }
+
+    if (heredocDelim) {
+      endIdx++;
+      while (endIdx < lines.length) {
+        const hdLine = heredocDelim.indented
+          ? lines[endIdx]!.trim()
+          : lines[endIdx]!.trimEnd();
+        if (hdLine === heredocDelim.delim) break;
+        endIdx++;
+      }
+    }
+
+    const joined = parts.join(" ").replace(/\s+/g, " ").trim();
+    const instrMatch = /^([A-Za-z]+)\s+(.*)$/.exec(joined);
+    if (instrMatch && instrMatch[1]) {
+      const kw = instrMatch[1].toUpperCase();
+      let rest = instrMatch[2]!.trim();
+
+      if (kw === "FROM") {
+        while (rest.startsWith("--")) {
+          const sp = rest.search(/\s/);
+          if (sp < 0) break;
+          rest = rest.slice(sp).trimStart();
+        }
+        const fromMatch = /^(\S+)(?:\s+AS\s+([A-Za-z0-9_.-]+))?/i.exec(rest);
+        const image = fromMatch?.[1] ?? rest;
+        const alias = fromMatch?.[2];
+        const stageName = alias ? `${image} AS ${alias}` : image;
+        const stageSym: SymbolEntry = {
+          kind: "stage",
+          name: sliceSafeChars(stageName, 64),
+          startLine: startIdx + 1,
+          endLine: Math.min(lines.length, endIdx + 1),
+          depth: 0,
+        };
+        symbols.push(stageSym);
+        stageEntries.push(stageSym);
+        activeStage = stageSym;
+      } else if (kw === "ARG") {
+        const argNames = rest
+          .split(/\s+/)
+          .map((tok) => tok.split("=")[0]?.trim() ?? "")
+          .filter((n) => /^[A-Za-z_]\w*$/.test(n));
+        const label = argNames.length > 0 ? argNames.join(", ") : sliceSafeChars(rest, 48);
+        if (label) {
+          symbols.push({
+            kind: "arg",
+            name: label,
+            startLine: startIdx + 1,
+            endLine: Math.min(lines.length, endIdx + 1),
+            depth: activeStage ? 1 : 0,
+          });
+        }
+      } else if (kw === "ENTRYPOINT" || kw === "CMD") {
+        symbols.push({
+          kind: kw.toLowerCase(),
+          name: sliceSafeChars(rest, 60),
+          startLine: startIdx + 1,
+          endLine: Math.min(lines.length, endIdx + 1),
+          depth: activeStage ? 1 : 0,
+        });
+      }
+    }
+
+    i = Math.max(startIdx + 1, endIdx + 1);
+  }
+
+  for (let idx = 0; idx < stageEntries.length; idx++) {
+    const stage = stageEntries[idx]!;
+    let bound =
+      idx + 1 < stageEntries.length
+        ? stageEntries[idx + 1]!.startLine - 1
+        : lines.length;
+    while (
+      bound > stage.startLine &&
+      (!(lines[bound - 1] ?? "").trim() || (lines[bound - 1] ?? "").trim().startsWith("#"))
+    ) {
+      bound--;
+    }
+    stage.endLine = Math.max(stage.startLine, bound);
+  }
+
+  return symbols;
+}
+
 const HTML_VOID_ELEMENTS = new Set([
   "area",
   "base",
@@ -3520,7 +3981,19 @@ function extractSfcSymbols(lines: string[], mode: "vue" | "svelte"): SymbolEntry
 }
 
 function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry[] {
+  const base = path.basename(filePath).toLowerCase();
   const ext = path.extname(filePath).toLowerCase();
+
+  if (
+    base === "dockerfile" ||
+    base.startsWith("dockerfile.") ||
+    base === "containerfile" ||
+    base.startsWith("containerfile.") ||
+    ext === ".dockerfile" ||
+    ext === ".containerfile"
+  ) {
+    return extractDockerfileSymbols(lines);
+  }
 
   switch (ext) {
     case ".ts":
@@ -3584,6 +4057,10 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".gql":
     case ".graphqls":
       return extractGraphqlSymbols(lines);
+    case ".tf":
+    case ".tfvars":
+    case ".hcl":
+      return extractTerraformSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }

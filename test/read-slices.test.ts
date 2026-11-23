@@ -1606,4 +1606,120 @@ describe("read_slices", () => {
       ],
     );
   });
+
+  it("extracts Terraform/HCL (.tf/.tfvars) and multi-stage Dockerfile/Containerfile outlines", () => {
+    const tfDoc = [
+      "terraform {", // 1
+      '  required_version = ">= 1.6.0"', // 2
+      "}", // 3
+      "", // 4
+      'provider "aws" {', // 5
+      '  region = var.region', // 6
+      "}", // 7
+      "", // 8
+      'variable "region" {', // 9
+      "  type = string", // 10
+      "}", // 11
+      "", // 12
+      "locals {", // 13
+      '  common_tags = { env = "prod" }', // 14
+      "}", // 15
+      "", // 16
+      'data "aws_ami" "ubuntu" {', // 17
+      "  most_recent = true", // 18
+      "}", // 19
+      "", // 20
+      'module "vpc" {', // 21
+      '  source = "./modules/vpc"', // 22
+      "}", // 23
+      "", // 24
+      'resource "aws_instance" "web" {', // 25
+      "  ami = data.aws_ami.ubuntu.id", // 26
+      "  user_data = <<-EOF", // 27
+      "    #!/bin/bash", // 28
+      '    echo "{ unbalanced brace inside heredoc"', // 29
+      '    resource "fake" "ignored" {', // 30
+      "  EOF", // 31
+      "}", // 32
+      "", // 33
+      'output "instance_id" {', // 34
+      "  value = aws_instance.web.id", // 35
+      "}", // 36
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("main.tf", tfDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "terraform:terraform:1-3",
+        "provider:aws:5-7",
+        "variable:region:9-11",
+        "locals:locals:13-15",
+        "data:aws_ami.ubuntu:17-19",
+        "module:vpc:21-23",
+        "resource:aws_instance.web:25-32",
+        "output:instance_id:34-36",
+      ],
+    );
+
+    const tfvarsDoc = [
+      'region = "us-west-2"', // 1
+      "subnets = [", // 2
+      '  "10.0.1.0/24",', // 3
+      '  "10.0.2.0/24",', // 4
+      "]", // 5
+      "tags = {", // 6
+      '  owner = "platform"', // 7
+      "}", // 8
+      "bootstrap = <<EOF", // 9
+      "echo 'hello { world'", // 10
+      "EOF", // 11
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("prod.tfvars", tfvarsDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "key:region:1-1",
+        "key:subnets:2-5",
+        "key:tags:6-8",
+        "key:bootstrap:9-11",
+      ],
+    );
+
+    const dockerDoc = [
+      "# syntax=docker/dockerfile:1", // 1
+      "ARG NODE_VERSION=22", // 2
+      "", // 3
+      "FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine AS builder", // 4
+      "WORKDIR /app", // 5
+      "ARG NPM_TOKEN", // 6
+      "RUN <<EOF", // 7
+      "FROM fake_inside_heredoc", // 8
+      "CMD ['ignored']", // 9
+      "EOF", // 10
+      "RUN npm ci && \\", // 11
+      "    npm run build", // 12
+      "", // 13
+      "# Runtime stage", // 14
+      "FROM node:${NODE_VERSION}-slim AS runner", // 15
+      "WORKDIR /app", // 16
+      "COPY --from=builder /app/dist ./dist", // 17
+      'ENTRYPOINT ["node", "dist/mcp-server.mjs"]', // 18
+      'CMD ["--stdio"]', // 19
+    ].join("\n");
+
+    const dockerSyms = extractSymbols("Dockerfile.prod", dockerDoc);
+    assert.deepEqual(extractSymbols("app.dockerfile", dockerDoc), dockerSyms);
+    assert.deepEqual(extractSymbols("Containerfile", dockerDoc), dockerSyms);
+    assert.deepEqual(
+      dockerSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "arg:NODE_VERSION:2-2:d0",
+        "stage:node:${NODE_VERSION}-alpine AS builder:4-12:d0",
+        "arg:NPM_TOKEN:6-6:d1",
+        "stage:node:${NODE_VERSION}-slim AS runner:15-19:d0",
+        'entrypoint:["node", "dist/mcp-server.mjs"]:18-18:d1',
+        'cmd:["--stdio"]:19-19:d1',
+      ],
+    );
+  });
 });
