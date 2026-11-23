@@ -1387,4 +1387,98 @@ describe("read_slices", () => {
     );
     assert.deepEqual(extractSymbols("items.json", '[\n  { "id": 1 },\n  { "id": 2 }\n]'), []);
   });
+
+  it("extracts SQL (.sql) DDL symbol outlines across comments, quoted/schema names, and $$ bodies", () => {
+    const sqlDoc = [
+      "-- Initial database migration", // 1
+      "/* Block comment with fake statement:", // 2
+      "   CREATE TABLE should_ignore (id int);", // 3
+      "*/", // 4
+      "BEGIN;", // 5
+      "", // 6
+      "CREATE SCHEMA IF NOT EXISTS analytics;", // 7
+      "", // 8
+      "CREATE SEQUENCE IF NOT EXISTS public.user_id_seq", // 9
+      "  START WITH 1000;", // 10
+      "", // 11
+      "CREATE TYPE public.account_status AS ENUM (", // 12
+      "  'pending',", // 13
+      "  'active;verified'", // 14
+      ");", // 15
+      "", // 16
+      "CREATE TEMP TABLE IF NOT EXISTS \"public\".\"users\" (", // 17
+      "  id BIGINT PRIMARY KEY DEFAULT nextval('public.user_id_seq'), -- inline ; comment", // 18
+      "  email TEXT NOT NULL,", // 19
+      "  status public.account_status DEFAULT 'pending'", // 20
+      ");", // 21
+      "", // 22
+      "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email", // 23
+      "  ON public.users (email);", // 24
+      "", // 25
+      "CREATE MATERIALIZED VIEW `analytics`.`active_users` AS", // 26
+      "SELECT id, email", // 27
+      "FROM public.users", // 28
+      "WHERE status = 'active;verified';", // 29
+      "", // 30
+      "CREATE OR REPLACE FUNCTION public.normalize_email(raw_email TEXT)", // 31
+      "RETURNS TEXT", // 32
+      "LANGUAGE plpgsql", // 33
+      "AS $$", // 34
+      "DECLARE", // 35
+      "  cleaned TEXT := lower(trim(raw_email));", // 36
+      "BEGIN", // 37
+      "  IF cleaned = '' THEN", // 38
+      "    RETURN NULL;", // 39
+      "  END IF;", // 40
+      "  RETURN cleaned;", // 41
+      "END;", // 42
+      "$$;", // 43
+      "", // 44
+      "CREATE PROCEDURE analytics.refresh_views()", // 45
+      "LANGUAGE plpgsql AS $proc$", // 46
+      "BEGIN", // 47
+      "  REFRESH MATERIALIZED VIEW analytics.active_users;", // 48
+      "END;", // 49
+      "$proc$;", // 50
+      "", // 51
+      "CREATE TRIGGER trg_users_normalize", // 52
+      "  BEFORE INSERT ON public.users", // 53
+      "  FOR EACH ROW EXECUTE FUNCTION public.normalize_email();", // 54
+      "", // 55
+      "ALTER TABLE IF EXISTS ONLY \"public\".\"users\"", // 56
+      "  ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW();", // 57
+      "", // 58
+      "COMMIT;", // 59
+    ].join("\n");
+
+    const syms = extractSymbols("001_init.sql", sqlDoc);
+    assert.deepEqual(
+      syms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "schema:analytics:7-7",
+        "sequence:public.user_id_seq:9-10",
+        "type:public.account_status:12-15",
+        "table:public.users:17-21",
+        "index:idx_users_email:23-24",
+        "view:analytics.active_users:26-29",
+        "function:public.normalize_email:31-43",
+        "procedure:analytics.refresh_views:45-50",
+        "trigger:trg_users_normalize:52-54",
+        "alter:public.users:56-57",
+      ],
+    );
+
+    // SQLite / MySQL BEGIN ... END; compound trigger without $$
+    const sqliteTrigger = [
+      "CREATE TRIGGER audit_log_insert AFTER INSERT ON users",
+      "BEGIN",
+      "  INSERT INTO audit_log(user_id) VALUES (NEW.id);",
+      "  UPDATE counters SET total = total + 1;",
+      "END;",
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("trigger.sql", sqliteTrigger).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["trigger:audit_log_insert:1-5"],
+    );
+  });
 });

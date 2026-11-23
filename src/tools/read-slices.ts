@@ -1824,6 +1824,452 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
   return symbols;
 }
 
+function stripSqlCommentsForHeader(raw: string): string {
+  let out = "";
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  while (i < raw.length) {
+    const ch = raw[i]!;
+    const next = raw[i + 1];
+    if (inSingle) {
+      out += ch;
+      if (ch === "'" && next === "'") {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      out += ch;
+      if (ch === '"' && next === '"') {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      i++;
+      continue;
+    }
+    if (inBacktick) {
+      out += ch;
+      if (ch === "`" && next === "`") {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === "`") inBacktick = false;
+      i++;
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      while (i < raw.length && raw[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    if (ch === "'") inSingle = true;
+    else if (ch === '"') inDouble = true;
+    else if (ch === "`") inBacktick = true;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function extractSqlQualifiedName(rest: string): string | null {
+  const parts: string[] = [];
+  let i = 0;
+  const len = rest.length;
+
+  while (i < len && parts.length < 3) {
+    while (i < len && /\s/.test(rest[i]!)) i++;
+    if (i >= len) break;
+    const ch = rest[i]!;
+    if (ch === '"') {
+      i++;
+      let buf = "";
+      while (i < len) {
+        if (rest[i] === '"' && rest[i + 1] === '"') {
+          buf += '"';
+          i += 2;
+          continue;
+        }
+        if (rest[i] === '"') {
+          i++;
+          break;
+        }
+        buf += rest[i]!;
+        i++;
+      }
+      if (!buf) break;
+      parts.push(buf);
+    } else if (ch === "`") {
+      i++;
+      let buf = "";
+      while (i < len) {
+        if (rest[i] === "`" && rest[i + 1] === "`") {
+          buf += "`";
+          i += 2;
+          continue;
+        }
+        if (rest[i] === "`") {
+          i++;
+          break;
+        }
+        buf += rest[i]!;
+        i++;
+      }
+      if (!buf) break;
+      parts.push(buf);
+    } else if (ch === "[") {
+      i++;
+      const start = i;
+      while (i < len && rest[i] !== "]") i++;
+      const buf = rest.slice(start, i).trim();
+      if (i < len && rest[i] === "]") i++;
+      if (!buf) break;
+      parts.push(buf);
+    } else if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
+      i++;
+      while (i < len && /[\w$]/.test(rest[i]!)) i++;
+      parts.push(rest.slice(start, i));
+    } else {
+      break;
+    }
+
+    let k = i;
+    while (k < len && /\s/.test(rest[k]!)) k++;
+    if (rest[k] === ".") {
+      i = k + 1;
+    } else {
+      break;
+    }
+  }
+
+  return parts.length > 0 ? parts.join(".") : null;
+}
+
+function parseSqlDdlHeader(rawHeader: string): { kind: string; name: string } | null {
+  const cleaned = stripSqlCommentsForHeader(rawHeader).replace(/\s+/g, " ").trimStart();
+  const createMatch =
+    /^CREATE\s+(?:(?:OR\s+REPLACE|GLOBAL|LOCAL|TEMP(?:ORARY)?|UNLOGGED|EXTERNAL|VIRTUAL|MATERIALIZED|UNIQUE|FULLTEXT|SPATIAL|CLUSTERED|NONCLUSTERED|TRANSIENT|SECURE)\s+)*(TABLE|VIEW|INDEX|FUNCTION|PROCEDURE|TRIGGER|TYPE|SCHEMA|SEQUENCE)\b\s*(.*)$/i.exec(
+      cleaned,
+    );
+  if (createMatch && createMatch[1]) {
+    const kind = createMatch[1].toLowerCase();
+    let rest = (createMatch[2] ?? "").trimStart();
+    for (let pass = 0; pass < 3; pass++) {
+      const nextRest = rest
+        .replace(/^CONCURRENTLY\b\s*/i, "")
+        .replace(/^IF\s+NOT\s+EXISTS\b\s*/i, "")
+        .replace(kind === "schema" ? /^AUTHORIZATION\b\s*/i : /^$/, "");
+      if (nextRest === rest) break;
+      rest = nextRest;
+    }
+    if (kind === "index" && /^ON\b\s+/i.test(rest)) {
+      const tbl = extractSqlQualifiedName(rest.replace(/^ON\b\s+/i, ""));
+      return tbl ? { kind, name: `on ${tbl}` } : null;
+    }
+    const name = extractSqlQualifiedName(rest);
+    return name ? { kind, name } : null;
+  }
+
+  const alterMatch = /^ALTER\s+(?:FOREIGN\s+)?TABLE\b\s*(.*)$/i.exec(cleaned);
+  if (alterMatch) {
+    let rest = (alterMatch[1] ?? "").trimStart();
+    for (let pass = 0; pass < 2; pass++) {
+      const nextRest = rest
+        .replace(/^IF\s+EXISTS\b\s*/i, "")
+        .replace(/^ONLY\b\s*/i, "");
+      if (nextRest === rest) break;
+      rest = nextRest;
+    }
+    const name = extractSqlQualifiedName(rest);
+    return name ? { kind: "alter", name } : null;
+  }
+
+  return null;
+}
+
+function extractSqlSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  let inBlockComment = false;
+  let dollarTag: string | null = null;
+  let inSingleQuote = false;
+  let singleQuoteBackslash = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  let parenDepth = 0;
+  let beginDepth = 0;
+  let caseDepth = 0;
+  let atStatementStart = true;
+  let activeSym: SymbolEntry | null = null;
+  let lastCodeLine = 1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    let col = 0;
+    let seenCodeOnLine = false;
+
+    while (col < line.length) {
+      const ch = line[col]!;
+      const next = line[col + 1];
+
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          col += 2;
+        } else {
+          col++;
+        }
+        continue;
+      }
+
+      if (dollarTag !== null) {
+        if (ch === "$" && line.startsWith(dollarTag, col)) {
+          col += dollarTag.length;
+          dollarTag = null;
+          lastCodeLine = i + 1;
+          seenCodeOnLine = true;
+        } else {
+          col++;
+        }
+        continue;
+      }
+
+      if (inSingleQuote) {
+        if (singleQuoteBackslash && ch === "\\") {
+          col += 2;
+          continue;
+        }
+        if (ch === "'" && next === "'") {
+          col += 2;
+          continue;
+        }
+        if (ch === "'") {
+          inSingleQuote = false;
+          singleQuoteBackslash = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (inDoubleQuote) {
+        if (ch === '"' && next === '"') {
+          col += 2;
+          continue;
+        }
+        if (ch === '"') {
+          inDoubleQuote = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (inBacktick) {
+        if (ch === "`" && next === "`") {
+          col += 2;
+          continue;
+        }
+        if (ch === "`") {
+          inBacktick = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (/\s/.test(ch)) {
+        col++;
+        continue;
+      }
+
+      if (ch === "-" && next === "-") {
+        break;
+      }
+
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        col += 2;
+        continue;
+      }
+
+      // psql meta-commands (e.g. \connect, \set) at line/statement start do not require ';'
+      if (!seenCodeOnLine && atStatementStart && ch === "\\") {
+        break;
+      }
+
+      // T-SQL GO batch separator on its own line
+      if (
+        !seenCodeOnLine &&
+        parenDepth === 0 &&
+        beginDepth === 0 &&
+        /^GO\b\s*(?:--.*)?$/i.test(line.slice(col))
+      ) {
+        if (activeSym) {
+          activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+          activeSym = null;
+        }
+        atStatementStart = true;
+        break;
+      }
+
+      if (
+        atStatementStart ||
+        (!seenCodeOnLine &&
+          parenDepth === 0 &&
+          beginDepth === 0 &&
+          /^(?:CREATE|ALTER)\b/i.test(line.slice(col)))
+      ) {
+        const headerWindow = [
+          line.slice(col),
+          lines[i + 1] ?? "",
+          lines[i + 2] ?? "",
+          lines[i + 3] ?? "",
+        ].join("\n");
+        const ddl = parseSqlDdlHeader(headerWindow);
+        if (ddl) {
+          if (activeSym) {
+            activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+          }
+          activeSym = {
+            kind: ddl.kind,
+            name: ddl.name,
+            startLine: i + 1,
+            endLine: i + 1,
+            depth: 0,
+          };
+          symbols.push(activeSym);
+          parenDepth = 0;
+          beginDepth = 0;
+          caseDepth = 0;
+          atStatementStart = false;
+        } else if (atStatementStart) {
+          atStatementStart = false;
+        }
+      }
+
+      seenCodeOnLine = true;
+      lastCodeLine = i + 1;
+
+      if (ch === "$") {
+        const dm = /^\$(?:[A-Za-z_]\w*)?\$/.exec(line.slice(col));
+        if (dm) {
+          dollarTag = dm[0];
+          col += dm[0].length;
+          continue;
+        }
+      }
+
+      if (
+        (ch === "E" || ch === "e") &&
+        next === "'" &&
+        (col === 0 || !/[\w$]/.test(line[col - 1]!))
+      ) {
+        inSingleQuote = true;
+        singleQuoteBackslash = true;
+        col += 2;
+        continue;
+      }
+
+      if (ch === "'") {
+        inSingleQuote = true;
+        singleQuoteBackslash = false;
+        col++;
+        continue;
+      }
+
+      if (ch === '"') {
+        inDoubleQuote = true;
+        col++;
+        continue;
+      }
+
+      if (ch === "`") {
+        inBacktick = true;
+        col++;
+        continue;
+      }
+
+      if (ch === "(") {
+        parenDepth++;
+        col++;
+        continue;
+      }
+      if (ch === ")") {
+        parenDepth = Math.max(0, parenDepth - 1);
+        col++;
+        continue;
+      }
+
+      if (
+        activeSym &&
+        (activeSym.kind === "function" ||
+          activeSym.kind === "procedure" ||
+          activeSym.kind === "trigger") &&
+        /[A-Za-z_]/.test(ch) &&
+        (col === 0 || !/[\w$]/.test(line[col - 1]!))
+      ) {
+        const wordMatch = /^[A-Za-z_]\w*/.exec(line.slice(col));
+        if (wordMatch) {
+          const upper = wordMatch[0].toUpperCase();
+          const afterWord = line.slice(col + wordMatch[0].length);
+          if (upper === "BEGIN" && !/^\s*(?:TRANSACTION\b|WORK\b)?\s*;/.test(afterWord)) {
+            beginDepth++;
+          } else if (upper === "CASE" && parenDepth === 0) {
+            caseDepth++;
+          } else if (upper === "END") {
+            if (/^\s+CASE\b/i.test(afterWord)) {
+              caseDepth = Math.max(0, caseDepth - 1);
+            } else if (!/^\s+(?:IF|LOOP|WHILE|REPEAT)\b/i.test(afterWord)) {
+              if (caseDepth > 0 && !/^\s*;/.test(afterWord)) {
+                caseDepth--;
+              } else {
+                beginDepth = Math.max(0, beginDepth - 1);
+              }
+            }
+          }
+          col += wordMatch[0].length;
+          continue;
+        }
+      }
+
+      if (ch === ";" && parenDepth === 0 && beginDepth === 0) {
+        if (activeSym) {
+          activeSym.endLine = i + 1;
+          activeSym = null;
+        }
+        caseDepth = 0;
+        atStatementStart = true;
+        col++;
+        continue;
+      }
+
+      col++;
+    }
+  }
+
+  if (activeSym) {
+    activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+  }
+
+  return symbols;
+}
+
 const HTML_VOID_ELEMENTS = new Set([
   "area",
   "base",
@@ -2814,6 +3260,8 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".sql":
+      return extractSqlSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }
