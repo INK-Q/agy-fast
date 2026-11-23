@@ -864,12 +864,15 @@ describe("run_checks", () => {
     }
   });
 
-  it("caps and sanitizes multiline inline scripts in compact [PASS] bullets", async () => {
-    const multilineInlineCmd = `${nodeBin} -e "\nconst payload = '${"z".repeat(1600)}';\nconsole.log('INLINE_OK');\n"`;
+  it("caps and sanitizes long/multiline inline scripts in compact [PASS] bullets", async () => {
+    const inlineCmd =
+      process.platform === "win32"
+        ? `${nodeBin} -e "const payload = '${"z".repeat(1600)}'; console.log('INLINE_OK');"`
+        : `${nodeBin} -e "\nconst payload = '${"z".repeat(1600)}';\nconsole.log('INLINE_OK');\n"`;
     const res = await runChecks({
       outputMode: "compact",
       maxChars: 4000,
-      commands: [{ name: "inline-pass", command: multilineInlineCmd }],
+      commands: [{ name: "inline-pass", command: inlineCmd }],
     });
     assert.equal(res.isError, false);
     const lines = res.text.trim().split("\n");
