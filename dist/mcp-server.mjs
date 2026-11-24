@@ -3181,8 +3181,36 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
           gPos = found + Math.max(1, normTarget.length);
         }
         if (globalOffsets.length > 0) {
-          const hitLines = globalOffsets.map((o) => formatMatchLineRange(lineStarts, o, normTarget.length)).join(", ");
-          hint = ` Exact match found outside range at ${hitLines} \u2014 adjust startLine/endLine or omit them.`;
+          const effStart = hunk.startLine ?? 1;
+          const effEnd = hunk.endLine ?? lineStarts.length;
+          const effectiveLen = normTarget.length > 1 && normTarget.endsWith("\n") ? normTarget.length - 1 : normTarget.length;
+          const hitSpans = globalOffsets.map((o) => {
+            const startLn = offsetToLine(lineStarts, o);
+            const endOffset = o + Math.max(0, effectiveLen - 1);
+            const endLn = offsetToLine(lineStarts, endOffset);
+            return {
+              startLn,
+              endLn,
+              label: formatMatchLineRange(lineStarts, o, normTarget.length)
+            };
+          });
+          const hitLines = hitSpans.map((h) => h.label).join(", ");
+          const overlapping = hitSpans.find(
+            (h) => h.startLn <= effEnd && h.endLn >= effStart
+          );
+          if (overlapping && hitSpans.length === 1) {
+            if (overlapping.startLn >= effStart && overlapping.endLn > effEnd) {
+              hint = ` Exact match spans ${overlapping.label} (starts inside range but extends past endLine ${effEnd}) \u2014 widen startLine/endLine or omit them.`;
+            } else if (overlapping.startLn < effStart && overlapping.endLn <= effEnd) {
+              hint = ` Exact match spans ${overlapping.label} (starts before startLine ${effStart}) \u2014 widen startLine/endLine or omit them.`;
+            } else {
+              hint = ` Exact match spans ${overlapping.label} (extends beyond lines ${effStart}-${effEnd}) \u2014 widen startLine/endLine or omit them.`;
+            }
+          } else if (overlapping) {
+            hint = ` Exact matches span ${hitLines} (extending beyond lines ${effStart}-${effEnd}) \u2014 adjust startLine/endLine or omit them.`;
+          } else {
+            hint = ` Exact match found outside range at ${hitLines} \u2014 adjust startLine/endLine or omit them.`;
+          }
         } else {
           const effStart = hunk.startLine ?? 1;
           const effEnd = hunk.endLine ?? lineStarts.length;
@@ -5423,22 +5451,32 @@ async function runGitQuery(query, searchRoot) {
   return out || "(empty output)";
 }
 var MAX_SEARCH_LINE_CHARS = 240;
+var MAX_SEARCH_LINE_BYTES = 300;
 function isHighSurrogate(code) {
   return code >= 55296 && code <= 56319;
 }
 function isLowSurrogate(code) {
   return code >= 56320 && code <= 57343;
 }
-function formatLineSnippet(line, maxChars = MAX_SEARCH_LINE_CHARS) {
+function formatLineSnippet(line, maxChars = MAX_SEARCH_LINE_CHARS, maxBytes = MAX_SEARCH_LINE_BYTES) {
   const text = line.text;
-  if (text.length <= maxChars) return text;
+  if (text.length <= maxChars && Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return text;
+  }
+  const clipPrefix = (raw) => {
+    let out = raw.length > maxChars ? sliceSafeChars(raw, maxChars) : raw;
+    if (Buffer.byteLength(out, "utf8") > maxBytes) {
+      out = sliceUtf8Bytes(out, maxBytes);
+    }
+    return out;
+  };
   if (!line.isMatch || line.matchStart === void 0) {
-    return `${sliceSafeChars(text, maxChars)}...`;
+    return `${clipPrefix(text)}...`;
   }
   const len = text.length;
   const mStart = clampInt(line.matchStart, 0, len);
   const mEnd = line.matchEnd !== void 0 ? clampInt(line.matchEnd, mStart, len) : mStart;
-  const prefix = sliceSafeChars(text, maxChars);
+  const prefix = clipPrefix(text);
   if (mStart < prefix.length && mEnd <= prefix.length) {
     return `${prefix}...`;
   }
@@ -5463,9 +5501,22 @@ function formatLineSnippet(line, maxChars = MAX_SEARCH_LINE_CHARS) {
     winEnd -= 1;
   }
   if (winEnd < winStart) winEnd = winStart;
+  let slice = text.slice(winStart, winEnd);
+  if (Buffer.byteLength(slice, "utf8") > maxBytes) {
+    const relMatch = Math.max(0, mStart - winStart);
+    if (Buffer.byteLength(slice.slice(0, relMatch), "utf8") > Math.floor(maxBytes * 0.4)) {
+      winStart = Math.max(0, mStart - Math.min(24, mStart));
+      if (winStart > 0 && winStart < len && isLowSurrogate(text.charCodeAt(winStart))) {
+        winStart = winStart === mStart && isHighSurrogate(text.charCodeAt(winStart - 1)) ? winStart - 1 : winStart + 1;
+      }
+      slice = text.slice(winStart, winEnd);
+    }
+    slice = sliceUtf8Bytes(slice, maxBytes);
+    winEnd = winStart + slice.length;
+  }
   const leadEllipsis = winStart > 0 ? "..." : "";
   const trailEllipsis = winEnd < len ? "..." : "";
-  return `${leadEllipsis}${text.slice(winStart, winEnd)}${trailEllipsis}`;
+  return `${leadEllipsis}${slice}${trailEllipsis}`;
 }
 function formatFileMatches(files, totalMatches, truncated) {
   if (files.length === 0) {
@@ -7278,6 +7329,176 @@ function extractJsonYamlSymbols(lines, isJson) {
   }
   return symbols;
 }
+function stripTomlInlineComment(line) {
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inDouble) {
+      if (ch === "\\") {
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'") {
+      inSingle = true;
+    } else if (ch === "#") {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+function parseTomlHeader(line) {
+  const noComment = stripTomlInlineComment(line).trim();
+  if (!noComment.startsWith("[") || !noComment.endsWith("]")) return null;
+  let kind = "table";
+  let inner = "";
+  if (noComment.startsWith("[[") && noComment.endsWith("]]")) {
+    kind = "array-table";
+    inner = noComment.slice(2, -2).trim();
+  } else {
+    inner = noComment.slice(1, -1).trim();
+  }
+  if (!inner) return null;
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (inDouble) {
+      if (ch === "\\") {
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'") {
+      inSingle = true;
+    } else if (ch === "[" || ch === "]" || ch === "," || ch === "=") {
+      return null;
+    }
+  }
+  if (inDouble || inSingle) return null;
+  return { kind, name: inner };
+}
+function extractTomlSymbols(lines) {
+  const symbols = [];
+  let inMulti = null;
+  let arrayDepth = 0;
+  let inlineTableDepth = 0;
+  let seenTable = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const atTopLevel = inMulti === null && arrayDepth === 0 && inlineTableDepth === 0;
+    if (atTopLevel) {
+      const header = parseTomlHeader(line);
+      if (header) {
+        seenTable = true;
+        symbols.push({
+          kind: header.kind,
+          name: header.name,
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0
+        });
+        continue;
+      }
+      if (!seenTable) {
+        const keyMatch = /^\s*([A-Za-z0-9_.-]+|"[^"\n]+"|'[^'\n]+')\s*=/.exec(line);
+        if (keyMatch && keyMatch[1]) {
+          symbols.push({
+            kind: "key",
+            name: keyMatch[1],
+            startLine: i + 1,
+            endLine: i + 1,
+            depth: 0
+          });
+        }
+      }
+    }
+    for (let j = 0; j < line.length; j++) {
+      if (inMulti === '"""') {
+        if (line[j] === "\\") {
+          j++;
+          continue;
+        }
+        if (line.startsWith('"""', j)) {
+          let run = 3;
+          while (run < 5 && line[j + run] === '"') run++;
+          j += run - 1;
+          inMulti = null;
+        }
+        continue;
+      }
+      if (inMulti === "'''") {
+        if (line.startsWith("'''", j)) {
+          let run = 3;
+          while (run < 5 && line[j + run] === "'") run++;
+          j += run - 1;
+          inMulti = null;
+        }
+        continue;
+      }
+      const ch = line[j];
+      if (ch === "#") break;
+      if (line.startsWith('"""', j)) {
+        inMulti = '"""';
+        j += 2;
+      } else if (line.startsWith("'''", j)) {
+        inMulti = "'''";
+        j += 2;
+      } else if (ch === '"') {
+        j++;
+        while (j < line.length) {
+          if (line[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (line[j] === '"') break;
+          j++;
+        }
+      } else if (ch === "'") {
+        j++;
+        while (j < line.length && line[j] !== "'") j++;
+      } else if (ch === "[") {
+        arrayDepth++;
+      } else if (ch === "]") {
+        arrayDepth = Math.max(0, arrayDepth - 1);
+      } else if (ch === "{") {
+        inlineTableDepth++;
+      } else if (ch === "}") {
+        inlineTableDepth = Math.max(0, inlineTableDepth - 1);
+      }
+    }
+  }
+  for (let idx = 0; idx < symbols.length; idx++) {
+    const cur = symbols[idx];
+    let endLine = idx + 1 < symbols.length ? symbols[idx + 1].startLine - 1 : lines.length;
+    while (endLine > cur.startLine && !(lines[endLine - 1] ?? "").trim()) {
+      endLine--;
+    }
+    cur.endLine = Math.max(cur.startLine, endLine);
+  }
+  return symbols;
+}
 function extractCssSymbols(lines, compactOnly = false) {
   const symbols = [];
   const state = {
@@ -8175,6 +8396,8 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".toml":
+      return extractTomlSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }
@@ -8364,6 +8587,26 @@ ${pickedLines.join("\n")}${packed.footer}`;
     byteBudget - headerBytes
   ) : null;
   return fallbackFooter ? `${header}${fallbackFooter}` : header;
+}
+function packSliceBlocksToBudget(header, blocks, charBudget, byteBudget) {
+  const fullText = `${header}
+${blocks.join("\n")}`;
+  if (blocks.length <= 1 || fullText.length <= charBudget && Buffer.byteLength(fullText, "utf8") <= byteBudget) {
+    return fullText;
+  }
+  const prefix = `${header}
+`;
+  const remChars = charBudget - prefix.length;
+  const remBytes = byteBudget - Buffer.byteLength(prefix, "utf8");
+  if (remChars < blocks.length * 48 || remBytes < blocks.length * 48) {
+    return fitSectionsToByteBudget([fullText], charBudget, byteBudget, "\n");
+  }
+  const fittedBlocks = fitSectionsToByteBudget(blocks, remChars, remBytes, "\n");
+  const combined = `${prefix}${fittedBlocks}`;
+  if (combined.length <= charBudget && Buffer.byteLength(combined, "utf8") <= byteBudget) {
+    return combined;
+  }
+  return fitSectionsToByteBudget([combined], charBudget, byteBudget, "\n");
 }
 async function runReadSlices(input) {
   const corruptedItems = [];
@@ -8628,10 +8871,20 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`
             }
             blocks.push(snippet.join("\n"));
           }
+          const header = `## Slice: ${relPath} (${totalLines} lines)`;
+          const fullText = `${header}
+${blocks.join("\n")}`;
+          if (blocks.length > 1) {
+            return {
+              kind: "slice",
+              header,
+              blocks,
+              fullText
+            };
+          }
           return {
             kind: "static",
-            fullText: `## Slice: ${relPath} (${totalLines} lines)
-${blocks.join("\n")}`
+            fullText
           };
         } catch (err) {
           return {
@@ -8675,6 +8928,14 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
       return packOutlineToBudget(
         entry.header,
         entry.symbols,
+        charBudgets[idx],
+        byteBudgets[idx]
+      );
+    }
+    if (entry.kind === "slice" && entry.blocks.length > 1 && (charSizes[idx] > charBudgets[idx] || byteSizes[idx] > byteBudgets[idx])) {
+      return packSliceBlocksToBudget(
+        entry.header,
+        entry.blocks,
         charBudgets[idx],
         byteBudgets[idx]
       );
