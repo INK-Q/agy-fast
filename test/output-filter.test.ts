@@ -647,4 +647,88 @@ describe("output-filter", () => {
     });
     assert.equal(unknownEmpty.bodyText, "Exited with code unknown");
   });
+
+  it("folds pytest, unittest, and cargo nextest PASS lines even with error-domain test names while anchoring real failures", () => {
+    // 1. pytest -v: passing tests containing "error"/"invalid"/"timeout" fold cleanly and never steal head anchor from FAILED
+    const pytestLines = [
+      ...Array.from(
+        { length: 25 },
+        (_, i) =>
+          `tests/test_auth.py::TestAuth::test_invalid_error_timeout_${i}[case ${i}] PASSED [${String((i + 1) * 3).padStart(3)}%]`,
+      ),
+      "tests/test_db.py::test_connection_pool FAILED [ 96%]",
+      "E       AssertionError: REAL_PYTEST_ROOT_CAUSE expected 200 == 503",
+      ...Array.from(
+        { length: 35 },
+        (_, i) => `tests/test_db.py:${i + 20}: in helper_frame_${i} ${"x".repeat(28)}`,
+      ),
+      "1 failed, 25 passed in 1.42s",
+    ];
+    const pytestFullMeta = formatCompactCommandOutputWithMeta({
+      stdout: pytestLines.join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 4000,
+    });
+    assert.equal(pytestFullMeta.collapsedLines, 25);
+    assert.match(pytestFullMeta.text, /collapsed 25 build\/pass lines/);
+    assert.match(pytestFullMeta.text, /REAL_PYTEST_ROOT_CAUSE/);
+
+    const pytestMeta = formatCompactCommandOutputWithMeta({
+      stdout: pytestLines.join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 900,
+    });
+    assert.equal(pytestMeta.collapsedLines, 25);
+    assert.doesNotMatch(pytestMeta.text, /test_invalid_error_timeout_/);
+    assert.match(pytestMeta.text, /tests\/test_db\.py::test_connection_pool FAILED/);
+    assert.match(pytestMeta.text, /REAL_PYTEST_ROOT_CAUSE/);
+    assert.match(pytestMeta.text, /1 failed, 25 passed/);
+
+    // 2. Python unittest -v and cargo nextest PASS lines fold cleanly while preserving real FAIL / ERROR verdicts
+    const mixedRunnerLines = [
+      ...Array.from(
+        { length: 8 },
+        (_, i) => `test_invalid_error_case_${i} (tests.test_api.ApiTest) ... ok`,
+      ),
+      "test_broken_endpoint (tests.test_api.ApiTest) ... FAIL",
+      "AssertionError: UNITTEST_REAL_FAILURE",
+      ...Array.from(
+        { length: 8 },
+        (_, i) => `        PASS [   0.01${i}s] ( ${i + 1}/20) my-crate::net test_timeout_error_${i}`,
+      ),
+      "        FAIL [   0.092s] (10/20) my-crate::net test_real_packet_loss",
+      ...Array.from({ length: 15 }, (_, i) => `summary tail line ${i}`),
+    ];
+    const mixedMeta = formatCompactCommandOutputWithMeta({
+      stdout: mixedRunnerLines.join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2400,
+    });
+    assert.equal(mixedMeta.collapsedLines, 16);
+    assert.match(mixedMeta.text, /test_broken_endpoint \(tests\.test_api\.ApiTest\) \.\.\. FAIL/);
+    assert.match(mixedMeta.text, /UNITTEST_REAL_FAILURE/);
+    assert.match(mixedMeta.text, /FAIL \[   0\.092s\] \(10\/20\) my-crate::net test_real_packet_loss/);
+
+    // 3. Linear-time ReDoS check on 60K-char adversarial pytest-like line without PASSED suffix
+    const start = performance.now();
+    const advMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        `tests/a.py::${"x".repeat(60_000)}`,
+        `PASS [${" ".repeat(60_000)}`,
+        ...Array.from({ length: 16 }, (_, i) => `tail ${i}`),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 1000,
+    });
+    assert.ok(performance.now() - start < 500);
+    assert.ok(advMeta.text.length <= 1000);
+  });
 });
