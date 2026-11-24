@@ -854,4 +854,99 @@ describe("session-start hook", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
+
+  it("reuses subdir dirents, prioritizes source subdirs, skips GNU Make ::= vars, and detects modern manifests", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-manifest-opt-"));
+    try {
+      // 1. Root Makefile with GNU Make `::=` / `:::=` / `:?=` variables alongside real `:` and `::` targets
+      await fs.writeFile(
+        path.join(dir, "Makefile"),
+        [
+          "CC := clang",
+          "CXX ::= clang++",
+          "LD :::= lld",
+          "OPT :?= -O2",
+          ".PHONY: build test clean",
+          "build: src",
+          "\t@echo building",
+          "clean::",
+          "\t@rm -rf out",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(dir, "CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.20)\nproject(FastEngine LANGUAGES CXX)\n",
+        "utf8",
+      );
+
+      // 2. 10 alphabetically earlier non-priority subdirs + priority `server/` & `web/` subdirs
+      // Without priority sorting, `.slice(0, 8)` would drop `server/` and `web/` completely.
+      for (const name of [
+        "aaa-notes",
+        "bbb-charts",
+        "ccc-data",
+        "ddd-deploy",
+        "eee-infra",
+        "fff-k8s",
+        "ggg-ops",
+        "hhh-proto",
+        "iii-schemas",
+        "jjj-tools",
+      ]) {
+        await fs.mkdir(path.join(dir, name), { recursive: true });
+        await fs.writeFile(path.join(dir, name, "README.md"), "# filler\n", "utf8");
+      }
+      await fs.mkdir(path.join(dir, "server"), { recursive: true });
+      await fs.writeFile(
+        path.join(dir, "server", "deno.json"),
+        '{"tasks":{"dev":"deno run main.ts"}}\n',
+        "utf8",
+      );
+      await fs.mkdir(path.join(dir, "web"), { recursive: true });
+      await fs.writeFile(
+        path.join(dir, "web", "package.json"),
+        JSON.stringify({ name: "priority-web", scripts: { dev: "vite" } }),
+        "utf8",
+      );
+
+      // Track fs.readdir calls per subdir to ensure tree + manifest share a single readdir per subdir
+      const readdirCounts = new Map<string, number>();
+      const origReaddir = fs.readdir;
+      (fs as unknown as { readdir: typeof fs.readdir }).readdir = (async (
+        target: Parameters<typeof fs.readdir>[0],
+        ...rest: unknown[]
+      ) => {
+        const key = path.resolve(String(target));
+        readdirCounts.set(key, (readdirCounts.get(key) ?? 0) + 1);
+        return (origReaddir as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }) as typeof fs.readdir;
+
+      let snap: string | null = null;
+      try {
+        snap = await buildWorkspaceSnapshot(dir);
+      } finally {
+        (fs as unknown as { readdir: typeof fs.readdir }).readdir = origReaddir;
+      }
+
+      assert.ok(snap);
+      assert.match(snap, /Makefile targets: build, clean/);
+      assert.doesNotMatch(snap, /Makefile targets:[^\n]*\b(?:CC|CXX|LD|OPT)\b/);
+      assert.match(snap, /CMakeLists\.txt \(FastEngine, cmake\)/);
+      assert.match(snap, /server\/deno\.json \(deno\)/);
+      assert.match(snap, /web\/package\.json \(priority-web\) scripts: dev/);
+      assert.equal(
+        readdirCounts.get(path.resolve(dir, "server")),
+        1,
+        "Expected server/ to be readdir'd at most once (shared between tree and manifest scan)",
+      );
+      assert.equal(
+        readdirCounts.get(path.resolve(dir, "web")),
+        1,
+        "Expected web/ to be readdir'd at most once (shared between tree and manifest scan)",
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });
