@@ -681,6 +681,127 @@ describe("installer", () => {
       );
       const backToLazy = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
       assert.equal(backToLazy.mcpServers.fast.tools, undefined);
+
+      // 5. `doctor` discovers bundled IDE ripgrep via AGY_FAST_IDE_ROOT, honors AGY_FAST_DISABLE_BUNDLED_RG=1,
+      //    and prioritizes explicit AGY_FAST_RG_PATH (including custom basenames like rg-14) over PATH rg
+      const fakeIdeRoot = path.join(modeHome, "fake-ide");
+      const rgBinName = process.platform === "win32" ? "rg.exe" : "rg";
+      const fakeRgPath = path.join(
+        fakeIdeRoot,
+        process.platform === "darwin" ? "Resources" : "resources",
+        "app",
+        "node_modules",
+        "@vscode",
+        "ripgrep",
+        "bin",
+        rgBinName,
+      );
+      await fs.mkdir(path.dirname(fakeRgPath), { recursive: true });
+      if (process.platform === "win32") {
+        await fs.copyFile(process.execPath, fakeRgPath);
+      } else {
+        await fs.writeFile(fakeRgPath, "#!/bin/sh\necho 'ripgrep 14.0.0'\n", { mode: 0o755 });
+      }
+      const makeCleanPathEnv = (extra: Record<string, string | undefined>): NodeJS.ProcessEnv => {
+        const res: NodeJS.ProcessEnv = { ...env };
+        for (const k of Object.keys(res)) {
+          if (k.toLowerCase() === "path") delete res[k];
+        }
+        res.PATH = path.dirname(process.execPath);
+        for (const [k, v] of Object.entries(extra)) {
+          if (v === undefined) delete res[k];
+          else res[k] = v;
+        }
+        return res;
+      };
+      const bundledDocOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "doctor", "--no-acp"],
+        { env: makeCleanPathEnv({ AGY_FAST_IDE_ROOT: fakeIdeRoot }), encoding: "utf8" },
+      );
+      assert.match(bundledDocOut, /available via IDE bundle/);
+
+      const disabledBundleOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "doctor", "--no-acp"],
+        {
+          env: makeCleanPathEnv({
+            AGY_FAST_IDE_ROOT: fakeIdeRoot,
+            AGY_FAST_DISABLE_BUNDLED_RG: "1",
+          }),
+          encoding: "utf8",
+        },
+      );
+      assert.match(disabledBundleOut, /ripgrep \(rg\): not found/);
+
+      const customRgBin = path.join(modeHome, process.platform === "win32" ? "rg-14.exe" : "rg-14");
+      if (process.platform === "win32") {
+        await fs.copyFile(process.execPath, customRgBin);
+      } else {
+        await fs.writeFile(customRgBin, "#!/bin/sh\necho 'ripgrep 14.1.0'\n", { mode: 0o755 });
+      }
+      const explicitRgOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "doctor", "--no-acp"],
+        { env: makeCleanPathEnv({ AGY_FAST_RG_PATH: customRgBin }), encoding: "utf8" },
+      );
+      assert.match(explicitRgOut, /available via AGY_FAST_RG_PATH/);
+
+      // 6. `update --check --channel main --repo ...` must NOT persist channel/repoUrl into config.json
+      const updaterCfgPath = path.join(modeHome, ".gemini", "cache", "agy-fast", "config.json");
+      const beforeCheckCfg = JSON.parse(await fs.readFile(updaterCfgPath, "utf8")) as Record<string, unknown>;
+      try {
+        execFileSync(
+          process.execPath,
+          [
+            INSTALL_SCRIPT,
+            "update",
+            "--check",
+            "--channel",
+            "main",
+            "--repo",
+            "file:///nonexistent-agy-fast-repo",
+            "--target",
+            pluginDir,
+          ],
+          { env, encoding: "utf8", stdio: "pipe" },
+        );
+      } catch {
+        // Expected failure on nonexistent repo URL
+      }
+      const afterCheckCfg = JSON.parse(await fs.readFile(updaterCfgPath, "utf8")) as Record<string, unknown>;
+      assert.equal(afterCheckCfg.channel, beforeCheckCfg.channel);
+      assert.equal(afterCheckCfg.repoUrl, beforeCheckCfg.repoUrl);
+
+      // 7. Non-check `update` that exits with `skipped-*` (e.g. `skipped-locked`) must ALSO NOT persist channel/repoUrl
+      const lockPath = path.join(modeHome, ".gemini", "cache", "agy-fast", "update.lock");
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: process.pid, token: "active-test-lock", createdAt: new Date().toISOString() }),
+        "utf8",
+      );
+      try {
+        const lockedOut = execFileSync(
+          process.execPath,
+          [
+            INSTALL_SCRIPT,
+            "update",
+            "--channel",
+            "main",
+            "--repo",
+            "file:///nonexistent-agy-fast-repo",
+            "--target",
+            pluginDir,
+          ],
+          { env, encoding: "utf8" },
+        );
+        assert.match(lockedOut, /already in progress/i);
+      } finally {
+        await fs.rm(lockPath, { force: true });
+      }
+      const afterSkippedCfg = JSON.parse(await fs.readFile(updaterCfgPath, "utf8")) as Record<string, unknown>;
+      assert.equal(afterSkippedCfg.channel, beforeCheckCfg.channel);
+      assert.equal(afterSkippedCfg.repoUrl, beforeCheckCfg.repoUrl);
     } finally {
       await fs.rm(modeHome, { recursive: true, force: true });
     }

@@ -8,12 +8,14 @@ import { fileURLToPath } from "node:url";
 
 // src/utils/updater-core.ts
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs } from "node:fs";
-import os from "node:os";
+import { promises as fs2 } from "node:fs";
+import os2 from "node:os";
 import path2 from "node:path";
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
@@ -196,15 +198,89 @@ function hasDefinedEnvKey(env, key, platform) {
   }
   return false;
 }
-function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
-  const result = { ...baseEnv };
-  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+function withNonInteractiveGitEnv(baseEnv, platform = process.platform) {
+  const effectiveBase = baseEnv === void 0 || baseEnv === process.env ? buildSpawnEnv(process.env, platform) : baseEnv;
+  const result = { ...effectiveBase };
+  if (!hasDefinedEnvKey(effectiveBase, "GIT_TERMINAL_PROMPT", platform)) {
     result.GIT_TERMINAL_PROMPT = "0";
   }
-  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+  if (!hasDefinedEnvKey(effectiveBase, "GCM_INTERACTIVE", platform)) {
     result.GCM_INTERACTIVE = "never";
   }
   return result;
+}
+function getHomeDirSafe(env = process.env, platform = process.platform) {
+  try {
+    if (platform === "win32") {
+      const driveHome = env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : "";
+      return env.USERPROFILE || driveHome || env.HOME || os.homedir();
+    }
+    return env.HOME || env.USERPROFILE || os.homedir();
+  } catch {
+    return "";
+  }
+}
+function getEnvPathKeyAndValue(env) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  return { key, value: env[key] ?? "" };
+}
+var cachedEnrichedPathKey = null;
+var cachedEnrichedPathValue = null;
+function buildEnrichedPath(env = process.env, platform = process.platform) {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  if (rawPath.trim() === "") return rawPath;
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = `${platform}|${rawPath}|${home}|${process.execPath}`;
+  if (cachedEnrichedPathKey === cacheKey && cachedEnrichedPathValue !== null) {
+    return cachedEnrichedPathValue;
+  }
+  const delim = platform === "win32" ? ";" : ":";
+  const existing = rawPath.split(delim).filter(Boolean);
+  const compareNorm = (p) => {
+    const cleaned = p.trim().replace(/^"+|"+$/g, "").trim();
+    if (!cleaned) return "";
+    return platform === "win32" || platform === "darwin" ? path.resolve(cleaned).toLowerCase() : path.resolve(cleaned);
+  };
+  const seen = new Set(existing.map(compareNorm).filter(Boolean));
+  const result = [...existing];
+  const addDir = (dir) => {
+    if (!dir) return;
+    const norm = compareNorm(dir);
+    if (!norm || seen.has(norm)) return;
+    try {
+      if (!fs.statSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
+    seen.add(norm);
+    result.push(dir);
+  };
+  addDir(path.dirname(process.execPath));
+  if (platform !== "win32") {
+    for (const stdDir of [
+      home ? path.join(home, ".local", "bin") : "",
+      home ? path.join(home, ".cargo", "bin") : "",
+      home ? path.join(home, ".volta", "bin") : "",
+      home ? path.join(home, ".bun", "bin") : "",
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin"
+    ]) {
+      addDir(stdDir);
+    }
+  }
+  cachedEnrichedPathKey = cacheKey;
+  cachedEnrichedPathValue = result.join(delim);
+  return cachedEnrichedPathValue;
+}
+function buildSpawnEnv(env, platform = process.platform) {
+  const { key: pathKey, value: current } = getEnvPathKeyAndValue(env);
+  if (current.trim() === "") {
+    return env;
+  }
+  const enriched = buildEnrichedPath(env, platform);
+  if (enriched === current) return env;
+  return { ...env, [pathKey]: enriched };
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -227,7 +303,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         detached,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? process.env
+        env: options.env !== void 0 ? options.env : buildSpawnEnv(process.env)
       });
     } catch (err) {
       resolve({
@@ -356,9 +432,9 @@ function getHomeDir(env = process.env, platform = process.platform) {
     if (driveHome) return driveHome;
     const home = env.HOME?.trim();
     if (home) return home;
-    return os.homedir();
+    return os2.homedir();
   }
-  return env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os2.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
@@ -431,7 +507,7 @@ function parseUpdateChannel(raw) {
 }
 async function readJsonFile(filePath) {
   try {
-    const raw = await fs.readFile(filePath, "utf8");
+    const raw = await fs2.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
@@ -442,17 +518,17 @@ async function readJsonFile(filePath) {
 }
 var tmpWriteSeq = 0;
 async function writeJsonAtomically(filePath, data) {
-  await fs.mkdir(path2.dirname(filePath), { recursive: true });
+  await fs2.mkdir(path2.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
-  await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+  await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
-    await fs.rename(tmpPath, filePath);
+    await fs2.rename(tmpPath, filePath);
   } catch {
     try {
-      await fs.copyFile(tmpPath, filePath);
+      await fs2.copyFile(tmpPath, filePath);
     } finally {
-      await fs.rm(tmpPath, { force: true }).catch(() => {
+      await fs2.rm(tmpPath, { force: true }).catch(() => {
       });
     }
   }
@@ -564,7 +640,7 @@ async function readInstalledVersion(pluginDir) {
 }
 async function pathExists(p) {
   try {
-    await fs.access(p);
+    await fs2.access(p);
     return true;
   } catch {
     return false;
@@ -573,7 +649,7 @@ async function pathExists(p) {
 async function detectInstallKind(pluginDir) {
   const resolved = path2.resolve(pluginDir);
   try {
-    const lst = await fs.lstat(resolved);
+    const lst = await fs2.lstat(resolved);
     if (lst.isSymbolicLink()) return "symlink";
   } catch {
     return "copied";
@@ -654,7 +730,7 @@ async function fetchLatestRemoteVersion(opts) {
     const tagsRes = await execBinaryAsync(
       "git",
       ["ls-remote", "--tags", "--refs", "--", safeRepoUrl],
-      { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
+      { cwd: os2.tmpdir(), timeoutMs, env: gitEnv }
     );
     if (!tagsRes.error && !tagsRes.timedOut && tagsRes.exitCode === 0) {
       const latest = pickLatestSemverTag(tagsRes.stdout);
@@ -763,7 +839,7 @@ async function fetchLatestRemoteVersion(opts) {
     const headRes = await execBinaryAsync(
       "git",
       ["ls-remote", "--", safeRepoUrl, "refs/heads/main", "HEAD"],
-      { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
+      { cwd: os2.tmpdir(), timeoutMs, env: gitEnv }
     );
     if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
       const entries = headRes.stdout.trim().split(/\r?\n/).map((line) => line.trim().split(/\s+/)).filter((parts) => parts.length >= 2 && Boolean(parts[0]));
@@ -889,7 +965,7 @@ ${listMsg}
   return { ok: true, version: manifest.version };
 }
 async function syncRuntimeFilesAtomically(srcRoot, dstRoot) {
-  await fs.mkdir(dstRoot, { recursive: true });
+  await fs2.mkdir(dstRoot, { recursive: true });
   const runtimeWithoutManifest = UPDATER_RUNTIME_FILES.filter((rel) => rel !== "plugin.json");
   const toCopy = [...runtimeWithoutManifest];
   for (const opt of UPDATER_OPTIONAL_FILES) {
@@ -902,22 +978,22 @@ async function syncRuntimeFilesAtomically(srcRoot, dstRoot) {
   for (const rel of toCopy) {
     const src = path2.join(srcRoot, rel);
     const dst = path2.join(dstRoot, rel);
-    await fs.mkdir(path2.dirname(dst), { recursive: true });
+    await fs2.mkdir(path2.dirname(dst), { recursive: true });
     const tmp = `${dst}.agy-tmp.${process.pid}.${seq++}`;
     try {
-      await fs.copyFile(src, tmp);
+      await fs2.copyFile(src, tmp);
     } catch (err) {
-      await fs.rm(tmp, { force: true }).catch(() => {
+      await fs2.rm(tmp, { force: true }).catch(() => {
       });
       throw err;
     }
     try {
-      await fs.rename(tmp, dst);
+      await fs2.rename(tmp, dst);
     } catch {
       try {
-        await fs.copyFile(tmp, dst);
+        await fs2.copyFile(tmp, dst);
       } finally {
-        await fs.rm(tmp, { force: true }).catch(() => {
+        await fs2.rm(tmp, { force: true }).catch(() => {
         });
       }
     }
@@ -933,11 +1009,11 @@ function isProcessDead(pid) {
   }
 }
 async function acquireUpdateLock(lockPath) {
-  await fs.mkdir(path2.dirname(lockPath), { recursive: true });
+  await fs2.mkdir(path2.dirname(lockPath), { recursive: true });
   const token = `${process.pid}-${Date.now()}-${++tmpWriteSeq}-${Math.random().toString(36).slice(2, 10)}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const handle = await fs.open(lockPath, "wx");
+      const handle = await fs2.open(lockPath, "wx");
       try {
         await handle.writeFile(
           JSON.stringify({ pid: process.pid, token, createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
@@ -951,7 +1027,7 @@ async function acquireUpdateLock(lockPath) {
       const code = err?.code;
       if (code !== "EEXIST") return null;
       try {
-        const st = await fs.stat(lockPath);
+        const st = await fs2.stat(lockPath);
         let stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
         if (!stale) {
           const info = await readJsonFile(lockPath);
@@ -962,8 +1038,8 @@ async function acquireUpdateLock(lockPath) {
         if (stale) {
           const claimedPath = `${lockPath}.stale.${process.pid}.${++tmpWriteSeq}`;
           try {
-            await fs.rename(lockPath, claimedPath);
-            await fs.rm(claimedPath, { force: true }).catch(() => {
+            await fs2.rename(lockPath, claimedPath);
+            await fs2.rm(claimedPath, { force: true }).catch(() => {
             });
           } catch {
           }
@@ -981,7 +1057,7 @@ async function releaseUpdateLock(lockPath, token) {
   try {
     const info = await readJsonFile(lockPath);
     if (info?.token === token) {
-      await fs.rm(lockPath, { force: true });
+      await fs2.rm(lockPath, { force: true });
     }
   } catch {
   }
@@ -1097,7 +1173,7 @@ async function runPluginUpdate(opts) {
       paths.cacheDir,
       `staging-${process.pid}-${Date.now()}`
     );
-    await fs.mkdir(paths.cacheDir, { recursive: true });
+    await fs2.mkdir(paths.cacheDir, { recursive: true });
     const gitEnv = withNonInteractiveGitEnv(env);
     const safeRepoUrl = validateRepoUrl(repoUrl);
     const cloneArgs = remote.ref === "HEAD" ? ["clone", "--depth", "1", "--", safeRepoUrl, stagingDir] : ["clone", "--depth", "1", "--branch", remote.ref, "--", safeRepoUrl, stagingDir];
@@ -1221,7 +1297,7 @@ async function runPluginUpdate(opts) {
     };
   } finally {
     if (stagingDir) {
-      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {
+      await fs2.rm(stagingDir, { recursive: true, force: true }).catch(() => {
       });
     }
     await releaseUpdateLock(paths.lockFile, lockToken);

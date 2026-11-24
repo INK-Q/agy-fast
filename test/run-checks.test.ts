@@ -1,16 +1,22 @@
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
 import {
+  buildEnrichedPath,
   buildPowerShellUtf8Command,
   decodeProcessOutput,
   execBinaryAsync,
   formatPowerShellCommand,
+  getBundledRipgrepCandidates,
   needsPowerShellOnWindows,
   parseWindowsCodePage,
+  resetEnrichedPathCache,
+  resetRipgrepCache,
   resetWindowsShellCache,
+  resolveRipgrepBinary,
   resolveWindowsPowerShell,
   unwrapTrivialWindowsPowerShellCommand,
   withNonInteractiveGitEnv,
@@ -861,6 +867,191 @@ describe("run_checks", () => {
       assert.equal(sigRes.isError, false);
       assert.match(sigRes.text, /FAIL \(SIGKILL - possible OOM\)/);
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
+    }
+  });
+
+  it("resolves ripgrep binary directly without mutating caller-isolated child PATH", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-rg-resolve-"));
+    try {
+      const pathDir = path.join(tmp, "path-bin");
+      const ideRoot = path.join(tmp, "fake-ide");
+      const fakeHome = path.join(tmp, "fake-home");
+      const localBin = path.join(fakeHome, ".local", "bin");
+      const minimalDir = path.join(tmp, "minimal-bin");
+      await fs.mkdir(pathDir, { recursive: true });
+      await fs.mkdir(localBin, { recursive: true });
+      await fs.mkdir(minimalDir, { recursive: true });
+
+      const rgName = process.platform === "win32" ? "rg.exe" : "rg";
+      const pathRg = path.join(pathDir, rgName);
+      const customRg = path.join(tmp, process.platform === "win32" ? "rg-14.exe" : "rg-14");
+      const bundledRg = path.join(
+        ideRoot,
+        process.platform === "darwin" ? "Resources" : "resources",
+        "app",
+        "node_modules",
+        "@vscode",
+        "ripgrep",
+        "bin",
+        rgName,
+      );
+      await fs.mkdir(path.dirname(bundledRg), { recursive: true });
+      for (const f of [pathRg, customRg, bundledRg]) {
+        if (process.platform === "win32") {
+          await fs.copyFile(process.execPath, f);
+        } else {
+          await fs.writeFile(f, "#!/bin/sh\necho 'ripgrep 14.0.0'\n", { mode: 0o755 });
+        }
+      }
+
+      resetRipgrepCache();
+      resetEnrichedPathCache();
+
+      // 0. On macOS (darwin), Resources/ candidates MUST precede resources/ candidates per root
+      const darwinCands = getBundledRipgrepCandidates(
+        "darwin",
+        { AGY_FAST_IDE_ROOT: "/tmp/fake-ide" },
+        "/Users/tester",
+      );
+      const firstRootCands = darwinCands.filter((c) => c.startsWith("/tmp/fake-ide/"));
+      assert.equal(firstRootCands.length, 4);
+      assert.ok(firstRootCands[0]!.startsWith("/tmp/fake-ide/Resources/"));
+      assert.ok(firstRootCands[1]!.startsWith("/tmp/fake-ide/Resources/"));
+      assert.ok(firstRootCands[2]!.startsWith("/tmp/fake-ide/resources/"));
+      assert.ok(firstRootCands[3]!.startsWith("/tmp/fake-ide/resources/"));
+      const appRootCands = darwinCands.filter((c) =>
+        c.startsWith("/Applications/Antigravity IDE.app/Contents/"),
+      );
+      assert.equal(appRootCands.length, 4);
+      assert.ok(appRootCands[0]!.includes("/Contents/Resources/"));
+      assert.ok(appRootCands[2]!.includes("/Contents/resources/"));
+
+      // 1. AGY_FAST_RG_PATH overrides an rg already on PATH AND supports custom basenames (rg-14)
+      assert.equal(
+        resolveRipgrepBinary({ PATH: pathDir, AGY_FAST_RG_PATH: customRg, HOME: fakeHome, USERPROFILE: fakeHome }),
+        path.resolve(customRg),
+      );
+
+      // 1b. Quoted PATH entries (common on Windows, e.g. `"C:\Program Files\rg"`) are stripped before lookup
+      assert.equal(
+        resolveRipgrepBinary({ PATH: `"${pathDir}"`, HOME: fakeHome, USERPROFILE: fakeHome }),
+        pathRg,
+      );
+
+      // 2. Empty PATH="" preserves isolated pure-Node fallback when AGY_FAST_RG_PATH is unset
+      assert.equal(
+        resolveRipgrepBinary({ PATH: "", AGY_FAST_IDE_ROOT: ideRoot, HOME: fakeHome, USERPROFILE: fakeHome }),
+        null,
+      );
+
+      // 3. Falls back to bundled IDE rg when PATH lacks rg, and respects AGY_FAST_DISABLE_BUNDLED_RG=1
+      assert.equal(
+        resolveRipgrepBinary({
+          PATH: path.dirname(process.execPath),
+          AGY_FAST_IDE_ROOT: ideRoot,
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+        }),
+        bundledRg,
+      );
+      assert.equal(
+        resolveRipgrepBinary({
+          PATH: path.dirname(process.execPath),
+          AGY_FAST_IDE_ROOT: ideRoot,
+          AGY_FAST_DISABLE_BUNDLED_RG: "1",
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+        }),
+        null,
+      );
+
+      // 4. buildEnrichedPath respects passed env.HOME and never leaks IDE bundle dir into global PATH
+      const enriched = buildEnrichedPath({
+        PATH: pathDir,
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,
+        AGY_FAST_IDE_ROOT: ideRoot,
+      });
+      assert.ok(!enriched.includes(path.dirname(bundledRg)), "IDE bundle dir must not leak into global PATH");
+      if (process.platform !== "win32") {
+        assert.ok(enriched.split(":").includes(localBin), "Expected passed env.HOME/.local/bin in enriched PATH");
+      }
+
+      // 5. Explicit caller options.env.PATH is NOT mutated by spawnAndCollect
+      const isolatedPath = path.dirname(process.execPath);
+      const childPathRes = await execBinaryAsync(
+        process.execPath,
+        ["-e", "console.log(process.env.PATH || process.env.Path || '')"],
+        { cwd: tmp, timeoutMs: 3000, env: { PATH: isolatedPath } },
+      );
+      assert.equal(childPathRes.exitCode, 0);
+      assert.equal(childPathRes.stdout.trim(), isolatedPath);
+
+      // 6. withNonInteractiveGitEnv() with no args enriches GUI process.env PATH,
+      //    while explicit isolated baseEnv is preserved untouched
+      const savedPathEntries = Object.keys(process.env)
+        .filter((k) => k.toUpperCase() === "PATH")
+        .map((k) => [k, process.env[k]] as const);
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      const prevGitPrompt = process.env.GIT_TERMINAL_PROMPT;
+      const prevGcmInteractive = process.env.GCM_INTERACTIVE;
+      try {
+        for (const [k] of savedPathEntries) delete process.env[k];
+        delete process.env.GIT_TERMINAL_PROMPT;
+        delete process.env.GCM_INTERACTIVE;
+        process.env.PATH = minimalDir;
+        process.env.HOME = fakeHome;
+        process.env.USERPROFILE = fakeHome;
+        resetEnrichedPathCache();
+
+        const guiGitEnv = withNonInteractiveGitEnv();
+        assert.equal(guiGitEnv.GIT_TERMINAL_PROMPT, "0");
+        assert.equal(guiGitEnv.GCM_INTERACTIVE, "never");
+        const delim = process.platform === "win32" ? ";" : ":";
+        const guiPathParts = (guiGitEnv.PATH || guiGitEnv.Path || "").split(delim);
+        assert.ok(
+          guiPathParts.includes(path.dirname(process.execPath)),
+          "Expected no-arg withNonInteractiveGitEnv() to enrich stripped GUI PATH via buildSpawnEnv",
+        );
+        if (process.platform !== "win32") {
+          assert.ok(
+            guiPathParts.includes(localBin),
+            "Expected no-arg withNonInteractiveGitEnv() to include HOME/.local/bin",
+          );
+        }
+
+        const isolatedEmptyEnv = withNonInteractiveGitEnv({ PATH: "" });
+        assert.equal(isolatedEmptyEnv.PATH, "");
+        assert.equal(isolatedEmptyEnv.GIT_TERMINAL_PROMPT, "0");
+        assert.equal(isolatedEmptyEnv.GCM_INTERACTIVE, "never");
+
+        const isolatedCustomEnv = withNonInteractiveGitEnv({
+          PATH: minimalDir,
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+        });
+        assert.equal(isolatedCustomEnv.PATH, minimalDir);
+      } finally {
+        for (const k of Object.keys(process.env)) {
+          if (k.toUpperCase() === "PATH") delete process.env[k];
+        }
+        for (const [k, v] of savedPathEntries) {
+          if (v !== undefined) process.env[k] = v;
+        }
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevGitPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+        else process.env.GIT_TERMINAL_PROMPT = prevGitPrompt;
+        if (prevGcmInteractive === undefined) delete process.env.GCM_INTERACTIVE;
+        else process.env.GCM_INTERACTIVE = prevGcmInteractive;
+        resetEnrichedPathCache();
+      }
+    } finally {
+      resetRipgrepCache();
+      await fs.rm(tmp, { recursive: true, force: true });
     }
   });
 });

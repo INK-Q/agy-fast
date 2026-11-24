@@ -245,12 +245,10 @@ export class McpStdioServer {
         // Ignore malformed or non-local file: URIs
       }
     }
-    if (paths.length > 0) {
-      try {
-        this.onWorkspaceRoots?.(paths);
-      } catch {
-        // Never crash the MCP server if a client-reported root is inaccessible
-      }
+    try {
+      this.onWorkspaceRoots?.(paths);
+    } catch {
+      // Never crash the MCP server if a client-reported root is inaccessible
     }
   }
 
