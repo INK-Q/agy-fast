@@ -1365,4 +1365,50 @@ describe("read_slices", () => {
     assert.match(outlineRes.text, /L26-L35 \[file\] docs\/old\.md -> docs\/new\.md \[renamed\]/);
     assert.match(outlineRes.text, /L36-L37 \[file\] assets\/logo\.png \[binary\]/);
   });
+
+  it("enriches unlabeled HTML semantic blocks with aria-label or first heading text without leaking across nesting", () => {
+    const deckHtml = [
+      "<!doctype html>", // 1
+      "<html>", // 2
+      "<body>", // 3
+      "  <main>", // 4 (outer main has no direct heading -> stays <main>)
+      '    <section class="slide">', // 5
+      '      <div class="header"><h2>Part I &amp; <code>Core</code> Architecture</h2></div>', // 6
+      "      <h3>Secondary subtitle ignored</h3>", // 7
+      "    </section>", // 8
+      '    <section aria-label="Pricing Breakdown">', // 9 (explicit aria-label preserved over inner h2)
+      "      <h2>Should not overwrite aria-label</h2>", // 10
+      "    </section>", // 11
+      '    <section id="metrics">', // 12 (explicit id preserved over inner h2)
+      "      <h2>Metrics</h2>", // 13
+      "    </section>", // 14
+      "    <article>", // 15
+      "      <h2></h2>", // 16 (empty heading skipped)
+      "      <h3>\n        Benchmark Results &mdash; Phase 2\n      </h3>", // 17-19
+      '      <div aria-label="Latency Chart"></div>', // 20
+      "    </article>", // 21
+      "  </main>", // 22
+      "</body>", // 23
+      "</html>", // 24
+    ].join("\n");
+
+    const syms = extractSymbols("slides.html", deckHtml);
+    assert.deepEqual(
+      syms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<body>:3-23:d0",
+        "<main>:4-22:d1",
+        '<section "Part I & Core Architecture">:5-8:d2',
+        '<section aria-label="Pricing Breakdown">:9-11:d2',
+        "<section #metrics>:12-14:d2",
+        '<article "Benchmark Results — Phase 2">:15-21:d2',
+        '<div aria-label="Latency Chart">:20-20:d2',
+      ],
+    );
+
+    // Linear-time guard for unclosed heading floods
+    const t0 = performance.now();
+    extractSymbols("unclosed-headings.html", "<section>" + "<h2>".repeat(50_000) + "</section>");
+    assert.ok(performance.now() - t0 < 1000);
+  });
 });

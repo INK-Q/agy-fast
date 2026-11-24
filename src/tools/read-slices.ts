@@ -1591,6 +1591,21 @@ const HTML_SEMANTIC_TAGS = new Set([
   "template",
 ]);
 
+const HTML_HEADING_LABEL_TAGS = new Set([
+  "section",
+  "article",
+  "aside",
+  "nav",
+  "dialog",
+  "header",
+  "footer",
+  "main",
+]);
+
+const HTML_HEADING_TAGS = new Set(["h1", "h2", "h3", "h4"]);
+const MAX_HEADING_SCAN = 512;
+const MAX_HEADING_LABEL_CHARS = 48;
+
 const HTML_CONTAINER_TAGS = new Set([
   "div",
   "ul",
@@ -1833,11 +1848,36 @@ function formatHtmlTagLabel(
   if (roleVal) {
     return `<${displayTag} role="${roleVal}">`;
   }
+  const ariaLabelVal = normalizeInlineAttr(parsed.attrs.get("aria-label"), 40);
+  if (ariaLabelVal) {
+    return `<${displayTag} aria-label="${ariaLabelVal}">`;
+  }
   const slotVal = normalizeInlineAttr(parsed.vueSlot, 36);
   if (lowerTag === "template" && slotVal) {
     return `<template #${slotVal}>`;
   }
   return `<${displayTag}>`;
+}
+
+function cleanHtmlHeadingText(rawInner: string): string {
+  const withoutComments = rawInner.replace(/<!--[\s\S]*?-->/g, " ");
+  const withoutTags = withoutComments.replace(/<[^>]*>/g, " ");
+  const decoded = withoutTags
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "'")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&middot;/gi, "·")
+    .replace(/&mdash;/gi, "—")
+    .replace(/&ndash;/gi, "–")
+    .replace(/"/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!decoded || !/[A-Za-z0-9\u4e00-\u9fff]/.test(decoded)) return "";
+  if (decoded.length <= MAX_HEADING_LABEL_CHARS) return decoded;
+  return `${sliceSafeChars(decoded, MAX_HEADING_LABEL_CHARS - 3).trimEnd()}...`;
 }
 
 function isJsScriptType(typeAttr: string | undefined): boolean {
@@ -1921,17 +1961,21 @@ function extractTemplateSymbols(
     startLine: number;
     emitted: boolean;
     symbol?: SymbolEntry;
+    needsHeadingLabel?: boolean;
   }
 
   const symbols: SymbolEntry[] = [];
   const stack: OpenFrame[] = [];
+  const emittedStack: OpenFrame[] = [];
   const stackTagCounts = new Map<string, number>();
   const pushFrame = (frame: OpenFrame) => {
     stack.push(frame);
+    if (frame.emitted) emittedStack.push(frame);
     stackTagCounts.set(frame.lowerTag, (stackTagCounts.get(frame.lowerTag) ?? 0) + 1);
   };
   const popFrame = (): OpenFrame => {
     const frame = stack.pop()!;
+    if (frame.emitted) emittedStack.pop();
     const prev = stackTagCounts.get(frame.lowerTag) ?? 0;
     if (prev <= 1) stackTagCounts.delete(frame.lowerTag);
     else stackTagCounts.set(frame.lowerTag, prev - 1);
@@ -1946,6 +1990,7 @@ function extractTemplateSymbols(
   let noCloseBodyBrace = false;
   let noCloseMustache = false;
   const noCloseRawSkip = new Set<string>();
+  let nextCloseTagPos = text.indexOf("</");
   let nextRightBrace = text.indexOf("}");
   let nextCloseMustache = mode === "vue" ? text.indexOf("}}") : -1;
 
@@ -2405,6 +2450,29 @@ function extractTemplateSymbols(
       continue;
     }
 
+    if (!selfClosing && nextCloseTagPos >= 0 && HTML_HEADING_TAGS.has(lowerTag)) {
+      const enclosingEmitted = emittedStack[emittedStack.length - 1];
+      if (enclosingEmitted?.needsHeadingLabel && enclosingEmitted.symbol) {
+        if (nextCloseTagPos < gtPos + 1) {
+          nextCloseTagPos = text.indexOf("</", gtPos + 1);
+        }
+        if (nextCloseTagPos >= 0 && nextCloseTagPos < gtPos + 1 + MAX_HEADING_SCAN) {
+          const scanEnd = Math.min(len, gtPos + 1 + MAX_HEADING_SCAN);
+          const windowText = text.slice(gtPos + 1, scanEnd);
+          const closeMatch = new RegExp(`</${lowerTag}\\s*>`, "i").exec(windowText);
+          if (closeMatch) {
+            const headingText = cleanHtmlHeadingText(
+              windowText.slice(0, closeMatch.index),
+            );
+            if (headingText) {
+              enclosingEmitted.symbol.name = `<${enclosingEmitted.lowerTag} "${headingText}">`;
+              enclosingEmitted.needsHeadingLabel = false;
+            }
+          }
+        }
+      }
+    }
+
     const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
     const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
     const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
@@ -2412,13 +2480,15 @@ function extractTemplateSymbols(
 
     let shouldEmit = false;
     let emittedSymbol: SymbolEntry | undefined;
+    let needsHeadingLabel = false;
 
     if (isComponent || isSemantic || isContainer) {
       const parsed = parseHtmlAttrs(rawAttrSlice);
       const hasIdentityAttr =
         Boolean(parsed.attrs.get("id")?.trim()) ||
         Boolean(parsed.attrs.get("data-testid")?.trim()) ||
-        Boolean(parsed.attrs.get("role")?.trim());
+        Boolean(parsed.attrs.get("role")?.trim()) ||
+        Boolean(parsed.attrs.get("aria-label")?.trim());
       // Skip nested Vue control-flow `<template v-if>` / `<template v-for>` wrappers
       // while keeping root `<template>`, named slots (`#header`), and identified templates.
       const keepTemplate =
@@ -2446,6 +2516,10 @@ function extractTemplateSymbols(
           endLine: openEndLine,
           depth: Math.min(MAX_HTML_DEPTH, emittedCount),
         };
+        needsHeadingLabel =
+          !selfClosing &&
+          HTML_HEADING_LABEL_TAGS.has(lowerTag) &&
+          !hasIdentityAttr;
         symbols.push(emittedSymbol);
       }
     }
@@ -2456,6 +2530,7 @@ function extractTemplateSymbols(
         startLine,
         emitted: shouldEmit,
         symbol: emittedSymbol,
+        needsHeadingLabel,
       });
       if (shouldEmit) emittedCount++;
     }
