@@ -1,19 +1,28 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
 import {
   buildPowerShellUtf8Command,
+  buildWindowsCmdBatchScript,
+  buildWindowsPowerShellArgs,
   decodeProcessOutput,
+  encodePowerShellCommand,
   execBinaryAsync,
   formatPowerShellCommand,
+  hasEmbeddedNewline,
+  hasNewlineInsideQuotes,
   needsPowerShellOnWindows,
+  parseDirectMultilineCommand,
+  parseExplicitMultilinePowerShell,
   parseWindowsCodePage,
   resetWindowsShellCache,
   resolveWindowsPowerShell,
   unwrapTrivialWindowsPowerShellCommand,
   withNonInteractiveGitEnv,
+  wrapMultilinePowerShellFailFast,
 } from "../src/utils/exec-utils.js";
 import {
   fitSectionsToByteBudget,
@@ -286,6 +295,204 @@ describe("run_checks", () => {
     assert.match(wrapped, /try \{ \[Console\]::OutputEncoding = \[System\.Text\.UTF8Encoding\]::new\(\$false\) \} catch \{\}/);
     assert.match(wrapped, /\$OutputEncoding = \[System\.Text\.UTF8Encoding\]::new\(\$false\)/);
     assert.ok(wrapped.endsWith('Write-Output "ok"'));
+
+    // Single-line commands with leading/trailing newlines stay single-line & do NOT route to PowerShell
+    assert.equal(hasEmbeddedNewline("npm run build && npm test\n"), false);
+    assert.equal(hasEmbeddedNewline("\r\nset NODE_ENV=test && npm test\r\n"), false);
+    assert.equal(hasEmbeddedNewline("cd packages/web\nnpm test"), true);
+    assert.equal(needsPowerShellOnWindows("npm run build && npm test\n"), false);
+    assert.equal(needsPowerShellOnWindows("set NODE_ENV=test && npm test\r\n"), false);
+    assert.equal(needsPowerShellOnWindows("echo %USERPROFILE%\n"), false);
+    assert.equal(needsPowerShellOnWindows("npm test 2>nul\n"), false);
+    // Non-PowerShell multiline commands stay cmd-routed (not PowerShell) so PS 5.1 `&&`/`set`/`%VAR%` stay intact
+    assert.equal(needsPowerShellOnWindows("cd packages/web\nnpm run build && npm test"), false);
+    assert.equal(needsPowerShellOnWindows("set FOO=bar\necho %FOO%"), false);
+    assert.equal(needsPowerShellOnWindows('node -e "\nconst x = 42;\nconsole.log(`val=${x}`);\n"'), false);
+    // Genuine PowerShell multiline scripts still detect PowerShell
+    assert.equal(needsPowerShellOnWindows('$x = 1\nWrite-Output $x'), true);
+
+    // formatPowerShellCommand: trailing horizontal spaces before \n must NOT turn string literals into `&` calls
+    assert.equal(
+      formatPowerShellCommand('"hello"\nWrite-Output "world"'),
+      '"hello"\nWrite-Output "world"',
+    );
+    assert.equal(
+      formatPowerShellCommand('"hello" \nWrite-Output "world"'),
+      '"hello" \nWrite-Output "world"',
+    );
+    // Quoted executable on line 1 AND line 2+ both get `& ` prepended
+    assert.equal(
+      formatPowerShellCommand(
+        '"C:\\Program Files\\nodejs\\node.exe" -e "console.log(1)"\n"C:\\Program Files\\nodejs\\node.exe" -e "console.log(2)"',
+      ),
+      '& "C:\\Program Files\\nodejs\\node.exe" -e "console.log(1)"\n& "C:\\Program Files\\nodejs\\node.exe" -e "console.log(2)"',
+    );
+    // Multiline UTF-8 prefix separates with \n and wraps fail-fast checks (capturing $? before `if`)
+    const mlPs = buildPowerShellUtf8Command('$x = 1\nWrite-Output $x');
+    assert.match(mlPs, /\$OutputEncoding = \[System\.Text\.UTF8Encoding\]::new\(\$false\);\n\$global:LASTEXITCODE = \$null/);
+    assert.match(mlPs, /\$__agyOk = \$\?; \$__agyCode = \$LASTEXITCODE; if \(\$__agyCode -and \$__agyCode -ne 0\)/);
+    // Quoted cmdlet args (`Set-Location "dir"`) and `-e "..."` MUST get fail-fast checks (not treated as continuations)
+    const cmdletWrapped = wrapMultilinePowerShellFailFast(
+      'Set-Location "missing"\n& "node.exe" -e "process.exit(3)"\nWrite-Output "after"',
+    );
+    assert.match(cmdletWrapped, /Set-Location "missing"\n\$__agyOk = \$\?;/);
+    assert.match(cmdletWrapped, /& "node\.exe" -e "process\.exit\(3\)"\n\$__agyOk = \$\?;/);
+    // Block continuations (`else`, Allman `{`, leading `|`, multiline `=` / `+`) stay intact inside wrapMultilinePowerShellFailFast
+    const ifElseWrapped = wrapMultilinePowerShellFailFast('if ($true) {\n  Write-Output "a"\n}\nelse {\n  Write-Output "b"\n}');
+    assert.doesNotMatch(ifElseWrapped, /\}\n\$__agyOk = \$\?[\s\S]*\nelse/);
+
+    const allmanIfWrapped = wrapMultilinePowerShellFailFast('if ($true)\n{\n  Write-Output "a"\n}');
+    assert.doesNotMatch(allmanIfWrapped, /if \(\$true\)\n\$__agyOk = \$\?/);
+    assert.match(allmanIfWrapped, /\}\n\$__agyOk = \$\?;/);
+
+    const allmanTryCatchWrapped = wrapMultilinePowerShellFailFast(
+      'try\n{\n  Write-Output "t"\n}\ncatch\n{\n  Write-Output "c"\n}',
+    );
+    assert.doesNotMatch(allmanTryCatchWrapped, /try\n\$__agyOk = \$\?/);
+    assert.doesNotMatch(allmanTryCatchWrapped, /\}\n\$__agyOk = \$\?[\s\S]*\ncatch/);
+    assert.doesNotMatch(allmanTryCatchWrapped, /catch\n\$__agyOk = \$\?/);
+    assert.match(allmanTryCatchWrapped, /\}\n\$__agyOk = \$\?;[^\n]*$/);
+
+    const mlAssignWrapped = wrapMultilinePowerShellFailFast('$x =\n  "hello"\nWrite-Output $x');
+    assert.doesNotMatch(mlAssignWrapped, /\$x =\n\$__agyOk = \$\?/);
+    assert.match(mlAssignWrapped, /"hello"\n\$__agyOk = \$\?;/);
+    assert.match(mlAssignWrapped, /Write-Output \$x\n\$__agyOk = \$\?;/);
+
+    const mlPlusWrapped = wrapMultilinePowerShellFailFast('$x = "a" +\n  "b"\nWrite-Output $x');
+    assert.doesNotMatch(mlPlusWrapped, /\$x = "a" \+\n\$__agyOk = \$\?/);
+    assert.match(mlPlusWrapped, /"b"\n\$__agyOk = \$\?;/);
+
+    const leadingPipeWrapped = wrapMultilinePowerShellFailFast(
+      "Get-ChildItem\n  | Select-Object -First 1",
+    );
+    assert.doesNotMatch(leadingPipeWrapped, /Get-ChildItem\n\$__agyOk = \$\?/);
+    assert.match(leadingPipeWrapped, /\| Select-Object -First 1\n\$__agyOk = \$\?;/);
+
+    const incrementWrapped = wrapMultilinePowerShellFailFast("$i = 0\n$i++\nWrite-Output $i");
+    assert.match(incrementWrapped, /\$i\+\+\n\$__agyOk = \$\?;/);
+
+    // UTF-16LE Base64 -EncodedCommand encoding and single-line vs multiline args
+    const psMultiline = '$x = 1\nWrite-Output $x';
+    assert.equal(Buffer.from(encodePowerShellCommand(psMultiline), "base64").toString("utf16le"), psMultiline);
+    const singleArgs = buildWindowsPowerShellArgs('Write-Output "ok"');
+    assert.deepEqual(singleArgs.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+    const multiArgs = buildWindowsPowerShellArgs(psMultiline);
+    assert.deepEqual(multiArgs.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    assert.equal(
+      Buffer.from(multiArgs[4]!, "base64").toString("utf16le"),
+      buildPowerShellUtf8Command(psMultiline),
+    );
+
+    // Explicit multiline pwsh/powershell wrapper parsing
+    const explicitParsed = parseExplicitMultilinePowerShell(
+      'pwsh -NoProfile -Command "Write-Output 1\nWrite-Output 2"',
+    );
+    assert.deepEqual(explicitParsed, {
+      bin: "pwsh",
+      flags: ["-NoProfile"],
+      script: "Write-Output 1\nWrite-Output 2",
+    });
+    assert.equal(
+      parseExplicitMultilinePowerShell('pwsh -Command "Write-Output 1\nWrite-Output 2" | findstr 1'),
+      null,
+    );
+
+    // Direct multiline quoted argument parsing preserves backticks, `${x}`, and `\"` verbatim
+    const directMlCmd = 'node -e "\nconst x = 42;\nconsole.log(`val=${x}`);\n"';
+    assert.equal(hasNewlineInsideQuotes(directMlCmd), true);
+    assert.equal(hasNewlineInsideQuotes("cd packages/web\nnpm test"), false);
+    // Contractions, cmd comments (`rem`/`@rem`/`::`), and unclosed single quotes must NOT false-positive
+    assert.equal(hasNewlineInsideQuotes("echo don't fail\nnpm test"), false);
+    assert.equal(hasNewlineInsideQuotes("echo don't fail\necho it's ok"), false);
+    assert.equal(hasNewlineInsideQuotes("echo can't stop\necho foo'bar"), false);
+    assert.equal(hasNewlineInsideQuotes("rem it's fine\nnpm test"), false);
+    assert.equal(hasNewlineInsideQuotes("  @REM 'quoted\nnpm test"), false);
+    assert.equal(hasNewlineInsideQuotes(":: don't touch\nnpm test"), false);
+    assert.equal(hasNewlineInsideQuotes("echo 'unclosed\nnpm test"), false);
+    // Genuine multiline single-quoted and double-quoted args still return true
+    assert.equal(hasNewlineInsideQuotes("node -e 'console.log(1)\nconsole.log(2)'"), true);
+    assert.equal(hasNewlineInsideQuotes("node -e 'a\nb' && echo ok"), true);
+    assert.equal(hasNewlineInsideQuotes("foo --msg='a\nb'"), true);
+    assert.equal(hasNewlineInsideQuotes('echo "a\nb"\necho c'), true);
+
+    assert.deepEqual(parseDirectMultilineCommand(directMlCmd), {
+      bin: "node",
+      args: ["-e", "\nconst x = 42;\nconsole.log(`val=${x}`);\n"],
+    });
+    assert.deepEqual(
+      parseDirectMultilineCommand('node -e "console.log(1)\nconsole.log(2)"'),
+      {
+        bin: "node",
+        args: ["-e", "console.log(1)\nconsole.log(2)"],
+      },
+    );
+    assert.deepEqual(
+      parseDirectMultilineCommand('"C:\\Program Files\\nodejs\\node.exe" -e "a\nb"'),
+      {
+        bin: "C:\\Program Files\\nodejs\\node.exe",
+        args: ["-e", "a\nb"],
+      },
+    );
+    assert.equal(parseDirectMultilineCommand('node -e "\nconsole.log(1)\n" | findstr 1'), null);
+    // Arbitrary .cmd/.bat files must NEVER be spawned with `shell: false` (Node 20.12+/22 EINVAL)
+    assert.equal(parseDirectMultilineCommand('mytool.cmd -e "\nhello\n"'), null);
+    assert.equal(parseDirectMultilineCommand('"C:\\tools\\mytool.bat" -e "\nhello\n"'), null);
+    assert.equal(parseDirectMultilineCommand('MYTOOL.BAT -e "\nhello\n"'), null);
+    assert.equal(parseDirectMultilineCommand('npm -e "\nhello\n"'), null);
+
+    // Fail-fast Windows .cmd batch script generation preserves real %ENV%, doubles stray/format %, and prefixes `call` on .cmd/.bat shims
+    const batch = buildWindowsCmdBatchScript(
+      [
+        "cd packages/web",
+        "set FOO=bar",
+        "echo %FOO% %PATH% %USERPROFILE% %ProgramFiles(x86)% %CommonProgramFiles(x86)% %TEMP% %ERRORLEVEL% %MY_VAR_1%",
+        'git log -n 5 --format="%H %s"',
+        'git log --format="%h - %s (%an)"',
+        'git log --format="%an (%ae)"',
+        "git log -n 1 --format=%H",
+        "echo %%LITERAL%% %20",
+        "npm run build && yarn test",
+        '"C:\\Program Files\\nodejs\\npm.cmd" test',
+        "echo STEP_2",
+        ".\\node_modules\\.bin\\tsc --noEmit",
+        '"C:\\tools\\mytool.bat" arg',
+        "call npm test",
+        'call "C:\\Program Files\\nodejs\\npm.cmd" test',
+        "@npm test",
+        '@"C:\\Program Files\\nodejs\\npm.cmd" test',
+        "@call npm test",
+        "node script.js",
+        '"C:\\Program Files\\nodejs\\node.exe" script.js',
+        "@rem it's a comment",
+      ].join("\n"),
+    );
+    assert.match(batch, /^@echo off\r\n/);
+    assert.match(batch, /cd packages\/web\r\nif %ERRORLEVEL% neq 0 exit \/b %ERRORLEVEL%/);
+    assert.match(
+      batch,
+      /echo %FOO% %PATH% %USERPROFILE% %ProgramFiles\(x86\)% %CommonProgramFiles\(x86\)% %TEMP% %ERRORLEVEL% %MY_VAR_1%\r\n/,
+    );
+    assert.match(batch, /git log -n 5 --format="%%H %%s"\r\n/);
+    assert.match(batch, /git log --format="%%h - %%s \(%%an\)"\r\n/);
+    assert.match(batch, /git log --format="%%an \(%%ae\)"\r\n/);
+    assert.match(batch, /git log -n 1 --format=%%H\r\n/);
+    assert.match(batch, /echo %%LITERAL%% %%20\r\n/);
+    assert.match(batch, /call npm run build && call yarn test\r\n/);
+    assert.match(
+      batch,
+      /call "C:\\Program Files\\nodejs\\npm\.cmd" test\r\nif %ERRORLEVEL% neq 0 exit \/b %ERRORLEVEL%\r\necho STEP_2\r\n/,
+    );
+    assert.match(batch, /call \.\\node_modules\\\.bin\\tsc --noEmit\r\n/);
+    assert.match(batch, /call "C:\\tools\\mytool\.bat" arg\r\n/);
+    assert.match(batch, /\r\ncall npm test\r\n/);
+    assert.match(batch, /\r\ncall "C:\\Program Files\\nodejs\\npm\.cmd" test\r\n/);
+    assert.doesNotMatch(batch, /call call /i);
+    assert.match(batch, /\r\n@call npm test\r\n/);
+    assert.match(batch, /\r\n@call "C:\\Program Files\\nodejs\\npm\.cmd" test\r\n/);
+    assert.doesNotMatch(batch, /@call call /i);
+    assert.match(batch, /\r\nnode script\.js\r\n/);
+    assert.match(batch, /\r\n"C:\\Program Files\\nodejs\\node\.exe" script\.js\r\n/);
+    assert.match(batch, /\r\n@rem it's a comment\r\n$/);
   });
 
   it("resolves pwsh -> powershell.exe -> null fallback chain and caches probe results", async () => {
@@ -747,6 +954,198 @@ describe("run_checks", () => {
         else process.env.SystemRoot = savedSystemRoot;
         if (savedWindir === undefined) delete process.env.WINDIR;
         else process.env.WINDIR = savedWindir;
+      }
+    });
+
+    it("executes trailing-newline single-line cmd, fail-fast multiline cmd/PS, direct multiline node -e, and explicit pwsh across pwsh 7 AND Windows PowerShell 5.1", async () => {
+      // 1. Single-line cmd idioms with trailing \n stay in cmd.exe (works even on PS 5.1-only hosts)
+      const trailingSingle = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "win-trailing-nl-cmd",
+            command: `set AGY_TR_TEST=ok_val && ${nodeBin} -e "console.log(process.env.AGY_TR_TEST)" 2>nul\n`,
+          },
+        ],
+      });
+      assert.equal(trailingSingle.isError, false);
+      assert.match(trailingSingle.text, /Checks: 1\/1 passed/);
+      assert.match(trailingSingle.text, /ok_val/);
+
+      // 2. Non-PowerShell multiline commands: native cmd batch fail-fast + direct multiline node -e with backticks/${x}
+      const cmdMultiline = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "win-cmd-ml-ok",
+            command: "set AGY_ML=batch_ok\necho STEP_1_%AGY_ML%\necho STEP_2_OK",
+          },
+          {
+            name: "win-cmd-ml-fail-line1",
+            command: `${nodeBin} -e "process.exitCode = 2"\n${nodeBin} -e "console.log('MASK_' + 'FAIL')"`,
+          },
+          {
+            name: "win-cmd-ml-cd-missing",
+            command: `cd agy_nonexistent_dir_xyz_999\n${nodeBin} -e "console.log('BAD_' + 'CD_RAN')"`,
+          },
+          {
+            name: "win-cmd-ml-percents-and-apostrophe",
+            command: [
+              "rem it's fine",
+              ":: don't touch",
+              "echo don't fail",
+              `${nodeBin} -e "console.log('FMT:' + process.argv[1] + '|' + process.argv[2])" "%H %s" "%h - %s (%an)"`,
+            ].join("\n"),
+          },
+          {
+            name: "win-direct-node-backticks",
+            command: `${nodeBin} -e "\nconst x = 42;\nconsole.log(\`val=\${x}\`);\n"`,
+          },
+          {
+            name: "win-explicit-ps-ml",
+            command: 'powershell.exe -NoProfile -Command "Write-Output EXP_PS_1\nWrite-Output EXP_PS_2"',
+          },
+        ],
+      });
+      assert.equal(cmdMultiline.isError, false);
+      assert.match(cmdMultiline.text, /Checks: 4\/6 passed, 2 failed/);
+      assert.match(cmdMultiline.text, /STEP_1_batch_ok/);
+      assert.match(cmdMultiline.text, /STEP_2_OK/);
+      assert.match(cmdMultiline.text, /FAIL \(exit 2\)\].*win-cmd-ml-fail-line1/);
+      assert.doesNotMatch(cmdMultiline.text, /MASK_FAIL/);
+      assert.doesNotMatch(cmdMultiline.text, /BAD_CD_RAN/);
+      assert.match(cmdMultiline.text, /don't fail/);
+      assert.match(cmdMultiline.text, /FMT:%H %s\|%h - %s \(%an\)/);
+      assert.match(cmdMultiline.text, /val=42/);
+      assert.match(cmdMultiline.text, /EXP_PS_1/);
+      assert.match(cmdMultiline.text, /EXP_PS_2/);
+
+      // 2b. Quoted .bat shim on line 1 must return control to line 2 via auto-prefixed `call`
+      const tmpBatDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-bat test-"));
+      try {
+        const batPath = path.join(tmpBatDir, "helper.bat");
+        await fs.writeFile(batPath, "@echo off\r\necho BAT_STEP_1_OK\r\n", "utf8");
+        const batRes = await runChecks({
+          outputMode: "full",
+          commands: [
+            {
+              name: "win-quoted-bat-shim",
+              command: `"${batPath}"\necho BAT_STEP_2_OK`,
+            },
+          ],
+        });
+        assert.equal(batRes.isError, false);
+        assert.match(batRes.text, /Checks: 1\/1 passed/, batRes.text);
+        assert.match(batRes.text, /BAT_STEP_1_OK/, batRes.text);
+        assert.match(batRes.text, /BAT_STEP_2_OK/, batRes.text);
+      } finally {
+        await fs.rm(tmpBatDir, { recursive: true, force: true });
+      }
+
+      // 3. Multiline PowerShell scripts tested explicitly under BOTH default (pwsh 7) AND Windows PowerShell 5.1 (powershell.exe)
+      const runPsSuite = async (label: string, supportsLeadingPipe: boolean) => {
+        const commands = [
+          {
+            name: `${label}-ok-with-stderr-warn`,
+            command: `$v = "ps_ok"\n${nodeBin} -e "console.error('harmless stderr warn'); process.exitCode = 0"\nWrite-Output "DONE_$v"`,
+          },
+          {
+            name: `${label}-fail-line1-native`,
+            command: `$v = "x"\n${nodeBin} -e "process.exitCode = 3"\nWrite-Output ("NO_RUN_" + "NATIVE")`,
+          },
+          {
+            name: `${label}-fail-line1-cmdlet`,
+            command: `Set-Location "agy_nonexistent_ps_dir_999"\nWrite-Output ("NO_RUN_" + "CMDLET")`,
+          },
+          {
+            name: `${label}-allman-and-continuations`,
+            command: [
+              "if ($true)",
+              "{",
+              '  Write-Output "ALLMAN_IF_OK"',
+              "}",
+              "try",
+              "{",
+              '  Write-Output "ALLMAN_TRY_OK"',
+              "}",
+              "catch",
+              "{",
+              '  Write-Output "ALLMAN_CATCH"',
+              "}",
+              "$a =",
+              '  "ML_ASSIGN_OK"',
+              "Write-Output $a",
+              '$b = "ML_" +',
+              '  "PLUS_OK"',
+              "Write-Output $b",
+            ].join("\n"),
+          },
+        ];
+        if (supportsLeadingPipe) {
+          commands.push({
+            name: `${label}-leading-pipe`,
+            command: "Get-ChildItem\n  | Select-Object -First 1",
+          });
+        }
+        const expectedPass = supportsLeadingPipe ? 3 : 2;
+        const psRes = await runChecks({
+          outputMode: "full",
+          commands,
+        });
+        assert.equal(psRes.isError, false);
+        assert.match(
+          psRes.text,
+          new RegExp(`Checks: ${expectedPass}/${commands.length} passed, 2 failed`),
+          `${label}:\n${psRes.text}`,
+        );
+        assert.match(psRes.text, /DONE_ps_ok/, `${label}:\n${psRes.text}`);
+        assert.match(psRes.text, /ALLMAN_IF_OK/, `${label}:\n${psRes.text}`);
+        assert.match(psRes.text, /ALLMAN_TRY_OK/, `${label}:\n${psRes.text}`);
+        assert.match(psRes.text, /ML_ASSIGN_OK/, `${label}:\n${psRes.text}`);
+        assert.match(psRes.text, /ML_PLUS_OK/, `${label}:\n${psRes.text}`);
+        assert.match(psRes.text, /FAIL \(exit 3\)\]/, `${label}:\n${psRes.text}`);
+        assert.doesNotMatch(psRes.text, /NO_RUN_NATIVE/, `${label}:\n${psRes.text}`);
+        assert.doesNotMatch(psRes.text, /NO_RUN_CMDLET/, `${label}:\n${psRes.text}`);
+      };
+
+      try {
+        // Default probe (pwsh 7 on windows-latest)
+        resetWindowsShellCache();
+        const defaultPs = await resolveWindowsPowerShell();
+        await runPsSuite("pwsh7", defaultPs === "pwsh");
+
+        // Force Windows PowerShell 5.1 (powershell.exe) explicitly
+        resetWindowsShellCache();
+        const ps51 = await resolveWindowsPowerShell(async (bin) => bin === "powershell.exe");
+        assert.equal(ps51, "powershell.exe");
+        await runPsSuite("ps51", false);
+
+        // Oversized (>28 KB UTF-16LE base64) multiline PowerShell script falls back cleanly to temp UTF-8-BOM .ps1
+        const hugeComment = `# ${"x".repeat(12_000)}`;
+        const bigPsRes = await runChecks({
+          outputMode: "full",
+          commands: [
+            {
+              name: "ps51-oversized-file-fallback",
+              command: `${hugeComment}\n$tag = "BIG_PS1_OK"\nWrite-Output $tag`,
+            },
+          ],
+        });
+        assert.equal(bigPsRes.isError, false);
+        assert.match(bigPsRes.text, /Checks: 1\/1 passed/, bigPsRes.text);
+        assert.match(bigPsRes.text, /BIG_PS1_OK/, bigPsRes.text);
+
+        // Unavailable PowerShell on multiline PS script returns explicit error instead of truncating in cmd.exe
+        resetWindowsShellCache();
+        assert.equal(await resolveWindowsPowerShell(async () => false), null);
+        const noPsRes = await runChecks({
+          outputMode: "full",
+          commands: [{ name: "no-ps-ml", command: '$a = 1\nWrite-Output $a' }],
+        });
+        assert.match(noPsRes.text, /ERROR/);
+        assert.match(noPsRes.text, /requires pwsh or powershell\.exe/i);
+      } finally {
+        resetWindowsShellCache();
       }
     });
   }
