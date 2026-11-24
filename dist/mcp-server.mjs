@@ -3122,6 +3122,44 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   Closest match near line ${bestStart + 1} (lines ${from}-${to}):
 ${snippet.join("\n")}`;
 }
+var MAX_AMBIGUOUS_PREVIEWS = 4;
+function formatAmbiguousMatchPreviews(normalizedContent, lineStarts, foundOffsets, targetLength) {
+  const fileLines = normalizedContent.split("\n");
+  const maxLine = normalizedContent.endsWith("\n") && fileLines.length > 1 ? fileLines.length - 1 : fileLines.length;
+  if (maxLine === 0) return "";
+  const fmtLine = (ln) => {
+    const raw = fileLines[ln - 1] ?? "";
+    const text = raw.length > 120 ? `${sliceSafeChars(raw, 117)}...` : raw;
+    return `    ${ln}: ${text}`;
+  };
+  const blocks = [];
+  const limit = Math.min(foundOffsets.length, MAX_AMBIGUOUS_PREVIEWS);
+  for (let i = 0; i < limit; i++) {
+    const offset = foundOffsets[i];
+    const startLine = offsetToLine(lineStarts, offset);
+    const endOffset = targetLength > 0 ? offset + targetLength - 1 : offset;
+    const endLine = Math.min(maxLine, offsetToLine(lineStarts, endOffset));
+    const rangeLabel = startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+    const lines = [];
+    if (startLine > 1) lines.push(fmtLine(startLine - 1));
+    lines.push(fmtLine(startLine));
+    if (endLine > startLine + 1) {
+      const midCount = endLine - startLine - 1;
+      lines.push(`    ... (${midCount} more matched ${midCount === 1 ? "line" : "lines"})`);
+      lines.push(fmtLine(endLine));
+    } else if (endLine === startLine + 1) {
+      lines.push(fmtLine(endLine));
+    }
+    if (endLine < maxLine) lines.push(fmtLine(endLine + 1));
+    blocks.push(`  Match #${i + 1} (${rangeLabel}):
+${lines.join("\n")}`);
+  }
+  if (foundOffsets.length > limit) {
+    blocks.push(`  ... (+${foundOffsets.length - limit} more matches)`);
+  }
+  return `
+${blocks.join("\n")}`;
+}
 function planHunksForContent(normalizedContent, hunks, displayPath) {
   const lineStarts = computeLineStarts(normalizedContent);
   const spans = [];
@@ -3202,8 +3240,14 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     }
     if (foundOffsets.length > 1 && !hunk.replaceAll) {
       const lines = foundOffsets.slice(0, 10).map((o) => formatMatchLineRange(lineStarts, o, normTarget.length, "")).join(", ");
+      const previews = formatAmbiguousMatchPreviews(
+        normalizedContent,
+        lineStarts,
+        foundOffsets,
+        normTarget.length
+      );
       errors.push(
-        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.`
+        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.${previews}`
       );
       continue;
     }
@@ -4577,6 +4621,51 @@ function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
   return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
+function summarizeOmittedDirs(omittedPaths, stripPrefix = "", maxBuckets = 6) {
+  if (omittedPaths.length === 0) return [];
+  const normPrefix = stripPrefix && stripPrefix !== "." && !stripPrefix.startsWith("..") ? stripPrefix.endsWith("/") ? stripPrefix : `${stripPrefix}/` : "";
+  let relPaths = omittedPaths.map((raw) => {
+    const p = toPosixPath(raw).replace(/^\.\//, "");
+    return normPrefix && p.startsWith(normPrefix) ? p.slice(normPrefix.length) : p;
+  });
+  let commonPrefix = "";
+  const maxDescent = 4;
+  for (let depth = 0; depth < maxDescent; depth++) {
+    const dirCounts = /* @__PURE__ */ new Map();
+    let singleDir = null;
+    let allInSingleDir = true;
+    for (const p of relPaths) {
+      const slash = p.indexOf("/");
+      if (slash === -1) {
+        allInSingleDir = false;
+        const rootLabel = commonPrefix || "(root)";
+        dirCounts.set(rootLabel, (dirCounts.get(rootLabel) ?? 0) + 1);
+      } else {
+        const seg = p.slice(0, slash + 1);
+        if (singleDir === null) singleDir = seg;
+        else if (singleDir !== seg) allInSingleDir = false;
+        const label = `${commonPrefix}${seg}`;
+        dirCounts.set(label, (dirCounts.get(label) ?? 0) + 1);
+      }
+    }
+    if (allInSingleDir && singleDir !== null) {
+      const stripped = relPaths.map((p) => p.slice(singleDir.length));
+      if (stripped.some((p) => p.includes("/"))) {
+        commonPrefix += singleDir;
+        relPaths = stripped;
+        continue;
+      }
+    }
+    return [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, maxBuckets).map(([dir, cnt]) => `${dir} (${cnt})`);
+  }
+  const finalCounts = /* @__PURE__ */ new Map();
+  for (const p of relPaths) {
+    const slash = p.indexOf("/");
+    const label = slash === -1 ? commonPrefix || "(root)" : `${commonPrefix}${p.slice(0, slash + 1)}`;
+    finalCounts.set(label, (finalCounts.get(label) ?? 0) + 1);
+  }
+  return [...finalCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, maxBuckets).map(([dir, cnt]) => `${dir} (${cnt})`);
+}
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
@@ -4694,10 +4783,24 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
     files2.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+    const totalFiles = files2.length;
+    const keptFiles = files2.slice(0, maxResults);
+    const summaryPartial = cutShort(res);
+    const summaryTruncated = totalFiles > maxResults || summaryPartial;
+    const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const omittedDirs = totalFiles > maxResults ? summarizeOmittedDirs(
+      files2.slice(maxResults).map((f) => f.file),
+      relPrefix
+    ) : void 0;
     return {
-      files: files2.slice(0, maxResults),
+      files: keptFiles,
       totalMatches: 0,
-      truncated: files2.length > maxResults || cutShort(res)
+      truncated: summaryTruncated,
+      ...summaryTruncated ? {
+        summaryTotalFiles: totalFiles,
+        summaryTotalPartial: summaryPartial,
+        summaryOmittedDirs: omittedDirs
+      } : {}
     };
   }
   const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
@@ -4868,10 +4971,14 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     const lines = [];
     let kept = 0;
     let lastKeptMatchLine = -1;
+    let hitPerFileCap = false;
     for (const line of sorted) {
       if (line.isMatch) {
         if (kept === budget) {
           truncated = true;
+          if (!isFileTarget && !query.multiline && perFileCap < maxResults && budget === perFileCap) {
+            hitPerFileCap = true;
+          }
           if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
             lines.push({ lineNumber: line.lineNumber, text: line.text, isMatch: false });
           }
@@ -4885,7 +4992,11 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       }
     }
     if (kept === 0) continue;
-    files.push({ file: relFile, lines });
+    files.push({
+      file: relFile,
+      lines,
+      ...hitPerFileCap ? { perFileCap } : {}
+    });
     totalMatches += kept;
   }
   return { files, totalMatches, truncated };
@@ -5067,6 +5178,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     };
   };
   const batchSize = 16;
+  const summaryScanCap = Math.max(maxResults + 1, 500);
+  let summaryCapReached = false;
   let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
@@ -5139,7 +5252,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     for (const item of results) {
       if (!item) continue;
       if (summary) {
-        if (files.length === maxResults) {
+        if (files.length >= summaryScanCap) {
+          summaryCapReached = true;
           truncated = true;
           break;
         }
@@ -5159,9 +5273,34 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
         truncated = true;
         break;
       }
-      files.push(buildFileMatches(item.relFile, item.lines, item.matchedLines));
+      const hitPerFileCap = item.fileTruncated && !stat.isFile() && !query.multiline && perFileCap < maxResults && item.matchedLines.length === perFileCap;
+      files.push({
+        ...buildFileMatches(item.relFile, item.lines, item.matchedLines),
+        ...hitPerFileCap ? { perFileCap } : {}
+      });
       totalMatches += item.matchedLines.length;
     }
+  }
+  if (summary) {
+    const totalFiles = files.length;
+    const keptFiles = files.slice(0, maxResults);
+    const summaryPartial = summaryCapReached || discoveryTruncated;
+    const summaryTruncated = totalFiles > maxResults || summaryPartial;
+    const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const omittedDirs = totalFiles > maxResults ? summarizeOmittedDirs(
+      files.slice(maxResults).map((f) => f.file),
+      relPrefix
+    ) : void 0;
+    return {
+      files: keptFiles,
+      totalMatches: 0,
+      truncated: summaryTruncated,
+      ...summaryTruncated ? {
+        summaryTotalFiles: totalFiles,
+        summaryTotalPartial: summaryPartial,
+        summaryOmittedDirs: omittedDirs
+      } : {}
+    };
   }
   return {
     files,
@@ -5210,8 +5349,8 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
-    for (let i = 0; i < sortedFiles.length; i += 32) {
-      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+    for (let i = 0; i < sortedFiles.length; i += 64) {
+      await Promise.all(sortedFiles.slice(i, i + 64).map(async (file) => {
         const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
@@ -5229,20 +5368,15 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
     return `${header}${items.join("\n")}`;
   }
   const omitted = sortedFiles.slice(maxResults);
-  const dirCounts = /* @__PURE__ */ new Map();
-  for (const f of omitted) {
-    const slash = f.indexOf("/");
-    const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
-    dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
-  }
-  const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
+  const topDirs = summarizeOmittedDirs(omitted);
   const totalLabel = walked.truncated ? `${walked.files.length}+` : String(walked.files.length);
+  const partialMtimeNote = sortBy === "mtime" && walked.truncated ? "; mtime order is partial (scan cap reached; narrow 'path' or 'pattern')" : "";
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `
-... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+... [truncated at ${items.length} of ${totalLabel} files${partialMtimeNote}${dirSummary}]`;
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, globScanLimit) {
   const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
@@ -5260,7 +5394,8 @@ ${rel}` : fallback2.emptyMessage;
     }
     return "(no files matched)";
   }
-  const scanLimit = Math.max(maxResults + 1, 2e3);
+  const defaultScanCap = query.sortBy === "mtime" ? 8e3 : 2e3;
+  const scanLimit = globScanLimit !== void 0 && Number.isFinite(globScanLimit) && globScanLimit >= 1 ? Math.trunc(globScanLimit) : Math.max(maxResults + 1, defaultScanCap);
   const walked = await walkFiles(searchRoot, {
     maxFiles: scanLimit,
     includeHidden,
@@ -5477,6 +5612,11 @@ function formatFileMatches(files, totalMatches, truncated) {
       const sep = l.isMatch ? ":" : "-";
       return `  ${l.lineNumber}${sep} ${formatLineSnippet(l)}`;
     });
+    if (fm.perFileCap !== void 0) {
+      lines.push(
+        `  ... (+more matches in this file; per-file cap ${fm.perFileCap} reached \u2014 narrow 'path' to see all)`
+      );
+    }
     blocks.push(`${fm.file}
 ${lines.join("\n")}`);
   }
@@ -5487,10 +5627,17 @@ ${lines.join("\n")}`);
 function measureCost(text) {
   return { chars: text.length, bytes: Buffer.byteLength(text, "utf8") };
 }
-function fileOmissionMarker(omitted) {
-  if (omitted <= 0) return "";
-  return `
+function fileOmissionMarker(omitted, perFileCap) {
+  if (omitted > 0) {
+    return perFileCap !== void 0 ? `
+  ... (+${omitted}+ more matches; per-file cap ${perFileCap})` : `
   ... (+${omitted} more ${omitted === 1 ? "match" : "matches"})`;
+  }
+  if (perFileCap !== void 0) {
+    return `
+  ... (+more matches in this file; per-file cap ${perFileCap})`;
+  }
+  return "";
 }
 function buildTruncatedNotice(shownMatches, totalMatches, shownFiles, totalFiles, maxResultsTruncated, omittedContextOnly) {
   const totalLabel = maxResultsTruncated ? `${totalMatches}+` : `${totalMatches}`;
@@ -5579,6 +5726,7 @@ function formatBudgetedContentSection(params) {
       matchEntries,
       contextEntries,
       firstMatchLine,
+      perFileCap: fm.perFileCap,
       shownMatches: 0,
       selectedContexts: [],
       selectedLineNums: /* @__PURE__ */ new Set()
@@ -5597,7 +5745,7 @@ function formatBudgetedContentSection(params) {
   let allFilesFirstBytes = headerCost.bytes;
   for (const st of states) {
     const first = st.matchEntries[0];
-    const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+    const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
     allFilesFirstChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
     allFilesFirstBytes += st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
   }
@@ -5614,7 +5762,7 @@ function formatBudgetedContentSection(params) {
   if (allFilesFirstChars + allShownInitialNotice.chars <= charBudget && allFilesFirstBytes + allShownInitialNotice.bytes <= byteBudget) {
     for (const st of states) {
       const first = st.matchEntries[0];
-      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
       st.shownMatches = 1;
       st.selectedLineNums.add(first.lineNumber);
       usedChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
@@ -5643,7 +5791,7 @@ function formatBudgetedContentSection(params) {
     const targetOmittedBytes = totalFiles > 1 ? Math.max(minOmittedNotice.bytes, Math.min(220, Math.floor(bodyBytes * 0.25))) : 0;
     const tryAddFirstMatch = (st, reserveChars, reserveBytes) => {
       const first = st.matchEntries[0];
-      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
       const addChars = st.headerCost.chars + first.cost.chars + markerCost.chars;
       const addBytes = st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
       if (usedChars + addChars + worstTruncNotice.chars + reserveChars <= charBudget && usedBytes + addBytes + worstTruncNotice.bytes + reserveBytes <= byteBudget) {
@@ -5665,7 +5813,7 @@ function formatBudgetedContentSection(params) {
         if (tryAddFirstMatch(st, minOmittedNotice.chars, minOmittedNotice.bytes)) {
           break;
         }
-        const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+        const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
         const availLineChars = charBudget - usedChars - st.headerCost.chars - markerCost.chars - worstTruncNotice.chars - minOmittedNotice.chars - 1;
         const availLineBytes = byteBudget - usedBytes - st.headerCost.bytes - markerCost.bytes - worstTruncNotice.bytes - minOmittedNotice.bytes - 1;
         const shrunk = fitShrunkMatchLine(st.firstMatchLine, availLineChars, availLineBytes);
@@ -5707,10 +5855,10 @@ function formatBudgetedContentSection(params) {
         }
         const entry = st.matchEntries[st.shownMatches];
         const prevMarkerCost = measureCost(
-          fileOmissionMarker(st.matchEntries.length - st.shownMatches)
+          fileOmissionMarker(st.matchEntries.length - st.shownMatches, st.perFileCap)
         );
         const nextMarkerCost = measureCost(
-          fileOmissionMarker(st.matchEntries.length - (st.shownMatches + 1))
+          fileOmissionMarker(st.matchEntries.length - (st.shownMatches + 1), st.perFileCap)
         );
         const deltaChars = entry.cost.chars + nextMarkerCost.chars - prevMarkerCost.chars;
         const deltaBytes = entry.cost.bytes + nextMarkerCost.bytes - prevMarkerCost.bytes;
@@ -5824,8 +5972,9 @@ ${st.file}`);
 ${line.formatted}`);
     }
     const omittedInFile = st.matchEntries.length - st.shownMatches;
-    if (omittedInFile > 0) {
-      parts.push(fileOmissionMarker(omittedInFile));
+    const marker = fileOmissionMarker(omittedInFile, st.perFileCap);
+    if (marker) {
+      parts.push(marker);
     }
   }
   const omittedContextOnly = shownFiles === totalFiles && shownMatches === actualTotalMatches && shownContexts < totalContextCount;
@@ -5845,7 +5994,9 @@ ${line.formatted}`);
     const remChars = charBudget - bodySoFar.length - truncCost.chars;
     const remBytes = byteBudget - Buffer.byteLength(bodySoFar, "utf8") - truncCost.bytes;
     const unshown = states.slice(shownFiles);
-    const allItems = unshown.map((st) => `${st.file} (${st.matchEntries.length})`);
+    const allItems = unshown.map(
+      (st) => `${st.file} (${st.matchEntries.length}${st.perFileCap !== void 0 ? "+" : ""})`
+    );
     const allLine = `
 ... [more files: ${allItems.join(", ")}]`;
     if (allLine.length <= remChars && Buffer.byteLength(allLine, "utf8") <= remBytes) {
@@ -5888,7 +6039,7 @@ ${line.formatted}`);
   }
   return null;
 }
-async function executeSingleQuery(query, index, baseCwd, useRg) {
+async function executeSingleQuery(query, index, baseCwd, useRg, options) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
@@ -5917,7 +6068,13 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
 ${out}` };
     }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      const out = await runGlobQuery(
+        query,
+        searchRoot,
+        baseCwd,
+        targetStat.isFile(),
+        options.globScanLimit
+      );
       return { header, text: `${header}
 ${out}` };
     }
@@ -5943,8 +6100,18 @@ ${out}` };
       }
       if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
         const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || "(no matches)";
-        const footer = res.truncated ? `
-... [truncated; showing ${res.files.length} files]` : "";
+        let footer = "";
+        if (res.truncated) {
+          if (res.summaryTotalFiles !== void 0 && res.summaryTotalFiles > res.files.length) {
+            const totalLabel = res.summaryTotalPartial ? `${res.summaryTotalFiles}+` : String(res.summaryTotalFiles);
+            const dirSummary = res.summaryOmittedDirs && res.summaryOmittedDirs.length > 0 ? `; omitted dirs: ${res.summaryOmittedDirs.join(", ")}` : "";
+            footer = `
+... [truncated; showing ${res.files.length} files of ${totalLabel}${dirSummary}]`;
+          } else {
+            footer = `
+... [truncated; showing ${res.files.length} files]`;
+          }
+        }
         return { header, text: `${header}
 ${body}${footer}` };
       }
@@ -6043,7 +6210,7 @@ async function runBatchSearch(input, options = {}) {
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const executed = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, options))
   );
   const separator = "\n\n";
   const rawSections = executed.map((e) => e.text);
