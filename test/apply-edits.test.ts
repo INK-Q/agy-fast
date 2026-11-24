@@ -1912,4 +1912,60 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
+
+  it("includes compact numbered context previews for ambiguous multi-match hunks and bounds preview count", async () => {
+    const ambigFile = path.join(tmpDir, "ambiguous-previews.py");
+    await fs.writeFile(
+      ambigFile,
+      [
+        "def train_step(batch):",
+        "    loss = compute_loss(batch)",
+        "    return loss",
+        "",
+        "def eval_step(batch):",
+        "    loss = compute_loss(batch)",
+        "    return loss.item()",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const res = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "ambiguous-previews.py",
+          hunks: [{ target: "loss = compute_loss(batch)", replacement: "loss = compute_loss(batch, scale=2)" }],
+        },
+      ],
+    });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /matched 2 times \(lines: 2, 6\)/);
+    assert.match(res.text, /Match #1 \(L2\):[\s\S]*1: def train_step\(batch\):[\s\S]*2:     loss = compute_loss\(batch\)[\s\S]*3:     return loss/);
+    assert.match(res.text, /Match #2 \(L6\):[\s\S]*5: def eval_step\(batch\):[\s\S]*6:     loss = compute_loss\(batch\)[\s\S]*7:     return loss\.item\(\)/);
+
+    // Multi-line match folds middle lines cleanly and caps preview blocks at 4 occurrences
+    const manyFile = path.join(tmpDir, "ambiguous-many.ts");
+    const blocks = Array.from({ length: 6 }, (_, i) =>
+      `function fn${i + 1}() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c + ${i + 1};\n}`,
+    ).join("\n\n");
+    await fs.writeFile(manyFile, `${blocks}\n`, "utf8");
+
+    const manyRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "ambiguous-many.ts",
+          hunks: [{ target: "  const a = 1;\n  const b = 2;\n  const c = 3;", replacement: "  const total = 6;" }],
+        },
+      ],
+    });
+    assert.equal(manyRes.isError, true);
+    assert.match(manyRes.text, /matched 6 times/);
+    assert.match(manyRes.text, /Match #1 \(L2-L4\):/);
+    assert.match(manyRes.text, /1 more matched line/);
+    assert.match(manyRes.text, /Match #4 \(L23-L25\):/);
+    assert.doesNotMatch(manyRes.text, /Match #5/);
+    assert.match(manyRes.text, /\.\.\. \(\+2 more matches\)/);
+    assert.ok(Buffer.byteLength(manyRes.text, "utf8") <= 8_800);
+  });
 });

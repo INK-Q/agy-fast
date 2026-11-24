@@ -354,6 +354,61 @@ function findClosestRegionSnippet(
   return `\n  Closest match near line ${bestStart + 1} (lines ${from}-${to}):\n${snippet.join("\n")}`;
 }
 
+const MAX_AMBIGUOUS_PREVIEWS = 4;
+
+/**
+ * Format compact numbered context previews for ambiguous multi-match hunks so
+ * callers can immediately disambiguate occurrences without an extra read turn.
+ */
+function formatAmbiguousMatchPreviews(
+  normalizedContent: string,
+  lineStarts: number[],
+  foundOffsets: number[],
+  targetLength: number,
+): string {
+  const fileLines = normalizedContent.split("\n");
+  const maxLine =
+    normalizedContent.endsWith("\n") && fileLines.length > 1
+      ? fileLines.length - 1
+      : fileLines.length;
+  if (maxLine === 0) return "";
+
+  const fmtLine = (ln: number): string => {
+    const raw = fileLines[ln - 1] ?? "";
+    const text = raw.length > 120 ? `${sliceSafeChars(raw, 117)}...` : raw;
+    return `    ${ln}: ${text}`;
+  };
+
+  const blocks: string[] = [];
+  const limit = Math.min(foundOffsets.length, MAX_AMBIGUOUS_PREVIEWS);
+  for (let i = 0; i < limit; i++) {
+    const offset = foundOffsets[i]!;
+    const startLine = offsetToLine(lineStarts, offset);
+    const endOffset = targetLength > 0 ? offset + targetLength - 1 : offset;
+    const endLine = Math.min(maxLine, offsetToLine(lineStarts, endOffset));
+    const rangeLabel = startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+
+    const lines: string[] = [];
+    if (startLine > 1) lines.push(fmtLine(startLine - 1));
+    lines.push(fmtLine(startLine));
+    if (endLine > startLine + 1) {
+      const midCount = endLine - startLine - 1;
+      lines.push(`    ... (${midCount} more matched ${midCount === 1 ? "line" : "lines"})`);
+      lines.push(fmtLine(endLine));
+    } else if (endLine === startLine + 1) {
+      lines.push(fmtLine(endLine));
+    }
+    if (endLine < maxLine) lines.push(fmtLine(endLine + 1));
+
+    blocks.push(`  Match #${i + 1} (${rangeLabel}):\n${lines.join("\n")}`);
+  }
+
+  if (foundOffsets.length > limit) {
+    blocks.push(`  ... (+${foundOffsets.length - limit} more matches)`);
+  }
+  return `\n${blocks.join("\n")}`;
+}
+
 function planHunksForContent(
   normalizedContent: string,
   hunks: EditHunk[],
@@ -458,8 +513,14 @@ function planHunksForContent(
         .slice(0, 10)
         .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length, ""))
         .join(", ");
+      const previews = formatAmbiguousMatchPreviews(
+        normalizedContent,
+        lineStarts,
+        foundOffsets,
+        normTarget.length,
+      );
       errors.push(
-        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.`,
+        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.${previews}`,
       );
       continue;
     }
