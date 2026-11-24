@@ -863,4 +863,74 @@ describe("run_checks", () => {
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
   });
+
+  it("bounds long/multiline command echoes before water-filling so inline scripts cannot starve sibling output", async () => {
+    const pad = "p".repeat(1900);
+    const makeInlineCmd = (body: string) =>
+      process.platform === "win32"
+        ? `${nodeBin} -e "const _pad = '${pad}'; ${body}"`
+        : `${nodeBin} -e "\nconst _pad = '${pad}';\n${body}\n"`;
+
+    // 1. Full mode: 3 long inline scripts (~2 KB each) whose combined actual stdout is ~3.4 KB
+    // must preserve 100% of every command's stdout without folding away rich sibling output.
+    const fullRes = await runChecks({
+      outputMode: "full",
+      maxChars: 8000,
+      commands: [
+        {
+          name: "rich-out",
+          command: makeInlineCmd(
+            "for (let i = 0; i < 65; i++) console.log('RICH_ROW_' + String(i).padStart(2, '0') + '_' + 'a'.repeat(30)); console.log('RICH_' + 'COMPLETE');",
+          ),
+        },
+        {
+          name: "short-out-a",
+          command: makeInlineCmd("console.log('SHORT_A_' + 'OK');"),
+        },
+        {
+          name: "short-out-b",
+          command: makeInlineCmd("console.log('SHORT_B_' + 'OK');"),
+        },
+      ],
+    });
+    assert.equal(fullRes.isError, false);
+    assert.ok(fullRes.text.length <= 8000);
+    assert.doesNotMatch(fullRes.text, /\[truncated: folded/);
+    assert.match(fullRes.text, /RICH_ROW_00_/);
+    assert.match(fullRes.text, /RICH_ROW_32_/);
+    assert.match(fullRes.text, /RICH_COMPLETE/);
+    assert.match(fullRes.text, /SHORT_A_OK/);
+    assert.match(fullRes.text, /SHORT_B_OK/);
+    // Echoed `$ ...` lines must stay compact and single-line
+    for (const line of fullRes.text.split("\n")) {
+      if (line.startsWith("$ ")) {
+        assert.ok(line.length <= 230, `Echoed command line too long (${line.length}): ${line.slice(0, 80)}`);
+      }
+    }
+
+    // 2. Compact mode FAIL: a failing command with a ~2 KB inline script and tiny error
+    // must not inflate water-fill demand and starve a sibling failing command's error details.
+    const compactRes = await runChecks({
+      outputMode: "compact",
+      maxChars: 2400,
+      commands: [
+        {
+          name: "big-script-tiny-fail",
+          command: makeInlineCmd("console.error('Error: TINY_' + 'CAUSE'); process.exit(1);"),
+        },
+        {
+          name: "short-cmd-rich-fail",
+          command: `${nodeBin} -e "for (let i = 0; i < 30; i++) console.error('Error: SIBLING_ERR_' + String(i).padStart(2, '0') + '_' + 'e'.repeat(32)); process.exit(1);"`,
+        },
+      ],
+    });
+    assert.equal(compactRes.isError, false);
+    assert.ok(compactRes.text.length <= 2400);
+    assert.match(compactRes.text, /Error: TINY_CAUSE/);
+    const siblingMatches = compactRes.text.match(/SIBLING_ERR_\d{2}_/g) ?? [];
+    assert.ok(
+      siblingMatches.length >= 25,
+      `Expected sibling fail to keep >=25 error lines, got ${siblingMatches.length}`,
+    );
+  });
 });
