@@ -4187,6 +4187,27 @@ function rankFuzzyPaths(query, candidates, maxResults) {
 }
 
 // src/tools/batch-search.ts
+var DIR_SCAN_MAX_FILE_BYTES = 2 * 1024 * 1024;
+var EXPLICIT_FILE_MAX_BYTES = 20 * 1024 * 1024;
+function formatByteLimitLabel(bytes) {
+  if (bytes >= 1024 * 1024) {
+    const mib = bytes / (1024 * 1024);
+    return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
+  }
+  if (bytes >= 1024) {
+    const kib = bytes / 1024;
+    return `${Number.isInteger(kib) ? kib : kib.toFixed(1)} KiB`;
+  }
+  return `${bytes} B`;
+}
+function formatSkippedOversizeReason(sizeBytes, limitBytes) {
+  const limitLabel = formatByteLimitLabel(limitBytes);
+  let sizeLabel = formatByteLimitLabel(sizeBytes);
+  if (sizeLabel === limitLabel) {
+    sizeLabel = `${sizeBytes} B`;
+  }
+  return `target file exceeds ${limitLabel} search limit (${sizeLabel})`;
+}
 var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "status",
   "diff",
@@ -4577,7 +4598,7 @@ function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
   return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
-async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
+async function runTextOrRegexWithRg(query, searchRoot, baseCwd, explicitFileMaxBytes = EXPLICIT_FILE_MAX_BYTES) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
@@ -4587,9 +4608,6 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
-      return { files: [], totalMatches: 0, truncated: false };
-    }
-    if (fileStat.size > 2 * 1024 * 1024) {
       return { files: [], totalMatches: 0, truncated: false };
     }
     if (query.glob) {
@@ -4602,19 +4620,33 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
+    if (fileStat.size > explicitFileMaxBytes) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: false,
+        skippedReason: formatSkippedOversizeReason(fileStat.size, explicitFileMaxBytes)
+      };
+    }
     const fh = await fs4.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
       if (isLikelyBinary(head.subarray(0, bytesRead))) {
-        return { files: [], totalMatches: 0, truncated: false };
+        return {
+          files: [],
+          totalMatches: 0,
+          truncated: false,
+          skippedReason: "target file appears to be binary"
+        };
       }
     } finally {
       await fh.close();
     }
   }
   const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
-  const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  const maxFileSizeArg = isFileTarget ? String(explicitFileMaxBytes) : "2M";
+  const args = ["--no-config", "--no-messages", "--max-filesize", maxFileSizeArg, "--crlf"];
   if (query.multiline) args.push("--multiline", "--multiline-dotall");
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
@@ -4694,10 +4726,19 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
     files2.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+    const truncatedSummary = files2.length > maxResults || cutShort(res);
+    if (files2.length === 0 && cutShort(res) && res.stdout.length > 0) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: true,
+        skippedReason: "match output exceeded 2 MiB capture buffer or timed out before a complete match could be parsed"
+      };
+    }
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files2.length > maxResults || cutShort(res)
+      truncated: truncatedSummary
     };
   }
   const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
@@ -4766,6 +4807,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   }
   if (currentChunk.length > 0) rgChunks.push(currentChunk);
   const byFile = /* @__PURE__ */ new Map();
+  let pass2CutShortWithOutput = false;
   for (const chunk of rgChunks) {
     const res = await runRg(
       [
@@ -4779,7 +4821,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       ],
       { allowPartialError: !isFileTarget }
     );
-    if (cutShort(res)) truncated = true;
+    if (cutShort(res)) {
+      truncated = true;
+      if (res.stdout.length > 0) pass2CutShortWithOutput = true;
+    }
     for (const rawLine of res.stdout.split("\n")) {
       if (!rawLine.trim()) continue;
       let ev;
@@ -4888,6 +4933,14 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     files.push({ file: relFile, lines });
     totalMatches += kept;
   }
+  if (files.length === 0 && pass2CutShortWithOutput) {
+    return {
+      files,
+      totalMatches,
+      truncated,
+      skippedReason: "match output exceeded 2 MiB capture buffer or timed out before a complete match could be parsed"
+    };
+  }
   return { files, totalMatches, truncated };
 }
 function* multilineMatches(content, regex) {
@@ -4934,7 +4987,7 @@ function multilineMatchLines(content, regex, limit) {
   }
   return results;
 }
-async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
+async function runTextOrRegexWithNode(query, searchRoot, baseCwd, explicitFileMaxBytes = EXPLICIT_FILE_MAX_BYTES) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
@@ -4978,11 +5031,38 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     return globNegated ? !matched : matched;
   };
   const stat = await fs4.stat(searchRoot);
-  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
+  const isFileTarget = stat.isFile();
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
-  if (stat.isFile()) {
+  if (isFileTarget) {
     const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
+    if (!globMatchesFile(relPosix)) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (stat.size > explicitFileMaxBytes) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: false,
+        skippedReason: formatSkippedOversizeReason(stat.size, explicitFileMaxBytes)
+      };
+    }
+    const fh = await fs4.open(searchRoot, "r");
+    try {
+      const head = Buffer.alloc(Math.min(stat.size, 8192));
+      const { bytesRead } = await fh.read(head, 0, head.length, 0);
+      if (isLikelyBinary(head.subarray(0, bytesRead))) {
+        return {
+          files: [],
+          totalMatches: 0,
+          truncated: false,
+          skippedReason: "target file appears to be binary"
+        };
+      }
+    } finally {
+      await fh.close();
+    }
+    targetFiles = [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }];
   } else {
     const includeHidden = Boolean(
       rawGlob && !globNegated && patternTargetsHidden(rawGlob)
@@ -5073,8 +5153,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
+          const maxFileBytes = isFileTarget ? explicitFileMaxBytes : DIR_SCAN_MAX_FILE_BYTES;
           const st = await fs4.stat(absFile);
-          if (st.size > 2 * 1024 * 1024) return null;
+          if (st.size > maxFileBytes) return null;
           const buf = await fs4.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
@@ -5888,7 +5969,7 @@ ${line.formatted}`);
   }
   return null;
 }
-async function executeSingleQuery(query, index, baseCwd, useRg) {
+async function executeSingleQuery(query, index, baseCwd, useRg, explicitFileMaxBytes) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
@@ -5930,16 +6011,20 @@ ${out}` };
       let res;
       if (useRg) {
         try {
-          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
+          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd, explicitFileMaxBytes);
         } catch (err) {
           if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
-            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, explicitFileMaxBytes);
           } else {
             throw err;
           }
         }
       } else {
-        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, explicitFileMaxBytes);
+      }
+      if (res.skippedReason) {
+        return { header, text: `${header}
+(skipped: ${res.skippedReason})` };
       }
       if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
         const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || "(no matches)";
@@ -6041,9 +6126,10 @@ async function runBatchSearch(input, options = {}) {
   const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
+  const explicitFileMaxBytes = options.explicitFileMaxBytes !== void 0 && Number.isFinite(options.explicitFileMaxBytes) && options.explicitFileMaxBytes >= 1 ? Math.trunc(options.explicitFileMaxBytes) : EXPLICIT_FILE_MAX_BYTES;
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const executed = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, explicitFileMaxBytes))
   );
   const separator = "\n\n";
   const rawSections = executed.map((e) => e.text);
@@ -7405,6 +7491,19 @@ var HTML_SEMANTIC_TAGS = /* @__PURE__ */ new Set([
   "dialog",
   "template"
 ]);
+var HTML_HEADING_LABEL_TAGS = /* @__PURE__ */ new Set([
+  "section",
+  "article",
+  "aside",
+  "nav",
+  "dialog",
+  "header",
+  "footer",
+  "main"
+]);
+var HTML_HEADING_TAGS = /* @__PURE__ */ new Set(["h1", "h2", "h3", "h4"]);
+var MAX_HEADING_SCAN = 512;
+var MAX_HEADING_LABEL_CHARS = 48;
 var HTML_CONTAINER_TAGS = /* @__PURE__ */ new Set([
   "div",
   "ul",
@@ -7602,11 +7701,23 @@ function formatHtmlTagLabel(displayTag, lowerTag, rawAttrs, parsed) {
   if (roleVal) {
     return `<${displayTag} role="${roleVal}">`;
   }
+  const ariaLabelVal = normalizeInlineAttr(parsed.attrs.get("aria-label"), 40);
+  if (ariaLabelVal) {
+    return `<${displayTag} aria-label="${ariaLabelVal}">`;
+  }
   const slotVal = normalizeInlineAttr(parsed.vueSlot, 36);
   if (lowerTag === "template" && slotVal) {
     return `<template #${slotVal}>`;
   }
   return `<${displayTag}>`;
+}
+function cleanHtmlHeadingText(rawInner) {
+  const withoutComments = rawInner.replace(/<!--[\s\S]*?-->/g, " ");
+  const withoutTags = withoutComments.replace(/<[^>]*>/g, " ");
+  const decoded = withoutTags.replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, "'").replace(/&#39;|&apos;/gi, "'").replace(/&nbsp;/gi, " ").replace(/&middot;/gi, "\xB7").replace(/&mdash;/gi, "\u2014").replace(/&ndash;/gi, "\u2013").replace(/"/g, "'").replace(/\s+/g, " ").trim();
+  if (!decoded || !/[A-Za-z0-9\u4e00-\u9fff]/.test(decoded)) return "";
+  if (decoded.length <= MAX_HEADING_LABEL_CHARS) return decoded;
+  return `${sliceSafeChars(decoded, MAX_HEADING_LABEL_CHARS - 3).trimEnd()}...`;
 }
 function isJsScriptType(typeAttr) {
   if (typeAttr === void 0) return true;
@@ -7650,13 +7761,16 @@ function extractTemplateSymbols(rawLines, mode = "html") {
   };
   const symbols = [];
   const stack = [];
+  const emittedStack = [];
   const stackTagCounts = /* @__PURE__ */ new Map();
   const pushFrame = (frame) => {
     stack.push(frame);
+    if (frame.emitted) emittedStack.push(frame);
     stackTagCounts.set(frame.lowerTag, (stackTagCounts.get(frame.lowerTag) ?? 0) + 1);
   };
   const popFrame = () => {
     const frame = stack.pop();
+    if (frame.emitted) emittedStack.pop();
     const prev = stackTagCounts.get(frame.lowerTag) ?? 0;
     if (prev <= 1) stackTagCounts.delete(frame.lowerTag);
     else stackTagCounts.set(frame.lowerTag, prev - 1);
@@ -7670,6 +7784,7 @@ function extractTemplateSymbols(rawLines, mode = "html") {
   let noCloseBodyBrace = false;
   let noCloseMustache = false;
   const noCloseRawSkip = /* @__PURE__ */ new Set();
+  let nextCloseTagPos = text.indexOf("</");
   let nextRightBrace = text.indexOf("}");
   let nextCloseMustache = mode === "vue" ? text.indexOf("}}") : -1;
   let i = 0;
@@ -8068,15 +8183,38 @@ function extractTemplateSymbols(rawLines, mode = "html") {
       i = nextPos;
       continue;
     }
+    if (!selfClosing && nextCloseTagPos >= 0 && HTML_HEADING_TAGS.has(lowerTag)) {
+      const enclosingEmitted = emittedStack[emittedStack.length - 1];
+      if (enclosingEmitted?.needsHeadingLabel && enclosingEmitted.symbol) {
+        if (nextCloseTagPos < gtPos + 1) {
+          nextCloseTagPos = text.indexOf("</", gtPos + 1);
+        }
+        if (nextCloseTagPos >= 0 && nextCloseTagPos < gtPos + 1 + MAX_HEADING_SCAN) {
+          const scanEnd = Math.min(len, gtPos + 1 + MAX_HEADING_SCAN);
+          const windowText = text.slice(gtPos + 1, scanEnd);
+          const closeMatch = new RegExp(`</${lowerTag}\\s*>`, "i").exec(windowText);
+          if (closeMatch) {
+            const headingText = cleanHtmlHeadingText(
+              windowText.slice(0, closeMatch.index)
+            );
+            if (headingText) {
+              enclosingEmitted.symbol.name = `<${enclosingEmitted.lowerTag} "${headingText}">`;
+              enclosingEmitted.needsHeadingLabel = false;
+            }
+          }
+        }
+      }
+    }
     const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
     const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
     const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
     const isContainer = HTML_CONTAINER_TAGS.has(lowerTag);
     let shouldEmit = false;
     let emittedSymbol;
+    let needsHeadingLabel = false;
     if (isComponent || isSemantic || isContainer) {
       const parsed = parseHtmlAttrs(rawAttrSlice);
-      const hasIdentityAttr = Boolean(parsed.attrs.get("id")?.trim()) || Boolean(parsed.attrs.get("data-testid")?.trim()) || Boolean(parsed.attrs.get("role")?.trim());
+      const hasIdentityAttr = Boolean(parsed.attrs.get("id")?.trim()) || Boolean(parsed.attrs.get("data-testid")?.trim()) || Boolean(parsed.attrs.get("role")?.trim()) || Boolean(parsed.attrs.get("aria-label")?.trim());
       const keepTemplate = lowerTag !== "template" || emittedCount === 0 || Boolean(parsed.vueSlot) || hasIdentityAttr;
       if (keepTemplate && (isComponent || isSemantic || isContainer && hasIdentityAttr)) {
         shouldEmit = true;
@@ -8089,6 +8227,7 @@ function extractTemplateSymbols(rawLines, mode = "html") {
           endLine: openEndLine,
           depth: Math.min(MAX_HTML_DEPTH, emittedCount)
         };
+        needsHeadingLabel = !selfClosing && HTML_HEADING_LABEL_TAGS.has(lowerTag) && !hasIdentityAttr;
         symbols.push(emittedSymbol);
       }
     }
@@ -8097,7 +8236,8 @@ function extractTemplateSymbols(rawLines, mode = "html") {
         lowerTag,
         startLine,
         emitted: shouldEmit,
-        symbol: emittedSymbol
+        symbol: emittedSymbol,
+        needsHeadingLabel
       });
       if (shouldEmit) emittedCount++;
     }
@@ -8118,6 +8258,222 @@ function extractHtmlSymbols(lines) {
 function extractSfcSymbols(lines, mode) {
   const symbols = extractTemplateSymbols(lines, mode);
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
+}
+function unquoteDiffPath(raw, stripGitPrefix) {
+  const tabIdx = raw.indexOf("	");
+  let s = (tabIdx >= 0 ? raw.slice(0, tabIdx) : raw).trim();
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    s = s.slice(1, -1).replace(/\\(["\\tnr])/g, (_m, ch) => {
+      if (ch === "t") return "	";
+      if (ch === "n") return "\n";
+      if (ch === "r") return "\r";
+      return ch;
+    });
+  }
+  if (stripGitPrefix && s !== "/dev/null" && (s.startsWith("a/") || s.startsWith("b/"))) {
+    s = s.slice(2);
+  }
+  return s;
+}
+function parseGitDiffHeaderPaths(line) {
+  if (!line.startsWith("diff --git ")) return null;
+  const rest = line.slice("diff --git ".length).trim();
+  const quoted = /^"((?:[^"\\]|\\.)+)"\s+"((?:[^"\\]|\\.)+)"$/.exec(rest);
+  if (quoted) {
+    return {
+      oldPath: unquoteDiffPath(`"${quoted[1]}"`, true),
+      newPath: unquoteDiffPath(`"${quoted[2]}"`, true)
+    };
+  }
+  if (rest.startsWith("a/") && (rest.length - 1) % 2 === 0) {
+    const mid = (rest.length - 1) / 2;
+    if (rest[mid] === " " && rest.slice(mid + 1, mid + 3) === "b/") {
+      const left = rest.slice(2, mid);
+      const right = rest.slice(mid + 3);
+      if (left === right) {
+        return { oldPath: left, newPath: right };
+      }
+    }
+  }
+  const splitIdx = rest.lastIndexOf(" b/");
+  if (splitIdx > 0) {
+    return {
+      oldPath: unquoteDiffPath(rest.slice(0, splitIdx), true),
+      newPath: unquoteDiffPath(rest.slice(splitIdx + 1), true)
+    };
+  }
+  return null;
+}
+function extractDiffSymbols(rawLines) {
+  if (rawLines.length === 0) return [];
+  const lines = rawLines[0].startsWith("\uFEFF") ? [rawLines[0].slice(1), ...rawLines.slice(1)] : rawLines;
+  const symbols = [];
+  const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+  let currentFile = null;
+  let currentHunk = null;
+  const closeHunk = (endLine) => {
+    if (!currentHunk) return;
+    currentHunk.sym.endLine = Math.max(currentHunk.sym.startLine, endLine);
+    currentHunk = null;
+  };
+  const closeFile = (endLine) => {
+    if (!currentFile) return;
+    closeHunk(endLine);
+    currentFile.sym.endLine = Math.max(currentFile.startLine, endLine);
+    const displayPath = currentFile.isDeleted ? currentFile.oldPath || currentFile.newPath || "(deleted)" : currentFile.isRenamed && currentFile.oldPath && currentFile.newPath && currentFile.oldPath !== currentFile.newPath ? `${currentFile.oldPath} -> ${currentFile.newPath}` : currentFile.newPath || currentFile.oldPath || "(unknown)";
+    const tags = [];
+    if (currentFile.isBinary) {
+      tags.push("[binary]");
+    } else {
+      if (currentFile.isNew) tags.push("[new]");
+      else if (currentFile.isDeleted) tags.push("[deleted]");
+      else if (currentFile.isRenamed) tags.push("[renamed]");
+      if (currentFile.additions > 0 || currentFile.deletions > 0) {
+        tags.push(`(+${currentFile.additions}/-${currentFile.deletions})`);
+      }
+    }
+    const label = tags.length > 0 ? `${displayPath} ${tags.join(" ")}` : displayPath;
+    currentFile.sym.name = sliceSafeChars(label, 140);
+    currentFile = null;
+  };
+  const createFileState = (startLine, oldPath, newPath, inMeta) => {
+    const sym = {
+      kind: "file",
+      name: newPath || oldPath,
+      startLine,
+      endLine: startLine,
+      depth: 0
+    };
+    symbols.push(sym);
+    return {
+      startLine,
+      oldPath,
+      newPath,
+      isNew: false,
+      isDeleted: false,
+      isRenamed: false,
+      isBinary: false,
+      additions: 0,
+      deletions: 0,
+      inMeta,
+      sym
+    };
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ln = i + 1;
+    if (line.startsWith("diff --git ")) {
+      const parsed = parseGitDiffHeaderPaths(line);
+      if (parsed) {
+        closeFile(ln - 1);
+        currentFile = createFileState(ln, parsed.oldPath, parsed.newPath, true);
+        continue;
+      }
+    }
+    const inActiveHunk = currentHunk !== null && (currentHunk.oldRem > 0 || currentHunk.newRem > 0);
+    if (inActiveHunk && currentHunk) {
+      if (line.startsWith("+")) {
+        currentHunk.newRem = Math.max(0, currentHunk.newRem - 1);
+        if (currentFile) currentFile.additions += 1;
+        continue;
+      }
+      if (line.startsWith("-")) {
+        currentHunk.oldRem = Math.max(0, currentHunk.oldRem - 1);
+        if (currentFile) currentFile.deletions += 1;
+        continue;
+      }
+      if (line.startsWith(" ") || line === "") {
+        currentHunk.oldRem = Math.max(0, currentHunk.oldRem - 1);
+        currentHunk.newRem = Math.max(0, currentHunk.newRem - 1);
+        continue;
+      }
+      if (line.startsWith("\\")) {
+        continue;
+      }
+      closeHunk(ln - 1);
+    }
+    if (currentFile) {
+      const hunkMatch = HUNK_RE.exec(line);
+      if (hunkMatch) {
+        closeHunk(ln - 1);
+        currentFile.inMeta = false;
+        const oldCount = hunkMatch[2] !== void 0 ? Number(hunkMatch[2]) : 1;
+        const newCount = hunkMatch[4] !== void 0 ? Number(hunkMatch[4]) : 1;
+        const closeAt = line.indexOf("@@", 2);
+        const rangeHeader = closeAt > 0 ? line.slice(0, closeAt + 2) : line;
+        const ctx = hunkMatch[5].trim();
+        const hunkName = ctx ? `${rangeHeader} ${sliceSafeChars(ctx, 64)}` : rangeHeader;
+        const sym = {
+          kind: "hunk",
+          name: hunkName,
+          startLine: ln,
+          endLine: ln,
+          depth: 1
+        };
+        symbols.push(sym);
+        currentHunk = { sym, oldRem: oldCount, newRem: newCount };
+        continue;
+      }
+      if (currentFile.inMeta) {
+        if (line.startsWith("new file mode ")) {
+          currentFile.isNew = true;
+          continue;
+        }
+        if (line.startsWith("deleted file mode ")) {
+          currentFile.isDeleted = true;
+          continue;
+        }
+        if (line.startsWith("rename from ")) {
+          currentFile.isRenamed = true;
+          currentFile.oldPath = unquoteDiffPath(line.slice("rename from ".length), false);
+          continue;
+        }
+        if (line.startsWith("rename to ")) {
+          currentFile.isRenamed = true;
+          currentFile.newPath = unquoteDiffPath(line.slice("rename to ".length), false);
+          continue;
+        }
+        if (line.startsWith("Binary files ") || line === "GIT binary patch") {
+          currentFile.isBinary = true;
+          continue;
+        }
+        if (line.startsWith("--- ")) {
+          const p = unquoteDiffPath(line.slice(4), true);
+          if (p === "/dev/null") currentFile.isNew = true;
+          else if (p) currentFile.oldPath = p;
+          continue;
+        }
+        if (line.startsWith("+++ ")) {
+          const p = unquoteDiffPath(line.slice(4), true);
+          if (p === "/dev/null") currentFile.isDeleted = true;
+          else if (p) currentFile.newPath = p;
+          continue;
+        }
+      }
+      if (line === "-- ") {
+        closeFile(ln - 1);
+        continue;
+      }
+    }
+    if (!currentFile?.inMeta && line.startsWith("--- ") && i + 1 < lines.length && lines[i + 1].startsWith("+++ ")) {
+      closeFile(ln - 1);
+      const oldRaw = unquoteDiffPath(line.slice(4), true);
+      const newRaw = unquoteDiffPath(lines[i + 1].slice(4), true);
+      const state = createFileState(
+        ln,
+        oldRaw === "/dev/null" ? "" : oldRaw,
+        newRaw === "/dev/null" ? "" : newRaw,
+        false
+      );
+      if (oldRaw === "/dev/null") state.isNew = true;
+      if (newRaw === "/dev/null") state.isDeleted = true;
+      currentFile = state;
+      i += 1;
+      continue;
+    }
+  }
+  closeFile(lines.length);
+  return symbols;
 }
 function extractSymbolsFromLines(filePath, lines) {
   const ext = path6.extname(filePath).toLowerCase();
@@ -8175,6 +8531,9 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".patch":
+    case ".diff":
+      return extractDiffSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }
@@ -8950,6 +9309,12 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const byteCap = Math.max(8, maxCmdBytes - 3);
     return `${sliceUtf8Bytes(sliceSafeChars(cmd, charCap), byteCap)}...`;
   };
+  const MAX_ECHO_CMD_CHARS = 220;
+  const MAX_ECHO_CMD_BYTES = 220;
+  const formatBoundedEchoCommand = (cmd) => {
+    const singleLine = cmd.replace(/[\r\n\t]+/g, " ").trim();
+    return capCmdDisplay(singleLine, MAX_ECHO_CMD_CHARS, MAX_ECHO_CMD_BYTES);
+  };
   const formatNotRunBlock = (spec) => {
     const baseHeader = `## [NOT RUN] ${spec.name}`;
     const notRunBudgetTotal = failedCount > 0 ? Math.min(availChars, Math.floor(availChars * 0.35)) : availChars;
@@ -8961,7 +9326,8 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       return baseHeader.length <= perNotRunShare || perNotRunShare < 16 ? baseHeader : `${sliceSafeChars(baseHeader, perNotRunShare - 3)}...`;
     }
     const perNotRunCap = Math.min(180, cmdRoom);
-    const shortCmd = capCmdDisplay(spec.command, perNotRunCap, perNotRunCap);
+    const singleLine = spec.command.replace(/[\r\n\t]+/g, " ").trim();
+    const shortCmd = capCmdDisplay(singleLine, perNotRunCap, perNotRunCap);
     return `${baseHeader}
 $ ${shortCmd}`;
   };
@@ -9009,8 +9375,9 @@ $ ${displayCmd}
       }
       const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
+      const echoCmd = formatBoundedEchoCommand(spec.command);
       const fullPrefix = `${headerLine}
-$ ${spec.command}
+$ ${echoCmd}
 `;
       const combined = [
         normalizeTerminalOutput(result.stdout),
@@ -9021,6 +9388,7 @@ $ ${spec.command}
       return {
         notRun: false,
         spec,
+        echoCmd,
         headerLine,
         fullPrefix,
         rawBody,
@@ -9046,7 +9414,7 @@ $ ${spec.command}
       }
       const prefix = formatCmdHeaderPrefix(
         entry.headerLine,
-        entry.spec.command,
+        entry.echoCmd,
         charShare,
         byteShare
       );
@@ -9100,8 +9468,9 @@ $ ${spec.command}
       }
       const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
+      const echoCmd = formatBoundedEchoCommand(spec.command);
       const header = `${badgeLine}
-$ ${spec.command}
+$ ${echoCmd}
 `;
       const prepared = prepareCompactCommandOutput({
         stdout: result.stdout,
@@ -9122,6 +9491,7 @@ $ ${spec.command}
       failEntries.push({
         index: i,
         spec,
+        echoCmd,
         badgeLine,
         header,
         prepared,
@@ -9238,7 +9608,7 @@ $ ${spec.command}
         const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
         const effectiveHeader = formatCmdHeaderPrefix(
           entry.badgeLine,
-          entry.spec.command,
+          entry.echoCmd,
           blockCharBudget,
           blockByteBudget
         );
