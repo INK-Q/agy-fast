@@ -1543,4 +1543,51 @@ describe("batch_search", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
+
+  it("warns when sortBy mtime hits the glob scan cap while staying silent on complete scans", async () => {
+    const mtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-mtime-cap-"));
+    try {
+      for (let i = 1; i <= 12; i++) {
+        const sub = path.join(mtimeDir, `bucket-${String(i).padStart(2, "0")}`);
+        await fs.mkdir(sub, { recursive: true });
+        const filePath = path.join(sub, `item-${i}.log`);
+        await fs.writeFile(filePath, `entry ${i}\n`, "utf8");
+        const t = new Date(Date.now() - (20 - i) * 60_000);
+        await fs.utimes(filePath, t, t);
+      }
+
+      // 1. Scan cap smaller than total files -> explicit partial mtime warning
+      const cappedRes = await runBatchSearch(
+        {
+          cwd: mtimeDir,
+          queries: [
+            { type: "glob", pattern: "*", sortBy: "mtime", maxResults: 3 },
+            { type: "glob", pattern: "*", sortBy: "path", maxResults: 3 },
+          ],
+        },
+        { globScanLimit: 6 },
+      );
+      assert.equal(cappedRes.isError, false);
+      const [mtimeSec, pathSec] = cappedRes.text.split("\n\n");
+      assert.match(
+        mtimeSec!,
+        /truncated at 3 of 6\+ files; mtime order is partial \(scan cap reached; narrow 'path' or 'pattern'\)/,
+      );
+      // sortBy: "path" does NOT emit the mtime-specific warning
+      assert.match(pathSec!, /truncated at 3 of 6\+ files;/);
+      assert.doesNotMatch(pathSec!, /mtime order is partial/);
+
+      // 2. Complete scan (no scan cap truncation) -> sorted newest-first without partial warning
+      const fullRes = await runBatchSearch({
+        cwd: mtimeDir,
+        queries: [{ type: "glob", pattern: "*", sortBy: "mtime", maxResults: 3 }],
+      });
+      assert.equal(fullRes.isError, false);
+      assert.match(fullRes.text, /bucket-12\/item-12\.log/);
+      assert.match(fullRes.text, /truncated at 3 of 12 files;/);
+      assert.doesNotMatch(fullRes.text, /mtime order is partial/);
+    } finally {
+      await fs.rm(mtimeDir, { recursive: true, force: true });
+    }
+  });
 });

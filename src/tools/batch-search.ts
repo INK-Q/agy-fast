@@ -52,6 +52,7 @@ export interface BatchSearchInput {
 
 export interface BatchSearchRuntimeOptions {
   forceNodeFallback?: boolean;
+  globScanLimit?: number;
 }
 
 const READONLY_GIT_SUBCOMMANDS = new Set([
@@ -1327,8 +1328,8 @@ async function formatGlobWalkResult(
   const sortedFiles = [...walked.files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (sortBy === "mtime") {
     const mtimes = new Map<string, number>();
-    for (let i = 0; i < sortedFiles.length; i += 32) {
-      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+    for (let i = 0; i < sortedFiles.length; i += 64) {
+      await Promise.all(sortedFiles.slice(i, i + 64).map(async (file) => {
         const stat = await fs.lstat(path.join(searchRoot, file)).catch(() => undefined);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
@@ -1361,9 +1362,13 @@ async function formatGlobWalkResult(
   const totalLabel = walked.truncated
     ? `${walked.files.length}+`
     : String(walked.files.length);
+  const partialMtimeNote =
+    sortBy === "mtime" && walked.truncated
+      ? "; mtime order is partial (scan cap reached; narrow 'path' or 'pattern')"
+      : "";
   const dirSummary =
     topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
-  const suffix = `\n... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+  const suffix = `\n... [truncated at ${items.length} of ${totalLabel} files${partialMtimeNote}${dirSummary}]`;
   return `${header}${items.join("\n")}${suffix}`;
 }
 
@@ -1372,6 +1377,7 @@ async function runGlobQuery(
   searchRoot: string,
   baseCwd: string,
   isFileTarget: boolean,
+  globScanLimit?: number,
 ): Promise<string> {
   const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
@@ -1393,7 +1399,11 @@ async function runGlobQuery(
     return "(no files matched)";
   }
 
-  const scanLimit = Math.max(maxResults + 1, 2000);
+  const defaultScanCap = query.sortBy === "mtime" ? 8000 : 2000;
+  const scanLimit =
+    globScanLimit !== undefined && Number.isFinite(globScanLimit) && globScanLimit >= 1
+      ? Math.trunc(globScanLimit)
+      : Math.max(maxResults + 1, defaultScanCap);
   const walked = await walkFiles(searchRoot, {
     maxFiles: scanLimit,
     includeHidden,
@@ -2217,6 +2227,7 @@ async function executeSingleQuery(
   index: number,
   baseCwd: string,
   useRg: boolean,
+  options: BatchSearchRuntimeOptions,
 ): Promise<ExecutedQuerySection> {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
@@ -2247,7 +2258,13 @@ async function executeSingleQuery(
     }
 
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      const out = await runGlobQuery(
+        query,
+        searchRoot,
+        baseCwd,
+        targetStat.isFile(),
+        options.globScanLimit,
+      );
       return { header, text: `${header}\n${out}` };
     }
 
@@ -2392,7 +2409,7 @@ export async function runBatchSearch(
     needsTextSearch && !options.forceNodeFallback && (await isRipgrepAvailable());
 
   const executed = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, options)),
   );
 
   const separator = "\n\n";
