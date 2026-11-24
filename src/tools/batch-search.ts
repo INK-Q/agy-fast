@@ -526,6 +526,7 @@ interface FileMatches {
   file: string;
   lines: SearchLine[];
   count?: number;
+  perFileCap?: number;
 }
 
 async function runTextOrRegexWithRg(
@@ -896,10 +897,19 @@ async function runTextOrRegexWithRg(
     const lines: SearchLine[] = [];
     let kept = 0;
     let lastKeptMatchLine = -1;
+    let hitPerFileCap = false;
     for (const line of sorted) {
       if (line.isMatch) {
         if (kept === budget) {
           truncated = true;
+          if (
+            !isFileTarget &&
+            !query.multiline &&
+            perFileCap < maxResults &&
+            budget === perFileCap
+          ) {
+            hitPerFileCap = true;
+          }
           if (
             lastKeptMatchLine !== -1 &&
             line.lineNumber <= lastKeptMatchLine + contextLines
@@ -918,7 +928,11 @@ async function runTextOrRegexWithRg(
       }
     }
     if (kept === 0) continue;
-    files.push({ file: relFile, lines });
+    files.push({
+      file: relFile,
+      lines,
+      ...(hitPerFileCap ? { perFileCap } : {}),
+    });
     totalMatches += kept;
   }
 
@@ -1252,7 +1266,16 @@ async function runTextOrRegexWithNode(
         truncated = true;
         break;
       }
-      files.push(buildFileMatches(item.relFile, item.lines, item.matchedLines));
+      const hitPerFileCap =
+        item.fileTruncated &&
+        !stat.isFile() &&
+        !query.multiline &&
+        perFileCap < maxResults &&
+        item.matchedLines.length === perFileCap;
+      files.push({
+        ...buildFileMatches(item.relFile, item.lines, item.matchedLines),
+        ...(hitPerFileCap ? { perFileCap } : {}),
+      });
       totalMatches += item.matchedLines.length;
     }
   }
@@ -1671,6 +1694,11 @@ function formatFileMatches(
       const sep = l.isMatch ? ":" : "-";
       return `  ${l.lineNumber}${sep} ${formatLineSnippet(l)}`;
     });
+    if (fm.perFileCap !== undefined) {
+      lines.push(
+        `  ... (+more matches in this file; per-file cap ${fm.perFileCap} reached — narrow 'path' to see all)`,
+      );
+    }
     blocks.push(`${fm.file}\n${lines.join("\n")}`);
   }
   const footer = truncated ? `\n... [truncated at ${totalMatches} matches]` : "";
@@ -1699,14 +1727,22 @@ interface BudgetedFileState {
   matchEntries: BudgetedLineEntry[];
   contextEntries: BudgetedLineEntry[];
   firstMatchLine: SearchLine;
+  perFileCap?: number;
   shownMatches: number;
   selectedContexts: BudgetedLineEntry[];
   selectedLineNums: Set<number>;
 }
 
-function fileOmissionMarker(omitted: number): string {
-  if (omitted <= 0) return "";
-  return `\n  ... (+${omitted} more ${omitted === 1 ? "match" : "matches"})`;
+function fileOmissionMarker(omitted: number, perFileCap?: number): string {
+  if (omitted > 0) {
+    return perFileCap !== undefined
+      ? `\n  ... (+${omitted}+ more matches; per-file cap ${perFileCap})`
+      : `\n  ... (+${omitted} more ${omitted === 1 ? "match" : "matches"})`;
+  }
+  if (perFileCap !== undefined) {
+    return `\n  ... (+more matches in this file; per-file cap ${perFileCap})`;
+  }
+  return "";
 }
 
 function buildTruncatedNotice(
@@ -1823,6 +1859,7 @@ function formatBudgetedContentSection(params: {
       matchEntries,
       contextEntries,
       firstMatchLine,
+      perFileCap: fm.perFileCap,
       shownMatches: 0,
       selectedContexts: [],
       selectedLineNums: new Set<number>(),
@@ -1846,7 +1883,7 @@ function formatBudgetedContentSection(params: {
   let allFilesFirstBytes = headerCost.bytes;
   for (const st of states) {
     const first = st.matchEntries[0]!;
-    const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+    const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
     allFilesFirstChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
     allFilesFirstBytes += st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
   }
@@ -1867,7 +1904,7 @@ function formatBudgetedContentSection(params: {
   ) {
     for (const st of states) {
       const first = st.matchEntries[0]!;
-      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
       st.shownMatches = 1;
       st.selectedLineNums.add(first.lineNumber);
       usedChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
@@ -1909,7 +1946,7 @@ function formatBudgetedContentSection(params: {
       reserveBytes: number,
     ): boolean => {
       const first = st.matchEntries[0]!;
-      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
       const addChars = st.headerCost.chars + first.cost.chars + markerCost.chars;
       const addBytes = st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
       if (
@@ -1935,7 +1972,7 @@ function formatBudgetedContentSection(params: {
         if (tryAddFirstMatch(st, minOmittedNotice.chars, minOmittedNotice.bytes)) {
           break;
         }
-        const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+        const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1, st.perFileCap));
         const availLineChars =
           charBudget -
           usedChars -
@@ -1994,10 +2031,10 @@ function formatBudgetedContentSection(params: {
         }
         const entry = st.matchEntries[st.shownMatches]!;
         const prevMarkerCost = measureCost(
-          fileOmissionMarker(st.matchEntries.length - st.shownMatches),
+          fileOmissionMarker(st.matchEntries.length - st.shownMatches, st.perFileCap),
         );
         const nextMarkerCost = measureCost(
-          fileOmissionMarker(st.matchEntries.length - (st.shownMatches + 1)),
+          fileOmissionMarker(st.matchEntries.length - (st.shownMatches + 1), st.perFileCap),
         );
         const deltaChars = entry.cost.chars + nextMarkerCost.chars - prevMarkerCost.chars;
         const deltaBytes = entry.cost.bytes + nextMarkerCost.bytes - prevMarkerCost.bytes;
@@ -2122,8 +2159,9 @@ function formatBudgetedContentSection(params: {
       parts.push(`\n${line.formatted}`);
     }
     const omittedInFile = st.matchEntries.length - st.shownMatches;
-    if (omittedInFile > 0) {
-      parts.push(fileOmissionMarker(omittedInFile));
+    const marker = fileOmissionMarker(omittedInFile, st.perFileCap);
+    if (marker) {
+      parts.push(marker);
     }
   }
 
@@ -2155,7 +2193,9 @@ function formatBudgetedContentSection(params: {
     const remBytes = byteBudget - Buffer.byteLength(bodySoFar, "utf8") - truncCost.bytes;
     const unshown = states.slice(shownFiles);
 
-    const allItems = unshown.map((st) => `${st.file} (${st.matchEntries.length})`);
+    const allItems = unshown.map(
+      (st) => `${st.file} (${st.matchEntries.length}${st.perFileCap !== undefined ? "+" : ""})`,
+    );
     const allLine = `\n... [more files: ${allItems.join(", ")}]`;
     if (
       allLine.length <= remChars &&

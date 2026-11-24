@@ -1590,4 +1590,77 @@ describe("batch_search", () => {
       await fs.rm(mtimeDir, { recursive: true, force: true });
     }
   });
+
+  it("marks files truncated by the per-file match cap identically in rg and Node backends", async () => {
+    const capDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-perfile-cap-"));
+    try {
+      await fs.writeFile(
+        path.join(capDir, "alpha.py"),
+        Array.from({ length: 65 }, (_, i) => `hit_token_${i + 1} = ${i + 1}`).join("\n") + "\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(capDir, "beta.py"),
+        Array.from({ length: 12 }, (_, i) => `hit_token_beta_${i + 1} = ${i + 1}`).join("\n") + "\n",
+        "utf8",
+      );
+
+      // 1. Directory query with maxResults=80: alpha hits per-file cap (50), beta shows all 12 (total 62)
+      const rgRes = await runBatchSearch({
+        cwd: capDir,
+        queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+      });
+      const nodeRes = await runBatchSearch(
+        {
+          cwd: capDir,
+          queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgRes.isError, false);
+      assert.equal(rgRes.text, nodeRes.text, "rg and Node fallback output must match");
+      assert.match(
+        rgRes.text,
+        /alpha\.py[\s\S]*50: hit_token_50 = 50\n  \.\.\. \(\+more matches in this file; per-file cap 50 reached — narrow 'path' to see all\)\nbeta\.py/,
+      );
+      assert.doesNotMatch(rgRes.text, /hit_token_beta_12 = 12\n  \.\.\. \(\+more matches/);
+      assert.match(rgRes.text, /\.\.\. \[truncated at 62 matches\]$/);
+
+      // 2. Single-file target with maxResults=80 does NOT trigger per-file cap marker
+      const singleRg = await runBatchSearch({
+        cwd: capDir,
+        queries: [{ type: "text", pattern: "hit_token", path: "alpha.py", maxResults: 80 }],
+      });
+      const singleNode = await runBatchSearch(
+        {
+          cwd: capDir,
+          queries: [{ type: "text", pattern: "hit_token", path: "alpha.py", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(singleRg.text, singleNode.text);
+      assert.doesNotMatch(singleRg.text, /per-file cap/);
+      assert.match(singleRg.text, /65: hit_token_65 = 65/);
+
+      // 3. Budget-constrained formatting preserves per-file cap marker and stays within maxChars
+      const tightRg = await runBatchSearch({
+        cwd: capDir,
+        maxChars: 900,
+        queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+      });
+      const tightNode = await runBatchSearch(
+        {
+          cwd: capDir,
+          maxChars: 900,
+          queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(tightRg.text, tightNode.text);
+      assert.ok(tightRg.text.length <= 900, `Expected <= 900 chars, got ${tightRg.text.length}`);
+      assert.match(tightRg.text, /per-file cap 50/);
+    } finally {
+      await fs.rm(capDir, { recursive: true, force: true });
+    }
+  });
 });
