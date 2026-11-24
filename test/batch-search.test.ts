@@ -1663,4 +1663,68 @@ describe("batch_search", () => {
       await fs.rm(capDir, { recursive: true, force: true });
     }
   });
+
+  it("reports total file counts and distinguishing omitted dirs on truncated summary and nested glob queries (rg/Node parity)", async () => {
+    const treeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-summary-dirs-"));
+    try {
+      // Nested single-root layout: workspace/runs/exp-01..exp-04
+      for (const [exp, count] of [
+        ["exp-01", 3],
+        ["exp-02", 2],
+        ["exp-03", 4],
+        ["exp-04", 5],
+      ] as const) {
+        const dir = path.join(treeDir, "workspace", "runs", exp, "logs");
+        await fs.mkdir(dir, { recursive: true });
+        for (let i = 1; i <= count; i++) {
+          await fs.writeFile(
+            path.join(dir, `trial-${i}.json`),
+            `{"marker":"SUMMARY_DIR_TOKEN","exp":"${exp}","i":${i}}\n`,
+            "utf8",
+          );
+        }
+      }
+
+      // 1. files_with_matches & count truncated at 3 of 14 files descend past shared "runs/" to reveal runs/exp-04/, runs/exp-03/, runs/exp-02/
+      const summaryQueries = [
+        {
+          type: "text" as const,
+          path: "workspace",
+          pattern: "SUMMARY_DIR_TOKEN",
+          outputMode: "files_with_matches" as const,
+          maxResults: 3,
+        },
+        {
+          type: "text" as const,
+          path: "workspace",
+          pattern: "SUMMARY_DIR_TOKEN",
+          outputMode: "count" as const,
+          maxResults: 3,
+        },
+      ];
+      const rgSummary = await runBatchSearch({ cwd: treeDir, queries: summaryQueries });
+      const nodeSummary = await runBatchSearch(
+        { cwd: treeDir, queries: summaryQueries },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgSummary.isError, false);
+      assert.equal(rgSummary.text, nodeSummary.text, "truncated summary output must match between rg and Node");
+      for (const sec of rgSummary.text.split("\n\n")) {
+        assert.match(sec, /truncated; showing 3 files of 14; omitted dirs: runs\/exp-04\/ \(5\), runs\/exp-03\/ \(4\), runs\/exp-02\/ \(2\)/);
+      }
+
+      // 2. Glob query on the same nested tree also descends past shared "runs/"
+      const globRes = await runBatchSearch({
+        cwd: treeDir,
+        queries: [{ type: "glob", path: "workspace", pattern: "*.json", maxResults: 3 }],
+      });
+      assert.equal(globRes.isError, false);
+      assert.match(
+        globRes.text,
+        /truncated at 3 of 14 files; omitted dirs: runs\/exp-04\/ \(5\), runs\/exp-03\/ \(4\), runs\/exp-02\/ \(2\)/,
+      );
+    } finally {
+      await fs.rm(treeDir, { recursive: true, force: true });
+    }
+  });
 });

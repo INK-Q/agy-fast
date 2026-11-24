@@ -529,11 +529,94 @@ interface FileMatches {
   perFileCap?: number;
 }
 
+interface TextOrRegexResult {
+  files: FileMatches[];
+  totalMatches: number;
+  truncated: boolean;
+  summaryTotalFiles?: number;
+  summaryTotalPartial?: boolean;
+  summaryOmittedDirs?: string[];
+}
+
+/**
+ * Summarize omitted file paths into top directory buckets so callers can scope
+ * follow-up queries. When all omitted paths share a single parent directory
+ * containing subdirectories, descend (up to 4 levels) to reveal distinguishing
+ * child directories instead of collapsing everything into one parent bucket.
+ */
+function summarizeOmittedDirs(
+  omittedPaths: string[],
+  stripPrefix = "",
+  maxBuckets = 6,
+): string[] {
+  if (omittedPaths.length === 0) return [];
+  const normPrefix =
+    stripPrefix && stripPrefix !== "." && !stripPrefix.startsWith("..")
+      ? stripPrefix.endsWith("/")
+        ? stripPrefix
+        : `${stripPrefix}/`
+      : "";
+  let relPaths = omittedPaths.map((raw) => {
+    const p = toPosixPath(raw).replace(/^\.\//, "");
+    return normPrefix && p.startsWith(normPrefix) ? p.slice(normPrefix.length) : p;
+  });
+
+  let commonPrefix = "";
+  const maxDescent = 4;
+  for (let depth = 0; depth < maxDescent; depth++) {
+    const dirCounts = new Map<string, number>();
+    let singleDir: string | null = null;
+    let allInSingleDir = true;
+    for (const p of relPaths) {
+      const slash = p.indexOf("/");
+      if (slash === -1) {
+        allInSingleDir = false;
+        const rootLabel = commonPrefix || "(root)";
+        dirCounts.set(rootLabel, (dirCounts.get(rootLabel) ?? 0) + 1);
+      } else {
+        const seg = p.slice(0, slash + 1);
+        if (singleDir === null) singleDir = seg;
+        else if (singleDir !== seg) allInSingleDir = false;
+        const label = `${commonPrefix}${seg}`;
+        dirCounts.set(label, (dirCounts.get(label) ?? 0) + 1);
+      }
+    }
+
+    if (allInSingleDir && singleDir !== null) {
+      const stripped = relPaths.map((p) => p.slice(singleDir!.length));
+      if (stripped.some((p) => p.includes("/"))) {
+        commonPrefix += singleDir;
+        relPaths = stripped;
+        continue;
+      }
+    }
+
+    return [...dirCounts.entries()]
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .slice(0, maxBuckets)
+      .map(([dir, cnt]) => `${dir} (${cnt})`);
+  }
+
+  const finalCounts = new Map<string, number>();
+  for (const p of relPaths) {
+    const slash = p.indexOf("/");
+    const label =
+      slash === -1
+        ? commonPrefix || "(root)"
+        : `${commonPrefix}${p.slice(0, slash + 1)}`;
+    finalCounts.set(label, (finalCounts.get(label) ?? 0) + 1);
+  }
+  return [...finalCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, maxBuckets)
+    .map(([dir, cnt]) => `${dir} (${cnt})`);
+}
+
 async function runTextOrRegexWithRg(
   query: SearchQuery,
   searchRoot: string,
   baseCwd: string,
-): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
+): Promise<TextOrRegexResult> {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
@@ -684,10 +767,29 @@ async function runTextOrRegexWithRg(
       files.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
     files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    const totalFiles = files.length;
+    const keptFiles = files.slice(0, maxResults);
+    const summaryPartial = cutShort(res);
+    const summaryTruncated = totalFiles > maxResults || summaryPartial;
+    const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
+    const omittedDirs =
+      totalFiles > maxResults
+        ? summarizeOmittedDirs(
+            files.slice(maxResults).map((f) => f.file),
+            relPrefix,
+          )
+        : undefined;
     return {
-      files: files.slice(0, maxResults),
+      files: keptFiles,
       totalMatches: 0,
-      truncated: files.length > maxResults || cutShort(res),
+      truncated: summaryTruncated,
+      ...(summaryTruncated
+        ? {
+            summaryTotalFiles: totalFiles,
+            summaryTotalPartial: summaryPartial,
+            summaryOmittedDirs: omittedDirs,
+          }
+        : {}),
     };
   }
 
@@ -999,7 +1101,7 @@ async function runTextOrRegexWithNode(
   query: SearchQuery,
   searchRoot: string,
   baseCwd: string,
-): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
+): Promise<TextOrRegexResult> {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
@@ -1171,6 +1273,8 @@ async function runTextOrRegexWithNode(
   };
 
   const batchSize = 16;
+  const summaryScanCap = Math.max(maxResults + 1, 500);
+  let summaryCapReached = false;
   let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
@@ -1246,7 +1350,8 @@ async function runTextOrRegexWithNode(
     for (const item of results) {
       if (!item) continue;
       if (summary) {
-        if (files.length === maxResults) {
+        if (files.length >= summaryScanCap) {
+          summaryCapReached = true;
           truncated = true;
           break;
         }
@@ -1278,6 +1383,33 @@ async function runTextOrRegexWithNode(
       });
       totalMatches += item.matchedLines.length;
     }
+  }
+
+  if (summary) {
+    const totalFiles = files.length;
+    const keptFiles = files.slice(0, maxResults);
+    const summaryPartial = summaryCapReached || discoveryTruncated;
+    const summaryTruncated = totalFiles > maxResults || summaryPartial;
+    const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
+    const omittedDirs =
+      totalFiles > maxResults
+        ? summarizeOmittedDirs(
+            files.slice(maxResults).map((f) => f.file),
+            relPrefix,
+          )
+        : undefined;
+    return {
+      files: keptFiles,
+      totalMatches: 0,
+      truncated: summaryTruncated,
+      ...(summaryTruncated
+        ? {
+            summaryTotalFiles: totalFiles,
+            summaryTotalPartial: summaryPartial,
+            summaryOmittedDirs: omittedDirs,
+          }
+        : {}),
+    };
   }
 
   return {
@@ -1370,18 +1502,9 @@ async function formatGlobWalkResult(
     return `${header}${items.join("\n")}`;
   }
 
-  // Summarize omitted matches by top-level directory so callers can scope follow-ups
+  // Summarize omitted matches by distinguishing directory so callers can scope follow-ups
   const omitted = sortedFiles.slice(maxResults);
-  const dirCounts = new Map<string, number>();
-  for (const f of omitted) {
-    const slash = f.indexOf("/");
-    const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
-    dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
-  }
-  const topDirs = [...dirCounts.entries()]
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .slice(0, 6)
-    .map(([dir, cnt]) => `${dir} (${cnt})`);
+  const topDirs = summarizeOmittedDirs(omitted);
   const totalLabel = walked.truncated
     ? `${walked.files.length}+`
     : String(walked.files.length);
@@ -2333,7 +2456,24 @@ async function executeSingleQuery(
         const body = res.files.map(({ file, count }) => query.outputMode === "count"
           ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}`
           : file).join("\n") || "(no matches)";
-        const footer = res.truncated ? `\n... [truncated; showing ${res.files.length} files]` : "";
+        let footer = "";
+        if (res.truncated) {
+          if (
+            res.summaryTotalFiles !== undefined &&
+            res.summaryTotalFiles > res.files.length
+          ) {
+            const totalLabel = res.summaryTotalPartial
+              ? `${res.summaryTotalFiles}+`
+              : String(res.summaryTotalFiles);
+            const dirSummary =
+              res.summaryOmittedDirs && res.summaryOmittedDirs.length > 0
+                ? `; omitted dirs: ${res.summaryOmittedDirs.join(", ")}`
+                : "";
+            footer = `\n... [truncated; showing ${res.files.length} files of ${totalLabel}${dirSummary}]`;
+          } else {
+            footer = `\n... [truncated; showing ${res.files.length} files]`;
+          }
+        }
         return { header, text: `${header}\n${body}${footer}` };
       }
       const text = `${header}\n${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
