@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -237,6 +237,200 @@ describe("installer", () => {
     // Must guard exit so `irm ... | iex` does not close the user's interactive terminal
     assert.match(ps1, /if \(\$__agyFastWasFile\)\s*\{[\s\S]*exit \$__agyFastFinalExit/);
     assert.match(ps1, /System\.Collections\.Generic\.List\[string\]/);
+  });
+
+  it("isolates install.ps1 piped remote execution from CWD, hardens manifest/repo checks, and verifies behavior on pwsh & PowerShell 5.1", async () => {
+    const ps1 = await fs.readFile(INSTALL_PS1, "utf8");
+    // Must never fall back to CWD when invoked via piped `irm ... | iex`
+    assert.doesNotMatch(ps1, /Get-Location/);
+    assert.match(ps1, /if\s*\(\s*\$IsFile\s+-and\s+-not\s+\[string\]::IsNullOrWhiteSpace\(\$ScriptRoot\)\s+-and\s+\(Test-LocalAgyFastRepo\s+-Candidate\s+\$ScriptRoot\)\s*\)/);
+    // Strict JSON object/string/case-sensitive manifest validation (no array coercion/unwrapping)
+    assert.match(ps1, /ConvertFrom-Json\s+-InputObject\s+\$trimmedManifest/);
+    assert.match(ps1, /\$manifest\s+-is\s+\[pscustomobject\]/);
+    assert.match(ps1, /\$manifest\.name\s+-is\s+\[string\]/);
+    assert.match(ps1, /\$manifest\.name\s+-ceq\s+"agy-fast"/);
+    // Platform-aware home resolution, LiteralPath cleanup, and git option-injection guard
+    assert.doesNotMatch(ps1, /Join-Path\s+\$env:USERPROFILE\b/);
+    assert.match(ps1, /\$isWin\s*=\s*\(\$PSVersionTable\.PSVersion\.Major\s+-lt\s+6\)\s+-or\s+\$IsWindows/);
+    assert.match(ps1, /Test-Path\s+-LiteralPath\s+\$tmpClone/);
+    assert.match(ps1, /Remove-Item\s+-LiteralPath\s+\$tmpClone/);
+    assert.match(ps1, /& git clone --depth 1 -- \$repoUrl \$tmpClone/);
+
+    // Validate AST syntax AND real behavioral execution across every installed PowerShell engine
+    // (on Windows CI, both pwsh 7 AND Windows PowerShell 5.1 are exercised — no early `break`).
+    const psCandidates = process.platform === "win32" ? ["pwsh", "powershell.exe"] : ["pwsh"];
+    const availableBins: string[] = [];
+    for (const bin of psCandidates) {
+      const parseRes = spawnSync(
+        bin,
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "$t = $null; $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:AGY_TEST_PS1_PATH, [ref]$t, [ref]$e); if ($e.Count -gt 0) { $e | ForEach-Object { [Console]::Error.WriteLine($_.Message) }; exit 1 }",
+        ],
+        { env: { ...process.env, AGY_TEST_PS1_PATH: INSTALL_PS1 }, encoding: "utf8" },
+      );
+      if ((parseRes.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") continue;
+      assert.equal(parseRes.error, undefined, `${bin} spawn failed: ${String(parseRes.error)}`);
+      assert.equal(parseRes.status, 0, `${bin} failed to parse install.ps1: ${parseRes.stderr}`);
+      availableBins.push(bin);
+    }
+
+    if (process.platform === "win32") {
+      assert.ok(
+        availableBins.includes("powershell.exe"),
+        "Expected Windows PowerShell 5.1 (powershell.exe) to be exercised on Windows",
+      );
+    }
+
+    if (availableBins.length === 0) return;
+
+    const psSandbox = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ps1-safety-"));
+    try {
+      const project = path.join(psSandbox, "decoy-workspace");
+      const binDir = path.join(psSandbox, "bin");
+      const localRepo = path.join(psSandbox, "local-repo");
+      const psHome = path.join(psSandbox, "home");
+      await fs.mkdir(path.join(project, "scripts"), { recursive: true });
+      await fs.mkdir(binDir, { recursive: true });
+      await fs.mkdir(path.join(localRepo, "scripts"), { recursive: true });
+      await fs.mkdir(psHome, { recursive: true });
+
+      // Decoy workspace pretends to be agy-fast
+      await fs.writeFile(path.join(project, "plugin.json"), JSON.stringify({ name: "agy-fast" }), "utf8");
+      await fs.writeFile(
+        path.join(project, "scripts", "install.mjs"),
+        'console.log("DECOY_EXECUTED");\n',
+        "utf8",
+      );
+
+      // Stub git binary that proves remote clone path was selected without hitting network
+      if (process.platform === "win32") {
+        await fs.writeFile(
+          path.join(binDir, "git.cmd"),
+          "@echo off\r\necho REMOTE_CLONE_ATTEMPT 1>&2\r\nexit /b 19\r\n",
+          "utf8",
+        );
+      } else {
+        const fakeGit = path.join(binDir, "git");
+        await fs.writeFile(fakeGit, "#!/bin/sh\necho REMOTE_CLONE_ATTEMPT >&2\nexit 19\n", "utf8");
+        await fs.chmod(fakeGit, 0o755);
+      }
+
+      const buildPsEnv = (extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => {
+        const env: NodeJS.ProcessEnv = { ...process.env };
+        let origPath = "";
+        for (const k of Object.keys(env)) {
+          if (k.toLowerCase() === "path") {
+            origPath = origPath || env[k] || "";
+            delete env[k];
+          }
+        }
+        const nodeDir = path.dirname(process.execPath);
+        env.PATH = `${binDir}${path.delimiter}${nodeDir}${origPath ? `${path.delimiter}${origPath}` : ""}`;
+        env.HOME = psHome;
+        env.USERPROFILE = psHome;
+        delete env.AGY_FAST_REPO;
+        for (const [k, v] of Object.entries(extra)) {
+          if (v === undefined) delete env[k];
+          else env[k] = v;
+        }
+        return env;
+      };
+
+      await fs.copyFile(INSTALL_PS1, path.join(localRepo, "install.ps1"));
+      await fs.writeFile(
+        path.join(localRepo, "scripts", "install.mjs"),
+        'console.log("LOCAL_INSTALLER", process.argv.slice(2).join(" "));\n',
+        "utf8",
+      );
+
+      for (const bin of availableBins) {
+        const baseFlags =
+          process.platform === "win32"
+            ? ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+            : ["-NoProfile", "-NonInteractive"];
+
+        // 1. Piped `irm | iex` inside decoy CWD must NEVER execute decoy scripts/install.mjs
+        const pipedRes = spawnSync(
+          bin,
+          [
+            ...baseFlags,
+            "-Command",
+            "$src = Get-Content -LiteralPath $env:AGY_TEST_PS1_PATH -Raw; Invoke-Expression $src",
+          ],
+          {
+            cwd: project,
+            env: buildPsEnv({ AGY_TEST_PS1_PATH: INSTALL_PS1 }),
+            encoding: "utf8",
+          },
+        );
+        const pipedCombined = `${pipedRes.stdout}\n${pipedRes.stderr}`;
+        assert.doesNotMatch(pipedCombined, /DECOY_EXECUTED/, `${bin}: piped iex executed CWD decoy`);
+        assert.match(pipedCombined, /REMOTE_CLONE_ATTEMPT/, `${bin}: piped iex did not reach remote clone`);
+
+        // 2. Explicit local file invocation from another CWD executes sibling scripts/install.mjs
+        await fs.writeFile(
+          path.join(localRepo, "plugin.json"),
+          JSON.stringify({ name: "agy-fast" }),
+          "utf8",
+        );
+        const localRes = spawnSync(
+          bin,
+          [...baseFlags, "-File", path.join(localRepo, "install.ps1"), "doctor"],
+          {
+            cwd: project,
+            env: buildPsEnv(),
+            encoding: "utf8",
+          },
+        );
+        assert.equal(localRes.status, 0, `${bin}: local install.ps1 failed: ${localRes.stderr}`);
+        assert.match(localRes.stdout, /LOCAL_INSTALLER doctor/);
+        assert.doesNotMatch(`${localRes.stdout}\n${localRes.stderr}`, /REMOTE_CLONE_ATTEMPT/);
+
+        // 3. Foreign / array-coercion / single-element-array / case-mismatch manifests reject local execution
+        const invalidManifests = [
+          JSON.stringify({ name: "other" }),
+          JSON.stringify({ name: ["agy-fast", "evil"] }),
+          JSON.stringify([{ name: "agy-fast" }]),
+          JSON.stringify({ name: "AGY-FAST" }),
+        ];
+        for (const badJson of invalidManifests) {
+          await fs.writeFile(path.join(localRepo, "plugin.json"), badJson, "utf8");
+          const badRes = spawnSync(
+            bin,
+            [...baseFlags, "-File", path.join(localRepo, "install.ps1")],
+            {
+              cwd: project,
+              env: buildPsEnv(),
+              encoding: "utf8",
+            },
+          );
+          const badCombined = `${badRes.stdout}\n${badRes.stderr}`;
+          assert.equal(badRes.status, 19, `${bin}: expected stub git exit 19 for ${badJson}, got ${badRes.status}: ${badCombined}`);
+          assert.match(badCombined, /REMOTE_CLONE_ATTEMPT/, `${bin}: expected remote clone for ${badJson}`);
+          assert.doesNotMatch(badCombined, /LOCAL_INSTALLER/, `${bin}: executed local installer for ${badJson}`);
+        }
+
+        // 4. Rejects dash-prefixed AGY_FAST_REPO before invoking git
+        const dashRepoRes = spawnSync(
+          bin,
+          [...baseFlags, "-File", path.join(localRepo, "install.ps1")],
+          {
+            cwd: project,
+            env: buildPsEnv({ AGY_FAST_REPO: "--upload-pack=evil" }),
+            encoding: "utf8",
+          },
+        );
+        const dashCombined = `${dashRepoRes.stdout}\n${dashRepoRes.stderr}`;
+        assert.equal(dashRepoRes.status, 1, `${bin}: expected exit 1 for dash-prefixed repo`);
+        assert.match(dashCombined, /must not start with '-'/);
+        assert.doesNotMatch(dashCombined, /REMOTE_CLONE_ATTEMPT/);
+      }
+    } finally {
+      await fs.rm(psSandbox, { recursive: true, force: true });
+    }
   });
 
   it("protects source repo across symlink/case variants, rejects ancestors and non-plugin dirs, and handles empty/symlink targets safely", async () => {
