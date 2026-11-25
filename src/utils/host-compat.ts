@@ -220,7 +220,10 @@ function parseSurfaceFromClientName(rawName: unknown): HostSurface | null {
   if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
     return "ide";
   }
-  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+  if (
+    /^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop|hub))?$/.test(s) ||
+    /^hub$/.test(s)
+  ) {
     return "desktop";
   }
   return null;

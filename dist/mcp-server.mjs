@@ -2,9 +2,9 @@
 
 
 // src/mcp-server.ts
-import fs6 from "node:fs";
-import os4 from "node:os";
-import path7 from "node:path";
+import fs8 from "node:fs";
+import os5 from "node:os";
+import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/protocol/mcp.ts
@@ -151,11 +151,9 @@ var McpStdioServer = class {
       } catch {
       }
     }
-    if (paths.length > 0) {
-      try {
-        this.onWorkspaceRoots?.(paths);
-      } catch {
-      }
+    try {
+      this.onWorkspaceRoots?.(paths);
+    } catch {
     }
   }
   registerTool(definition, handler) {
@@ -649,6 +647,7 @@ ${serialized}`);
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -1125,12 +1124,13 @@ function hasDefinedEnvKey(env, key, platform) {
   }
   return false;
 }
-function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
-  const result = { ...baseEnv };
-  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+function withNonInteractiveGitEnv(baseEnv, platform = process.platform) {
+  const effectiveBase = baseEnv === void 0 || baseEnv === process.env ? buildSpawnEnv(process.env, platform) : baseEnv;
+  const result = { ...effectiveBase };
+  if (!hasDefinedEnvKey(effectiveBase, "GIT_TERMINAL_PROMPT", platform)) {
     result.GIT_TERMINAL_PROMPT = "0";
   }
-  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+  if (!hasDefinedEnvKey(effectiveBase, "GCM_INTERACTIVE", platform)) {
     result.GCM_INTERACTIVE = "never";
   }
   return result;
@@ -1158,6 +1158,219 @@ async function runShellCommandAsync(command, options) {
   }
   return spawnAndCollect(command, [], true, effectiveOptions);
 }
+function getHomeDirSafe(env = process.env, platform = process.platform) {
+  try {
+    if (platform === "win32") {
+      const driveHome = env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : "";
+      return env.USERPROFILE || driveHome || env.HOME || os.homedir();
+    }
+    return env.HOME || env.USERPROFILE || os.homedir();
+  } catch {
+    return "";
+  }
+}
+function isExecutableFileSync(filePath, platform = process.platform) {
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) return false;
+    if (platform !== "win32") {
+      fs.accessSync(filePath, fs.constants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+function findBinaryInPathSync(binName, pathValue, platform = process.platform) {
+  if (!pathValue) return null;
+  const exts = platform === "win32" ? /\.(?:exe|cmd|bat)$/i.test(binName) ? [""] : [".exe", ".cmd", ".bat"] : [""];
+  const pathMod = platform === "win32" ? path.win32 : path.posix;
+  const delim = platform === "win32" ? ";" : ":";
+  for (const rawDir of pathValue.split(delim)) {
+    const dir = rawDir.trim().replace(/^"+|"+$/g, "").trim();
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = pathMod.join(dir, `${binName}${ext}`);
+      if (isExecutableFileSync(candidate, platform)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+function getBundledRipgrepCandidates(platform = process.platform, env = process.env, homeDir = getHomeDirSafe(env, platform)) {
+  const pathMod = platform === "win32" ? path.win32 : path.posix;
+  const rgName = platform === "win32" ? "rg.exe" : "rg";
+  const resourceDirs = platform === "darwin" ? ["Resources", "resources"] : ["resources"];
+  const relSuffixes = [
+    pathMod.join("app", "node_modules", "@vscode", "ripgrep", "bin", rgName),
+    pathMod.join(
+      "app",
+      "node_modules.asar.unpacked",
+      "@vscode",
+      "ripgrep",
+      "bin",
+      rgName
+    )
+  ];
+  const appRoots = [];
+  if (env.AGY_FAST_IDE_ROOT?.trim()) {
+    appRoots.push(env.AGY_FAST_IDE_ROOT.trim());
+  }
+  if (platform === "darwin") {
+    const roots = ["/Applications", ...homeDir ? [pathMod.join(homeDir, "Applications")] : []];
+    for (const r of roots) {
+      for (const app of [
+        "Antigravity IDE.app",
+        "Antigravity.app",
+        "Visual Studio Code.app",
+        "Cursor.app"
+      ]) {
+        appRoots.push(pathMod.join(r, app, "Contents"));
+      }
+    }
+  } else if (platform === "win32") {
+    for (const base of [
+      env.LOCALAPPDATA ? pathMod.join(env.LOCALAPPDATA, "Programs") : "",
+      env.ProgramFiles || "",
+      env["ProgramFiles(x86)"] || ""
+    ]) {
+      if (!base) continue;
+      for (const app of ["Antigravity IDE", "Antigravity", "Microsoft VS Code", "cursor"]) {
+        appRoots.push(pathMod.join(base, app));
+      }
+    }
+  } else {
+    for (const dir of [
+      "/opt/antigravity-ide",
+      "/usr/share/antigravity-ide",
+      "/opt/Antigravity",
+      "/usr/share/code",
+      "/opt/visual-studio-code",
+      "/usr/share/cursor"
+    ]) {
+      appRoots.push(dir);
+    }
+  }
+  const out = [];
+  for (const root of appRoots) {
+    for (const resDir of resourceDirs) {
+      for (const rel of relSuffixes) {
+        out.push(pathMod.join(root, resDir, rel));
+      }
+    }
+  }
+  return out;
+}
+function resolveBundledRipgrepBinary(env = process.env, platform = process.platform) {
+  const explicitRg = env.AGY_FAST_RG_PATH?.trim();
+  if (explicitRg) {
+    return isExecutableFileSync(explicitRg, platform) ? path.resolve(explicitRg) : null;
+  }
+  if (env.AGY_FAST_DISABLE_BUNDLED_RG === "1") return null;
+  const homeDir = getHomeDirSafe(env, platform);
+  for (const cand of getBundledRipgrepCandidates(platform, env, homeDir)) {
+    if (isExecutableFileSync(cand, platform)) {
+      return cand;
+    }
+  }
+  return null;
+}
+function getEnvPathKeyAndValue(env) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  return { key, value: env[key] ?? "" };
+}
+var cachedEnrichedPathKey = null;
+var cachedEnrichedPathValue = null;
+function buildEnrichedPath(env = process.env, platform = process.platform) {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  if (rawPath.trim() === "") return rawPath;
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = `${platform}|${rawPath}|${home}|${process.execPath}`;
+  if (cachedEnrichedPathKey === cacheKey && cachedEnrichedPathValue !== null) {
+    return cachedEnrichedPathValue;
+  }
+  const delim = platform === "win32" ? ";" : ":";
+  const existing = rawPath.split(delim).filter(Boolean);
+  const compareNorm = (p) => {
+    const cleaned = p.trim().replace(/^"+|"+$/g, "").trim();
+    if (!cleaned) return "";
+    return platform === "win32" || platform === "darwin" ? path.resolve(cleaned).toLowerCase() : path.resolve(cleaned);
+  };
+  const seen = new Set(existing.map(compareNorm).filter(Boolean));
+  const result = [...existing];
+  const addDir = (dir) => {
+    if (!dir) return;
+    const norm = compareNorm(dir);
+    if (!norm || seen.has(norm)) return;
+    try {
+      if (!fs.statSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
+    seen.add(norm);
+    result.push(dir);
+  };
+  addDir(path.dirname(process.execPath));
+  if (platform !== "win32") {
+    for (const stdDir of [
+      home ? path.join(home, ".local", "bin") : "",
+      home ? path.join(home, ".cargo", "bin") : "",
+      home ? path.join(home, ".volta", "bin") : "",
+      home ? path.join(home, ".bun", "bin") : "",
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin"
+    ]) {
+      addDir(stdDir);
+    }
+  }
+  cachedEnrichedPathKey = cacheKey;
+  cachedEnrichedPathValue = result.join(delim);
+  return cachedEnrichedPathValue;
+}
+function buildSpawnEnv(env, platform = process.platform) {
+  const { key: pathKey, value: current } = getEnvPathKeyAndValue(env);
+  if (current.trim() === "") {
+    return env;
+  }
+  const enriched = buildEnrichedPath(env, platform);
+  if (enriched === current) return env;
+  return { ...env, [pathKey]: enriched };
+}
+var cachedRgBinaryKey = null;
+var cachedRgBinaryValue = null;
+function resolveRipgrepBinary(env = process.env, platform = process.platform) {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = [
+    platform,
+    rawPath,
+    home,
+    env.LOCALAPPDATA ?? "",
+    env.ProgramFiles ?? "",
+    env["ProgramFiles(x86)"] ?? "",
+    env.AGY_FAST_RG_PATH ?? "",
+    env.AGY_FAST_IDE_ROOT ?? "",
+    env.AGY_FAST_DISABLE_BUNDLED_RG ?? ""
+  ].join("|");
+  if (cachedRgBinaryKey === cacheKey) {
+    return cachedRgBinaryValue;
+  }
+  let resolved = null;
+  const explicitRg = env.AGY_FAST_RG_PATH?.trim();
+  if (explicitRg) {
+    resolved = isExecutableFileSync(explicitRg, platform) ? path.resolve(explicitRg) : null;
+  } else if (rawPath.trim() === "") {
+    resolved = null;
+  } else {
+    const enrichedPath = buildEnrichedPath(env, platform);
+    resolved = findBinaryInPathSync("rg", enrichedPath, platform) ?? resolveBundledRipgrepBinary(env, platform);
+  }
+  cachedRgBinaryKey = cacheKey;
+  cachedRgBinaryValue = resolved;
+  return resolved;
+}
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
@@ -1179,7 +1392,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         detached,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? process.env
+        env: options.env !== void 0 ? options.env : buildSpawnEnv(process.env)
       });
     } catch (err) {
       resolve({
@@ -1263,14 +1476,28 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   });
 }
 var cachedRgAvailable = null;
+var cachedRgAvailableBin = null;
 var pendingRgProbe = null;
+var pendingRgProbeBin = null;
 async function isRipgrepAvailable() {
-  if (cachedRgAvailable !== null) return cachedRgAvailable;
-  if (pendingRgProbe) return pendingRgProbe;
+  const rgBin = resolveRipgrepBinary(process.env);
+  if (!rgBin) {
+    cachedRgAvailable = false;
+    cachedRgAvailableBin = null;
+    pendingRgProbe = null;
+    pendingRgProbeBin = null;
+    return false;
+  }
+  if (cachedRgAvailable !== null && cachedRgAvailableBin === rgBin) {
+    return cachedRgAvailable;
+  }
+  if (pendingRgProbe && pendingRgProbeBin === rgBin) {
+    return pendingRgProbe;
+  }
   let probe = null;
   probe = (async () => {
     try {
-      const res = await execBinaryAsync("rg", ["--version"], {
+      const res = await execBinaryAsync(rgBin, ["--version"], {
         cwd: os.tmpdir(),
         timeoutMs: 2e3,
         maxOutputBytes: 4096
@@ -1278,22 +1505,165 @@ async function isRipgrepAvailable() {
       const available = !res.error && !res.timedOut && res.exitCode === 0;
       if (!res.timedOut && pendingRgProbe === probe) {
         cachedRgAvailable = available;
+        cachedRgAvailableBin = rgBin;
       }
       return available;
     } finally {
       if (pendingRgProbe === probe) {
         pendingRgProbe = null;
+        pendingRgProbeBin = null;
       }
     }
   })();
   pendingRgProbe = probe;
+  pendingRgProbeBin = rgBin;
   return probe;
 }
 
-// src/utils/host-compat.ts
-import fs from "node:fs";
+// src/utils/mcp-cwd.ts
+import fs2 from "node:fs";
 import os2 from "node:os";
 import path2 from "node:path";
+function isExplicitAbsoluteOrHomePath(raw, platform = process.platform) {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return true;
+  }
+  if (platform === "win32") {
+    return /^[A-Za-z]:[\\/]/.test(trimmed) || /^\\\\[^\\]/.test(trimmed);
+  }
+  return path2.posix.isAbsolute(trimmed);
+}
+function expandHomeIfNeeded(rawPath, env = process.env, platform = process.platform) {
+  const trimmed = rawPath.trim();
+  if (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    const driveHome = platform === "win32" && env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : "";
+    const home = (platform === "win32" ? env.USERPROFILE || driveHome || env.HOME : env.HOME || env.USERPROFILE) || os2.homedir();
+    return trimmed === "~" ? home : path2.join(home, trimmed.slice(2));
+  }
+  return path2.resolve(trimmed);
+}
+function extractLineRangeSpecPath(spec) {
+  if (typeof spec !== "string") return null;
+  const trimmed = spec.trim();
+  const m = /^(.+):\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.exec(trimmed);
+  return m?.[1]?.trim() ?? null;
+}
+function parseArrayOrJsonString(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+function inferCwdFromAllAbsoluteToolArgs(toolName, args, platform = process.platform, env = process.env) {
+  const candidateTargets = [];
+  if (toolName === "quick_outline") {
+    const list = parseArrayOrJsonString(args.paths);
+    if (!list || list.length === 0) return null;
+    for (const item of list) {
+      if (!isExplicitAbsoluteOrHomePath(item, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(item, env, platform), kind: "file" });
+    }
+  } else if (toolName === "read_slices") {
+    const hasOutlines = args.outlines !== void 0;
+    const hasSlices = args.slices !== void 0;
+    const hasLineRanges = args.lineRanges !== void 0;
+    const outlines = hasOutlines ? parseArrayOrJsonString(args.outlines) : [];
+    const slices = hasSlices ? parseArrayOrJsonString(args.slices) : [];
+    const lineRanges = hasLineRanges ? parseArrayOrJsonString(args.lineRanges) : [];
+    if (!outlines || !slices || !lineRanges) return null;
+    if (outlines.length === 0 && slices.length === 0 && lineRanges.length === 0) {
+      return null;
+    }
+    for (const p of outlines) {
+      if (!isExplicitAbsoluteOrHomePath(p, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(p, env, platform), kind: "file" });
+    }
+    for (const s of slices) {
+      if (typeof s === "string") {
+        const sp = extractLineRangeSpecPath(s);
+        if (!sp || !isExplicitAbsoluteOrHomePath(sp, platform)) return null;
+        candidateTargets.push({ target: expandHomeIfNeeded(sp, env, platform), kind: "file" });
+      } else if (s && typeof s === "object" && !Array.isArray(s)) {
+        const sp = s.path;
+        if (!isExplicitAbsoluteOrHomePath(sp, platform)) return null;
+        candidateTargets.push({ target: expandHomeIfNeeded(sp, env, platform), kind: "file" });
+      } else {
+        return null;
+      }
+    }
+    for (const lr of lineRanges) {
+      const sp = extractLineRangeSpecPath(lr);
+      if (!sp || !isExplicitAbsoluteOrHomePath(sp, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(sp, env, platform), kind: "file" });
+    }
+  } else if (toolName === "apply_edits") {
+    if (args.verify !== void 0 && args.verify !== null && args.verify !== "") {
+      if (typeof args.verify === "string") return null;
+      if (typeof args.verify === "object" && !Array.isArray(args.verify)) {
+        const vCwd = args.verify.cwd;
+        if (!isExplicitAbsoluteOrHomePath(vCwd, platform)) return null;
+        candidateTargets.push({ target: expandHomeIfNeeded(vCwd, env, platform), kind: "dir" });
+      } else {
+        return null;
+      }
+    }
+    const rawEdits = parseArrayOrJsonString(args.edits);
+    if (!rawEdits || rawEdits.length === 0) return null;
+    for (const item of rawEdits) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const p = item.path;
+      if (!isExplicitAbsoluteOrHomePath(p, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(p, env, platform), kind: "file" });
+    }
+  } else if (toolName === "batch_search") {
+    const queries = parseArrayOrJsonString(args.queries);
+    if (!queries || queries.length === 0) return null;
+    for (const q of queries) {
+      if (!q || typeof q !== "object" || Array.isArray(q)) return null;
+      const p = q.path;
+      if (!isExplicitAbsoluteOrHomePath(p, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(p, env, platform), kind: "auto" });
+    }
+  } else if (toolName === "run_checks") {
+    const commands = parseArrayOrJsonString(args.commands);
+    if (!commands || commands.length === 0) return null;
+    for (const c of commands) {
+      if (!c || typeof c !== "object" || Array.isArray(c)) return null;
+      const cmdCwd = c.cwd;
+      if (!isExplicitAbsoluteOrHomePath(cmdCwd, platform)) return null;
+      candidateTargets.push({ target: expandHomeIfNeeded(cmdCwd, env, platform), kind: "dir" });
+    }
+  }
+  if (candidateTargets.length === 0) return null;
+  const first = candidateTargets[0];
+  if (first.kind === "dir") {
+    return first.target;
+  }
+  if (first.kind === "auto") {
+    try {
+      if (fs2.statSync(first.target).isDirectory()) return first.target;
+    } catch {
+    }
+  }
+  return path2.dirname(first.target);
+}
+
+// src/utils/host-compat.ts
+import fs3 from "node:fs";
+import os3 from "node:os";
+import path3 from "node:path";
 
 // src/utils/output-filter.ts
 var ANSI_REGEX = (
@@ -2344,7 +2714,7 @@ function parseSurfaceFromClientName(rawName) {
   if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
     return "ide";
   }
-  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop|hub))?$/.test(s) || /^hub$/.test(s)) {
     return "desktop";
   }
   return null;
@@ -2510,13 +2880,13 @@ function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
-  return path2.join(cacheDir, "config.json");
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+  const cacheDir = custom ? path3.resolve(custom) : path3.join(home, ".gemini", "cache", "agy-fast");
+  return path3.join(cacheDir, "config.json");
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
-    const raw = fs.readFileSync(getConfigPath(env), "utf8");
+    const raw = fs3.readFileSync(getConfigPath(env), "utf8");
     const parsed = JSON.parse(raw);
     return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
   } catch {
@@ -2525,8 +2895,8 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/tools/apply-edits.ts
-import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
+import { promises as fs5 } from "node:fs";
+import path5 from "node:path";
 
 // src/utils/arg-validation.ts
 function isPlainObject(value) {
@@ -2601,9 +2971,9 @@ function formatCorruptedArrayError(options) {
 }
 
 // src/utils/fs-utils.ts
-import { promises as fs2 } from "node:fs";
-import os3 from "node:os";
-import path3 from "node:path";
+import { promises as fs4 } from "node:fs";
+import os4 from "node:os";
+import path4 from "node:path";
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   ".git",
   ".hg",
@@ -2631,19 +3001,19 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   "vendor"
 ]);
 function expandHome(inputPath) {
-  if (inputPath === "~") return os3.homedir();
+  if (inputPath === "~") return os4.homedir();
   if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path3.join(os3.homedir(), inputPath.slice(2));
+    return path4.join(os4.homedir(), inputPath.slice(2));
   }
   return inputPath;
 }
 function resolvePath(inputPath, baseDir) {
   const expanded = expandHome(inputPath.trim());
-  const root = baseDir ? path3.resolve(expandHome(baseDir)) : process.cwd();
-  return path3.resolve(root, expanded);
+  const root = baseDir ? path4.resolve(expandHome(baseDir)) : process.cwd();
+  return path4.resolve(root, expanded);
 }
 function toPosixPath(p) {
-  return p.split(path3.sep).join("/");
+  return p.split(path4.sep).join("/");
 }
 function isLikelyBinary(buf) {
   const limit = Math.min(buf.length, 8192);
@@ -2669,7 +3039,7 @@ function detectUtf16Bom(buf) {
   return null;
 }
 async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
-  const stat = await fs2.stat(filePath);
+  const stat = await fs4.stat(filePath);
   if (!stat.isFile()) {
     throw new Error(`Not a regular file: ${filePath}`);
   }
@@ -2678,7 +3048,7 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
       `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
     );
   }
-  const buf = await fs2.readFile(filePath);
+  const buf = await fs4.readFile(filePath);
   const utf16Bom = detectUtf16Bom(buf);
   if (utf16Bom) {
     throw new Error(
@@ -2857,7 +3227,7 @@ async function walkFiles(rootDir, options = {}) {
     if (truncated) return null;
     activeReaddirs++;
     try {
-      return await fs2.readdir(dir, { withFileTypes: true });
+      return await fs4.readdir(dir, { withFileTypes: true });
     } finally {
       activeReaddirs--;
       if (truncated) {
@@ -2890,7 +3260,7 @@ async function walkFiles(rootDir, options = {}) {
       const relPosix = relDir ? `${relDir}/${name}` : name;
       if (entry.isDirectory()) {
         if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: path3.join(dir, name), rel: relPosix });
+        subdirs.push({ abs: path4.join(dir, name), rel: relPosix });
       } else if (entry.isFile()) {
         if (fileFilter && !fileFilter(relPosix)) continue;
         localFiles.push(relPosix);
@@ -3314,7 +3684,7 @@ function countLines(text) {
 }
 var OVERWRITE_HEADER_PEEK_BYTES = 8192;
 async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
-  const fh = await fs3.open(filePath, "r");
+  const fh = await fs5.open(filePath, "r");
   try {
     const buf = Buffer.allocUnsafe(maxBytes);
     const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
@@ -3341,7 +3711,7 @@ async function readOverwriteOriginal(writeTargetPath, size, relPath) {
       return { ok: false, error: nonTextErr2 };
     }
   }
-  const buffer = await fs3.readFile(writeTargetPath);
+  const buffer = await fs5.readFile(writeTargetPath);
   const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
   if (nonTextErr) {
     return { ok: false, error: nonTextErr };
@@ -3364,20 +3734,20 @@ function isGitInternalPath(filePath, platform = process.platform) {
 }
 async function canonicalizeTargetPath(absPath) {
   try {
-    return await fs3.realpath(absPath);
+    return await fs5.realpath(absPath);
   } catch {
     const trailingSegments = [];
     let current = absPath;
     while (true) {
-      const parent = path4.dirname(current);
+      const parent = path5.dirname(current);
       if (parent === current) {
         return absPath;
       }
-      trailingSegments.push(path4.basename(current));
+      trailingSegments.push(path5.basename(current));
       current = parent;
       try {
-        const realAncestor = await fs3.realpath(current);
-        return path4.join(realAncestor, ...trailingSegments.reverse());
+        const realAncestor = await fs5.realpath(current);
+        return path5.join(realAncestor, ...trailingSegments.reverse());
       } catch {
       }
     }
@@ -3385,17 +3755,17 @@ async function canonicalizeTargetPath(absPath) {
 }
 async function findMissingAncestorDirs(dir) {
   const missing = [];
-  let current = path4.resolve(dir);
+  let current = path5.resolve(dir);
   while (true) {
     try {
-      await fs3.lstat(current);
+      await fs5.lstat(current);
       break;
     } catch (err) {
       if (err?.code !== "ENOENT") {
         break;
       }
       missing.push(current);
-      const parent = path4.dirname(current);
+      const parent = path5.dirname(current);
       if (parent === current) break;
       current = parent;
     }
@@ -3410,7 +3780,7 @@ async function commitPlannedWrites(plans) {
     for (const plan of plans) {
       if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
-      const dir = path4.dirname(target);
+      const dir = path5.dirname(target);
       const missingDirs = await findMissingAncestorDirs(dir);
       for (let i = missingDirs.length - 1; i >= 0; i--) {
         const d = missingDirs[i];
@@ -3419,42 +3789,42 @@ async function commitPlannedWrites(plans) {
           createdDirs.push(d);
         }
       }
-      await fs3.mkdir(dir, { recursive: true });
-      const tmpPath = path4.join(
+      await fs5.mkdir(dir, { recursive: true });
+      const tmpPath = path5.join(
         dir,
         `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
       );
       try {
-        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs5.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs3.chmod(tmpPath, plan.originalMode);
+          await fs5.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs5.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs3.rename(tmpPath, target);
+        await fs5.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs5.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs3.unlink(target);
+            await fs5.unlink(target);
           } catch {
           }
         }
-        await fs3.writeFile(target, plan.newContent, "utf8");
+        await fs5.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs3.chmod(target, plan.originalMode);
+            await fs5.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -3467,23 +3837,23 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs3.unlink(target).catch(() => {
+          await fs5.unlink(target).catch(() => {
           });
-          await fs3.symlink(item.originalSymlinkTarget, target);
+          await fs5.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs3.writeFile(target, item.originalBuffer);
+          await fs5.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs3.chmod(target, item.originalMode);
+            await fs5.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs3.unlink(target);
+          await fs5.unlink(target);
         }
       } catch {
       }
     }
     for (let i = createdDirs.length - 1; i >= 0; i--) {
       try {
-        await fs3.rmdir(createdDirs[i]);
+        await fs5.rmdir(createdDirs[i]);
       } catch {
       }
     }
@@ -3745,7 +4115,7 @@ async function runApplyEdits(input) {
   if (!input.dryRun && validatedVerify?.cwd) {
     const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
     try {
-      const st = await fs3.stat(resolvedVerifyCwd);
+      const st = await fs5.stat(resolvedVerifyCwd);
       if (!st.isDirectory()) {
         return {
           text: `Validation failed (0 files modified):
@@ -3771,7 +4141,7 @@ async function runApplyEdits(input) {
     }
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
-    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
     if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
       errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
       continue;
@@ -3819,10 +4189,10 @@ async function runApplyEdits(input) {
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs3.lstat(item.writeTargetPath);
+        const lst = await fs5.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs3.stat(item.writeTargetPath);
+            const st = await fs5.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -3854,7 +4224,7 @@ async function runApplyEdits(input) {
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs5.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -3863,7 +4233,7 @@ async function runApplyEdits(input) {
             }
           }
         } else {
-          const st = await fs3.stat(item.writeTargetPath);
+          const st = await fs5.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -4090,8 +4460,8 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 }
 
 // src/tools/batch-search.ts
-import { promises as fs4 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs6 } from "node:fs";
+import path6 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -4575,7 +4945,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path6.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
@@ -4583,7 +4953,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs4.stat(searchRoot);
+  const fileStat = await fs6.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -4597,12 +4967,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path6.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs4.open(searchRoot, "r");
+    const fh = await fs6.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -4629,10 +4999,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const relNative = path5.relative(baseCwd, searchRoot);
+  const relNative = path6.relative(baseCwd, searchRoot);
   const relRoot = toPosixPath(relNative);
-  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path5.isAbsolute(relRoot);
-  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path5.sep}-` : relNative : searchRoot;
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path6.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path6.sep}-` : relNative : searchRoot;
   const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
   const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
@@ -4650,8 +5020,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
+  const rgBin = resolveRipgrepBinary() ?? "rg";
   const runRg = async (runArgs, opts) => {
-    const res = await execBinaryAsync("rg", runArgs, {
+    const res = await execBinaryAsync(rgBin, runArgs, {
       cwd: baseCwd,
       timeoutMs: 15e3,
       maxOutputBytes: 2 * 1024 * 1024
@@ -4745,9 +5116,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, path5.resolve(baseCwd, rawFile));
-    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path5.sep}`) && !path5.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
+    const rel = path6.relative(baseCwd, path6.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path6.sep}`) && !path6.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path6.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -4977,11 +5348,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs4.stat(searchRoot);
+  const stat = await fs6.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
+    const relPosix = toPosixPath(path6.relative(baseCwd, searchRoot)) || path6.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
@@ -5004,12 +5375,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       fileFilter: globMatchesFile
     });
     discoveryTruncated = walked.truncated;
-    const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const rootRel = toPosixPath(path6.relative(baseCwd, searchRoot));
     const useFastPrefix = Boolean(
-      rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
+      rootRel === "" || !rootRel.startsWith("..") && !path6.isAbsolute(rootRel)
     );
     targetFiles = walked.files.map((rel) => {
-      const abs = path5.join(searchRoot, rel);
+      const abs = path6.join(searchRoot, rel);
       const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
       return { abs, rel: displayRel };
     });
@@ -5073,9 +5444,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
-          const st = await fs4.stat(absFile);
+          const st = await fs6.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs4.readFile(absFile);
+          const buf = await fs6.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
@@ -5206,13 +5577,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path6.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs6.lstat(path6.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -5249,8 +5620,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
-    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    const base = path5.basename(searchRoot);
+    const rel = toPosixPath(path6.relative(baseCwd, searchRoot)) || path6.basename(searchRoot);
+    const base = path6.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -5301,7 +5672,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
+  return toPosixPath(path6.relative(baseCwd, path6.resolve(baseCwd, file))) || path6.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
@@ -5309,7 +5680,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchesType = fileTypeMatcher(query.fileType);
   const maxResults = clampInt(query.maxResults, 1, 200, 30);
   const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path6.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
   const footer = walked.truncated || totalMatched > maxResults ? `
@@ -5906,12 +6277,12 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs4.stat(searchRoot);
+      targetStat = await fs6.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path6.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd);
       return { header, text: `${header}
 ${out}` };
@@ -6029,7 +6400,7 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs6.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -6102,7 +6473,7 @@ function clampInt(val, min, max, fallback = min) {
 }
 
 // src/tools/read-slices.ts
-import path6 from "node:path";
+import path7 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -8120,7 +8491,7 @@ function extractSfcSymbols(lines, mode) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path7.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -8542,7 +8913,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path7.relative(baseCwd, absPath)) || path7.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -8583,7 +8954,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path7.relative(baseCwd, absPath)) || path7.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -8765,7 +9136,7 @@ async function runQuickOutline(input) {
 }
 
 // src/tools/run-checks.ts
-import { promises as fs5 } from "node:fs";
+import { promises as fs7 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -8843,7 +9214,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs5.stat(baseCwd);
+    const st = await fs7.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -8875,7 +9246,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs5.stat(cmdCwd);
+        const st = await fs7.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -9928,14 +10299,14 @@ function shouldCliExitNonZero(tool, result) {
 
 // src/mcp-server.ts
 var SERVER_VERSION = "0.3.1";
-var DEFAULT_PLUGIN_ROOT = path7.resolve(
-  path7.dirname(fileURLToPath2(import.meta.url)),
+var DEFAULT_PLUGIN_ROOT = path8.resolve(
+  path8.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
 function canonicalizeDir(dirPath) {
-  const resolved = path7.resolve(dirPath);
+  const resolved = path8.resolve(dirPath);
   try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+    return typeof fs8.realpathSync.native === "function" ? fs8.realpathSync.native(resolved) : fs8.realpathSync(resolved);
   } catch {
     return resolved;
   }
@@ -9944,8 +10315,8 @@ function isSameOrSubdir(candidate, root) {
   const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
   const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path7.relative(normRoot, normCandidate);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
+  const rel = path8.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path8.sep}`) && !path8.isAbsolute(rel);
 }
 function isInstalledPluginPath(dirPath) {
   const posix = dirPath.replace(/\\/g, "/");
@@ -9959,15 +10330,15 @@ function isSameDir(a, b) {
 }
 function detectNonWorkspaceCwd(env, currentCwd) {
   const canonCwd = canonicalizeDir(currentCwd);
-  if (path7.parse(canonCwd).root === canonCwd) {
+  if (path8.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
+  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path8.isAbsolute(p);
   const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
   const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
   if (homes.length === 0 && env === process.env) {
     try {
-      const osHome = os4.homedir();
+      const osHome = os5.homedir();
       if (isFullAbsPath(osHome)) homes.push(osHome);
     } catch {
     }
@@ -9991,7 +10362,7 @@ function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
   }
   const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
   if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs8.existsSync(path8.join(canonScriptRoot, "plugin.json")) && !fs8.existsSync(path8.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -10068,7 +10439,7 @@ function createAgyFastServer(options = {}) {
     configEditsFormat: savedEditsFormat
   });
   let defaultCwd;
-  const resolveToolArgs = (args) => {
+  const resolveToolArgs = (toolName, args) => {
     if (args.cwd !== void 0 && args.cwd !== null && typeof args.cwd !== "string") {
       return {
         ok: false,
@@ -10076,12 +10447,23 @@ function createAgyFastServer(options = {}) {
       };
     }
     const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
-    const isHomePath = rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
     if (!rawCwd) {
       if (defaultCwd) {
         return {
           ok: true,
           value: { ...args, cwd: defaultCwd }
+        };
+      }
+      const inferredAbsCwd = inferCwdFromAllAbsoluteToolArgs(
+        toolName,
+        args,
+        process.platform,
+        env
+      );
+      if (inferredAbsCwd) {
+        return {
+          ok: true,
+          value: { ...args, cwd: inferredAbsCwd }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -10107,11 +10489,11 @@ function createAgyFastServer(options = {}) {
         value: { ...args, cwd: void 0 }
       };
     }
-    if (!path7.isAbsolute(rawCwd) && !isHomePath) {
+    if (!isExplicitAbsoluteOrHomePath(rawCwd)) {
       if (defaultCwd) {
         return {
           ok: true,
-          value: { ...args, cwd: path7.resolve(defaultCwd, rawCwd) }
+          value: { ...args, cwd: path8.resolve(defaultCwd, rawCwd) }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -10151,14 +10533,13 @@ function createAgyFastServer(options = {}) {
         return false;
       }
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
-      const trimmed = rawCwd.trim();
-      const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path7.isAbsolute(trimmed) && !isHome;
+      return !isExplicitAbsoluteOrHomePath(rawCwd);
     },
     onWorkspaceRoots: (paths) => {
+      defaultCwd = void 0;
       for (const candidate of paths) {
         try {
-          if (fs6.statSync(candidate).isDirectory()) {
+          if (fs8.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
@@ -10209,7 +10590,7 @@ function createAgyFastServer(options = {}) {
       }
     },
     async (args) => {
-      const resolved = resolveToolArgs(args);
+      const resolved = resolveToolArgs("batch_search", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runBatchSearch(resolved.value);
     }
@@ -10217,7 +10598,7 @@ function createAgyFastServer(options = {}) {
   server.registerTool(
     () => buildApplyEditsToolDefinition(hostCompat),
     async (args) => {
-      const resolved = resolveToolArgs(args);
+      const resolved = resolveToolArgs("apply_edits", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runApplyEdits(resolved.value);
     }
@@ -10266,7 +10647,7 @@ function createAgyFastServer(options = {}) {
       }
     },
     async (args) => {
-      const resolved = resolveToolArgs(args);
+      const resolved = resolveToolArgs("read_slices", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runReadSlices(resolved.value);
     }
@@ -10291,7 +10672,7 @@ function createAgyFastServer(options = {}) {
       }
     },
     async (args) => {
-      const resolved = resolveToolArgs(args);
+      const resolved = resolveToolArgs("quick_outline", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runQuickOutline(resolved.value);
     }
@@ -10328,7 +10709,7 @@ function createAgyFastServer(options = {}) {
       }
     },
     async (args) => {
-      const resolved = resolveToolArgs(args);
+      const resolved = resolveToolArgs("run_checks", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runChecks(resolved.value);
     }

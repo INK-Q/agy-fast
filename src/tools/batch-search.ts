@@ -9,6 +9,7 @@ import {
 import {
   execBinaryAsync,
   isRipgrepAvailable,
+  resolveRipgrepBinary,
   withNonInteractiveGitEnv,
   type ExecResult,
 } from "../utils/exec-utils.js";
@@ -627,11 +628,13 @@ async function runTextOrRegexWithRg(
     }
   }
 
+  const rgBin = resolveRipgrepBinary() ?? "rg";
+
   const runRg = async (
     runArgs: string[],
     opts?: { allowPartialError?: boolean },
   ): Promise<ExecResult> => {
-    const res = await execBinaryAsync("rg", runArgs, {
+    const res = await execBinaryAsync(rgBin, runArgs, {
       cwd: baseCwd,
       timeoutMs: 15_000,
       maxOutputBytes: 2 * 1024 * 1024,

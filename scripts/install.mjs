@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -961,9 +961,81 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   return { synced: true, mode };
 }
 
+async function isExecutableFile(filePath) {
+  try {
+    const st = await fs.stat(filePath);
+    if (!st.isFile()) return false;
+    if (process.platform !== "win32") {
+      await fs.access(filePath, fsConstants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findBundledRipgrep() {
+  if (process.env.AGY_FAST_DISABLE_BUNDLED_RG === "1") {
+    return null;
+  }
+  const home = getHomeDir();
+  const rgName = process.platform === "win32" ? "rg.exe" : "rg";
+  const resourceDirs =
+    process.platform === "darwin" ? ["Resources", "resources"] : ["resources"];
+  const relSuffixes = [
+    path.join("app", "node_modules", "@vscode", "ripgrep", "bin", rgName),
+    path.join("app", "node_modules.asar.unpacked", "@vscode", "ripgrep", "bin", rgName),
+  ];
+  const roots = [];
+  if (process.env.AGY_FAST_IDE_ROOT?.trim()) roots.push(process.env.AGY_FAST_IDE_ROOT.trim());
+  if (process.platform === "darwin") {
+    for (const base of ["/Applications", path.join(home, "Applications")]) {
+      for (const app of ["Antigravity IDE.app", "Antigravity.app", "Visual Studio Code.app", "Cursor.app"]) {
+        roots.push(path.join(base, app, "Contents"));
+      }
+    }
+  } else if (process.platform === "win32") {
+    for (const base of [
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs") : "",
+      process.env.ProgramFiles || "",
+      process.env["ProgramFiles(x86)"] || "",
+    ]) {
+      if (!base) continue;
+      for (const app of ["Antigravity IDE", "Antigravity", "Microsoft VS Code", "cursor"]) {
+        roots.push(path.join(base, app));
+      }
+    }
+  } else {
+    roots.push(
+      "/opt/antigravity-ide",
+      "/usr/share/antigravity-ide",
+      "/opt/Antigravity",
+      "/usr/share/code",
+      "/opt/visual-studio-code",
+      "/usr/share/cursor",
+    );
+  }
+  for (const r of roots) {
+    for (const resDir of resourceDirs) {
+      for (const rel of relSuffixes) {
+        const cand = path.join(r, resDir, rel);
+        if (await isExecutableFile(cand)) return cand;
+      }
+    }
+  }
+  return null;
+}
+
 async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const nodeVer = checkNodeVersion();
-  const hasRg = hasCommand("rg", ["--version"]);
+  const explicitRgRaw = process.env.AGY_FAST_RG_PATH?.trim() || "";
+  const explicitRg =
+    explicitRgRaw && (await isExecutableFile(explicitRgRaw))
+      ? path.resolve(explicitRgRaw)
+      : null;
+  const hasPathRg = !explicitRgRaw && hasCommand("rg", ["--version"]);
+  const bundledRg = !explicitRgRaw && !hasPathRg ? await findBundledRipgrep() : null;
+  const hasRg = Boolean(explicitRg) || hasPathRg || Boolean(bundledRg);
   const hasAgy = hasCommand("agy", ["--version"]);
   const exists = await pathExists(targetDir);
 
@@ -1078,7 +1150,15 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     console.log(`  - Version     : v${installedVersion}`);
     console.log(`  - Node.js     : v${nodeVer} (OK)`);
     console.log(
-      `  - ripgrep (rg): ${hasRg ? "available (fast search active)" : "not found (automatic Node.js fallback active)"}`,
+      `  - ripgrep (rg): ${
+        explicitRg
+          ? `available via AGY_FAST_RG_PATH (${explicitRg})`
+          : hasPathRg
+            ? "available (fast search active)"
+            : bundledRg
+              ? `available via IDE bundle (${bundledRg})`
+              : "not found (automatic Node.js fallback active)"
+      }`,
     );
     console.log(
       `  - MCP server  : ${
@@ -1544,6 +1624,19 @@ async function runUpdate(opts) {
 
   if (parsed.status === "error") {
     throw new Error(parsed.error || parsed.message);
+  }
+
+  // Persist --channel / --repo only on non-check runs AFTER updater validates/succeeds
+  if (
+    !opts.checkOnly &&
+    parsed.status !== "error" &&
+    !/^skipped-/.test(String(parsed.status || "")) &&
+    (opts.channel || opts.repoUrl)
+  ) {
+    const postPatch = {};
+    if (opts.channel) postPatch.channel = opts.channel;
+    if (opts.repoUrl) postPatch.repoUrl = opts.repoUrl;
+    await writeUpdaterConfigFile(postPatch);
   }
 
   const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;

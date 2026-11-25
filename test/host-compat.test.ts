@@ -106,6 +106,21 @@ describe("host-compat version & surface controller", () => {
     assert.equal(doctorId.surface, "unknown");
     assert.equal(doctorId.version, null);
 
+    // Desktop 2.0 Hub MCP clientInfo ("hub") must NOT inherit ambient CLI LS version from parent shell
+    const hubWithCliEnv = detectHostIdentity({
+      clientInfo: { name: "hub", version: "2.34.0" },
+      env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.6" },
+    });
+    assert.equal(hubWithCliEnv.surface, "desktop");
+    assert.equal(hubWithCliEnv.version, "2.34.0");
+    assert.equal(
+      resolveHostCompat({
+        clientInfo: { name: "hub", version: "2.34.0" },
+        env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.6" },
+      }).editsFormat,
+      "array",
+    );
+
     // Explicit AGY_FAST_HOST override
     assert.deepEqual(parseHostOverride("cli@1.5.14"), { surface: "cli", version: "1.5.14" });
     assert.deepEqual(parseHostOverride("cli@1.5.13.4"), { surface: "cli", version: "1.5.13" });

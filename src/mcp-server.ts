@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
 import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
 import {
+  inferCwdFromAllAbsoluteToolArgs,
+  isExplicitAbsoluteOrHomePath,
+} from "./utils/mcp-cwd.js";
+import {
   readSavedEditsFormatSync,
   resolveHostCompat,
   type EditsFormatMode,
@@ -231,6 +235,7 @@ export function createAgyFastServer(
   let defaultCwd: string | undefined;
 
   const resolveToolArgs = <T extends { cwd?: string }>(
+    toolName: string,
     args: Record<string, unknown>,
   ): { ok: true; value: T } | { ok: false; error: string } => {
     if (args.cwd !== undefined && args.cwd !== null && typeof args.cwd !== "string") {
@@ -240,13 +245,23 @@ export function createAgyFastServer(
       };
     }
     const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
-    const isHomePath =
-      rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
     if (!rawCwd) {
       if (defaultCwd) {
         return {
           ok: true,
           value: { ...args, cwd: defaultCwd } as unknown as T,
+        };
+      }
+      const inferredAbsCwd = inferCwdFromAllAbsoluteToolArgs(
+        toolName,
+        args,
+        process.platform,
+        env,
+      );
+      if (inferredAbsCwd) {
+        return {
+          ok: true,
+          value: { ...args, cwd: inferredAbsCwd } as unknown as T,
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -272,7 +287,7 @@ export function createAgyFastServer(
         value: { ...args, cwd: undefined } as unknown as T,
       };
     }
-    if (!path.isAbsolute(rawCwd) && !isHomePath) {
+    if (!isExplicitAbsoluteOrHomePath(rawCwd)) {
       if (defaultCwd) {
         return {
           ok: true,
@@ -317,12 +332,10 @@ export function createAgyFastServer(
         return false;
       }
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
-      const trimmed = rawCwd.trim();
-      const isHome =
-        trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path.isAbsolute(trimmed) && !isHome;
+      return !isExplicitAbsoluteOrHomePath(rawCwd);
     },
     onWorkspaceRoots: (paths) => {
+      defaultCwd = undefined;
       for (const candidate of paths) {
         try {
           if (fs.statSync(candidate).isDirectory()) {
@@ -379,7 +392,7 @@ export function createAgyFastServer(
       },
     },
     async (args) => {
-      const resolved = resolveToolArgs<BatchSearchInput>(args);
+      const resolved = resolveToolArgs<BatchSearchInput>("batch_search", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runBatchSearch(resolved.value);
     },
@@ -388,7 +401,7 @@ export function createAgyFastServer(
   server.registerTool(
     () => buildApplyEditsToolDefinition(hostCompat),
     async (args) => {
-      const resolved = resolveToolArgs<ApplyEditsInput>(args);
+      const resolved = resolveToolArgs<ApplyEditsInput>("apply_edits", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runApplyEdits(resolved.value);
     },
@@ -439,7 +452,7 @@ export function createAgyFastServer(
       },
     },
     async (args) => {
-      const resolved = resolveToolArgs<ReadSlicesInput>(args);
+      const resolved = resolveToolArgs<ReadSlicesInput>("read_slices", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runReadSlices(resolved.value);
     },
@@ -466,7 +479,7 @@ export function createAgyFastServer(
       },
     },
     async (args) => {
-      const resolved = resolveToolArgs<QuickOutlineInput>(args);
+      const resolved = resolveToolArgs<QuickOutlineInput>("quick_outline", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runQuickOutline(resolved.value);
     },
@@ -505,7 +518,7 @@ export function createAgyFastServer(
       },
     },
     async (args) => {
-      const resolved = resolveToolArgs<RunChecksInput>(args);
+      const resolved = resolveToolArgs<RunChecksInput>("run_checks", args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runChecks(resolved.value);
     },

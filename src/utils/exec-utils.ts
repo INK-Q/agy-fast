@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -610,14 +611,18 @@ function hasDefinedEnvKey(
 }
 
 export function withNonInteractiveGitEnv(
-  baseEnv: NodeJS.ProcessEnv = process.env,
+  baseEnv?: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = { ...baseEnv };
-  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+  const effectiveBase =
+    baseEnv === undefined || baseEnv === process.env
+      ? buildSpawnEnv(process.env, platform)
+      : baseEnv;
+  const result: NodeJS.ProcessEnv = { ...effectiveBase };
+  if (!hasDefinedEnvKey(effectiveBase, "GIT_TERMINAL_PROMPT", platform)) {
     result.GIT_TERMINAL_PROMPT = "0";
   }
-  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+  if (!hasDefinedEnvKey(effectiveBase, "GCM_INTERACTIVE", platform)) {
     result.GCM_INTERACTIVE = "never";
   }
   return result;
@@ -650,6 +655,292 @@ export async function runShellCommandAsync(
   return spawnAndCollect(command, [], true, effectiveOptions);
 }
 
+function getHomeDirSafe(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  try {
+    if (platform === "win32") {
+      const driveHome =
+        env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : "";
+      return env.USERPROFILE || driveHome || env.HOME || os.homedir();
+    }
+    return env.HOME || env.USERPROFILE || os.homedir();
+  } catch {
+    return "";
+  }
+}
+
+function isExecutableFileSync(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) return false;
+    if (platform !== "win32") {
+      fs.accessSync(filePath, fs.constants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findBinaryInPathSync(
+  binName: string,
+  pathValue: string,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (!pathValue) return null;
+  const exts =
+    platform === "win32"
+      ? /\.(?:exe|cmd|bat)$/i.test(binName)
+        ? [""]
+        : [".exe", ".cmd", ".bat"]
+      : [""];
+  const pathMod = platform === "win32" ? path.win32 : path.posix;
+  const delim = platform === "win32" ? ";" : ":";
+  for (const rawDir of pathValue.split(delim)) {
+    const dir = rawDir.trim().replace(/^"+|"+$/g, "").trim();
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = pathMod.join(dir, `${binName}${ext}`);
+      if (isExecutableFileSync(candidate, platform)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+export function getBundledRipgrepCandidates(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir = getHomeDirSafe(env, platform),
+): string[] {
+  const pathMod = platform === "win32" ? path.win32 : path.posix;
+  const rgName = platform === "win32" ? "rg.exe" : "rg";
+  const resourceDirs =
+    platform === "darwin" ? ["Resources", "resources"] : ["resources"];
+  const relSuffixes = [
+    pathMod.join("app", "node_modules", "@vscode", "ripgrep", "bin", rgName),
+    pathMod.join(
+      "app",
+      "node_modules.asar.unpacked",
+      "@vscode",
+      "ripgrep",
+      "bin",
+      rgName,
+    ),
+  ];
+
+  const appRoots: string[] = [];
+  if (env.AGY_FAST_IDE_ROOT?.trim()) {
+    appRoots.push(env.AGY_FAST_IDE_ROOT.trim());
+  }
+  if (platform === "darwin") {
+    const roots = ["/Applications", ...(homeDir ? [pathMod.join(homeDir, "Applications")] : [])];
+    for (const r of roots) {
+      for (const app of [
+        "Antigravity IDE.app",
+        "Antigravity.app",
+        "Visual Studio Code.app",
+        "Cursor.app",
+      ]) {
+        appRoots.push(pathMod.join(r, app, "Contents"));
+      }
+    }
+  } else if (platform === "win32") {
+    for (const base of [
+      env.LOCALAPPDATA ? pathMod.join(env.LOCALAPPDATA, "Programs") : "",
+      env.ProgramFiles || "",
+      env["ProgramFiles(x86)"] || "",
+    ]) {
+      if (!base) continue;
+      for (const app of ["Antigravity IDE", "Antigravity", "Microsoft VS Code", "cursor"]) {
+        appRoots.push(pathMod.join(base, app));
+      }
+    }
+  } else {
+    for (const dir of [
+      "/opt/antigravity-ide",
+      "/usr/share/antigravity-ide",
+      "/opt/Antigravity",
+      "/usr/share/code",
+      "/opt/visual-studio-code",
+      "/usr/share/cursor",
+    ]) {
+      appRoots.push(dir);
+    }
+  }
+
+  const out: string[] = [];
+  for (const root of appRoots) {
+    for (const resDir of resourceDirs) {
+      for (const rel of relSuffixes) {
+        out.push(pathMod.join(root, resDir, rel));
+      }
+    }
+  }
+  return out;
+}
+
+export function resolveBundledRipgrepBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const explicitRg = env.AGY_FAST_RG_PATH?.trim();
+  if (explicitRg) {
+    return isExecutableFileSync(explicitRg, platform) ? path.resolve(explicitRg) : null;
+  }
+  if (env.AGY_FAST_DISABLE_BUNDLED_RG === "1") return null;
+  const homeDir = getHomeDirSafe(env, platform);
+  for (const cand of getBundledRipgrepCandidates(platform, env, homeDir)) {
+    if (isExecutableFileSync(cand, platform)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+function getEnvPathKeyAndValue(env: NodeJS.ProcessEnv): { key: string; value: string } {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  return { key, value: env[key] ?? "" };
+}
+
+let cachedEnrichedPathKey: string | null = null;
+let cachedEnrichedPathValue: string | null = null;
+
+export function resetEnrichedPathCache(): void {
+  cachedEnrichedPathKey = null;
+  cachedEnrichedPathValue = null;
+}
+
+export function buildEnrichedPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  // Preserve explicit empty PATH="" used by isolated fallback tests/benchmarks
+  if (rawPath.trim() === "") return rawPath;
+
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = `${platform}|${rawPath}|${home}|${process.execPath}`;
+  if (cachedEnrichedPathKey === cacheKey && cachedEnrichedPathValue !== null) {
+    return cachedEnrichedPathValue;
+  }
+
+  const delim = platform === "win32" ? ";" : ":";
+  const existing = rawPath.split(delim).filter(Boolean);
+  const compareNorm = (p: string) => {
+    const cleaned = p.trim().replace(/^"+|"+$/g, "").trim();
+    if (!cleaned) return "";
+    return platform === "win32" || platform === "darwin"
+      ? path.resolve(cleaned).toLowerCase()
+      : path.resolve(cleaned);
+  };
+  const seen = new Set(existing.map(compareNorm).filter(Boolean));
+  const result = [...existing];
+
+  const addDir = (dir: string) => {
+    if (!dir) return;
+    const norm = compareNorm(dir);
+    if (!norm || seen.has(norm)) return;
+    try {
+      if (!fs.statSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
+    seen.add(norm);
+    result.push(dir);
+  };
+
+  // Ensure sibling binaries of the running Node runtime (npm, npx, corepack) are reachable
+  addDir(path.dirname(process.execPath));
+
+  if (platform !== "win32") {
+    for (const stdDir of [
+      home ? path.join(home, ".local", "bin") : "",
+      home ? path.join(home, ".cargo", "bin") : "",
+      home ? path.join(home, ".volta", "bin") : "",
+      home ? path.join(home, ".bun", "bin") : "",
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+    ]) {
+      addDir(stdDir);
+    }
+  }
+
+  cachedEnrichedPathKey = cacheKey;
+  cachedEnrichedPathValue = result.join(delim);
+  return cachedEnrichedPathValue;
+}
+
+function buildSpawnEnv(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const { key: pathKey, value: current } = getEnvPathKeyAndValue(env);
+  if (current.trim() === "") {
+    return env;
+  }
+  const enriched = buildEnrichedPath(env, platform);
+  if (enriched === current) return env;
+  return { ...env, [pathKey]: enriched };
+}
+
+let cachedRgBinaryKey: string | null = null;
+let cachedRgBinaryValue: string | null = null;
+
+/**
+ * Resolves the ripgrep executable path without mutating global child `PATH`.
+ * Precedence:
+ * 1. Explicit `AGY_FAST_RG_PATH` (overrides any `rg` on PATH, supports custom basenames like `rg-14`)
+ * 2. `rg` on enriched `PATH` (respects explicit empty `PATH=""` isolation)
+ * 3. IDE-bundled `@vscode/ripgrep` binary (unless `AGY_FAST_DISABLE_BUNDLED_RG=1`)
+ */
+export function resolveRipgrepBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = [
+    platform,
+    rawPath,
+    home,
+    env.LOCALAPPDATA ?? "",
+    env.ProgramFiles ?? "",
+    env["ProgramFiles(x86)"] ?? "",
+    env.AGY_FAST_RG_PATH ?? "",
+    env.AGY_FAST_IDE_ROOT ?? "",
+    env.AGY_FAST_DISABLE_BUNDLED_RG ?? "",
+  ].join("|");
+  if (cachedRgBinaryKey === cacheKey) {
+    return cachedRgBinaryValue;
+  }
+
+  let resolved: string | null = null;
+  const explicitRg = env.AGY_FAST_RG_PATH?.trim();
+  if (explicitRg) {
+    resolved = isExecutableFileSync(explicitRg, platform) ? path.resolve(explicitRg) : null;
+  } else if (rawPath.trim() === "") {
+    // Explicit empty PATH="" disables PATH + bundled rg discovery for fallback tests/benchmarks
+    resolved = null;
+  } else {
+    const enrichedPath = buildEnrichedPath(env, platform);
+    resolved =
+      findBinaryInPathSync("rg", enrichedPath, platform) ??
+      resolveBundledRipgrepBinary(env, platform);
+  }
+
+  cachedRgBinaryKey = cacheKey;
+  cachedRgBinaryValue = resolved;
+  return resolved;
+}
+
 function spawnAndCollect(
   commandOrBin: string,
   args: string[],
@@ -679,7 +970,7 @@ function spawnAndCollect(
         detached,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? process.env,
+        env: options.env !== undefined ? options.env : buildSpawnEnv(process.env),
       });
     } catch (err) {
       resolve({
@@ -774,16 +1065,30 @@ function spawnAndCollect(
 }
 
 let cachedRgAvailable: boolean | null = null;
+let cachedRgAvailableBin: string | null = null;
 let pendingRgProbe: Promise<boolean> | null = null;
+let pendingRgProbeBin: string | null = null;
 
 export async function isRipgrepAvailable(): Promise<boolean> {
-  if (cachedRgAvailable !== null) return cachedRgAvailable;
-  if (pendingRgProbe) return pendingRgProbe;
+  const rgBin = resolveRipgrepBinary(process.env);
+  if (!rgBin) {
+    cachedRgAvailable = false;
+    cachedRgAvailableBin = null;
+    pendingRgProbe = null;
+    pendingRgProbeBin = null;
+    return false;
+  }
+  if (cachedRgAvailable !== null && cachedRgAvailableBin === rgBin) {
+    return cachedRgAvailable;
+  }
+  if (pendingRgProbe && pendingRgProbeBin === rgBin) {
+    return pendingRgProbe;
+  }
 
   let probe: Promise<boolean> | null = null;
   probe = (async () => {
     try {
-      const res = await execBinaryAsync("rg", ["--version"], {
+      const res = await execBinaryAsync(rgBin, ["--version"], {
         cwd: os.tmpdir(),
         timeoutMs: 2000,
         maxOutputBytes: 4096,
@@ -791,20 +1096,28 @@ export async function isRipgrepAvailable(): Promise<boolean> {
       const available = !res.error && !res.timedOut && res.exitCode === 0;
       if (!res.timedOut && pendingRgProbe === probe) {
         cachedRgAvailable = available;
+        cachedRgAvailableBin = rgBin;
       }
       return available;
     } finally {
       if (pendingRgProbe === probe) {
         pendingRgProbe = null;
+        pendingRgProbeBin = null;
       }
     }
   })();
 
   pendingRgProbe = probe;
+  pendingRgProbeBin = rgBin;
   return probe;
 }
 
 export function resetRipgrepCache(): void {
   cachedRgAvailable = null;
+  cachedRgAvailableBin = null;
   pendingRgProbe = null;
+  pendingRgProbeBin = null;
+  cachedRgBinaryKey = null;
+  cachedRgBinaryValue = null;
+  resetEnrichedPathCache();
 }

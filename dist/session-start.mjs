@@ -2,7 +2,7 @@
 
 
 // src/session-start.ts
-import { promises as fs3 } from "node:fs";
+import { promises as fs4 } from "node:fs";
 import path5 from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -70,11 +70,13 @@ function sliceSafeChars(text, maxChars) {
 
 // src/utils/host-compat.ts
 import { promises as fsp } from "node:fs";
-import os from "node:os";
+import os2 from "node:os";
 import path2 from "node:path";
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
@@ -258,15 +260,89 @@ function hasDefinedEnvKey(env, key, platform) {
   }
   return false;
 }
-function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
-  const result = { ...baseEnv };
-  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+function withNonInteractiveGitEnv(baseEnv, platform = process.platform) {
+  const effectiveBase = baseEnv === void 0 || baseEnv === process.env ? buildSpawnEnv(process.env, platform) : baseEnv;
+  const result = { ...effectiveBase };
+  if (!hasDefinedEnvKey(effectiveBase, "GIT_TERMINAL_PROMPT", platform)) {
     result.GIT_TERMINAL_PROMPT = "0";
   }
-  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+  if (!hasDefinedEnvKey(effectiveBase, "GCM_INTERACTIVE", platform)) {
     result.GCM_INTERACTIVE = "never";
   }
   return result;
+}
+function getHomeDirSafe(env = process.env, platform = process.platform) {
+  try {
+    if (platform === "win32") {
+      const driveHome = env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : "";
+      return env.USERPROFILE || driveHome || env.HOME || os.homedir();
+    }
+    return env.HOME || env.USERPROFILE || os.homedir();
+  } catch {
+    return "";
+  }
+}
+function getEnvPathKeyAndValue(env) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  return { key, value: env[key] ?? "" };
+}
+var cachedEnrichedPathKey = null;
+var cachedEnrichedPathValue = null;
+function buildEnrichedPath(env = process.env, platform = process.platform) {
+  const { value: rawPath } = getEnvPathKeyAndValue(env);
+  if (rawPath.trim() === "") return rawPath;
+  const home = getHomeDirSafe(env, platform);
+  const cacheKey = `${platform}|${rawPath}|${home}|${process.execPath}`;
+  if (cachedEnrichedPathKey === cacheKey && cachedEnrichedPathValue !== null) {
+    return cachedEnrichedPathValue;
+  }
+  const delim = platform === "win32" ? ";" : ":";
+  const existing = rawPath.split(delim).filter(Boolean);
+  const compareNorm = (p) => {
+    const cleaned = p.trim().replace(/^"+|"+$/g, "").trim();
+    if (!cleaned) return "";
+    return platform === "win32" || platform === "darwin" ? path.resolve(cleaned).toLowerCase() : path.resolve(cleaned);
+  };
+  const seen = new Set(existing.map(compareNorm).filter(Boolean));
+  const result = [...existing];
+  const addDir = (dir) => {
+    if (!dir) return;
+    const norm = compareNorm(dir);
+    if (!norm || seen.has(norm)) return;
+    try {
+      if (!fs.statSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
+    seen.add(norm);
+    result.push(dir);
+  };
+  addDir(path.dirname(process.execPath));
+  if (platform !== "win32") {
+    for (const stdDir of [
+      home ? path.join(home, ".local", "bin") : "",
+      home ? path.join(home, ".cargo", "bin") : "",
+      home ? path.join(home, ".volta", "bin") : "",
+      home ? path.join(home, ".bun", "bin") : "",
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin"
+    ]) {
+      addDir(stdDir);
+    }
+  }
+  cachedEnrichedPathKey = cacheKey;
+  cachedEnrichedPathValue = result.join(delim);
+  return cachedEnrichedPathValue;
+}
+function buildSpawnEnv(env, platform = process.platform) {
+  const { key: pathKey, value: current } = getEnvPathKeyAndValue(env);
+  if (current.trim() === "") {
+    return env;
+  }
+  const enriched = buildEnrichedPath(env, platform);
+  if (enriched === current) return env;
+  return { ...env, [pathKey]: enriched };
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -289,7 +365,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         detached,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? process.env
+        env: options.env !== void 0 ? options.env : buildSpawnEnv(process.env)
       });
     } catch (err) {
       resolve({
@@ -476,7 +552,7 @@ function parseSurfaceFromClientName(rawName) {
   if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
     return "ide";
   }
-  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop|hub))?$/.test(s) || /^hub$/.test(s)) {
     return "desktop";
   }
   return null;
@@ -650,7 +726,7 @@ function formatSessionStartCompatNotice(compat) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
   const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
   return path2.join(cacheDir, "config.json");
 }
@@ -665,8 +741,8 @@ async function readSavedEditsFormat(env = process.env) {
 }
 
 // src/utils/snapshot.ts
-import { promises as fs } from "node:fs";
-import os2 from "node:os";
+import { promises as fs2 } from "node:fs";
+import os3 from "node:os";
 import path3 from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -723,7 +799,7 @@ async function findGitEntry(workspaceDir) {
   while (true) {
     const candidate = path3.join(cur, ".git");
     try {
-      await fs.lstat(candidate);
+      await fs2.lstat(candidate);
       return candidate;
     } catch {
     }
@@ -735,15 +811,15 @@ async function findGitEntry(workspaceDir) {
 async function readBranchFromGitEntry(gitEntry) {
   if (!gitEntry) return null;
   try {
-    const st = await fs.stat(gitEntry);
+    const st = await fs2.stat(gitEntry);
     let gitDir = gitEntry;
     if (st.isFile()) {
-      const ptr = await fs.readFile(gitEntry, "utf8");
+      const ptr = await fs2.readFile(gitEntry, "utf8");
       const m = /^gitdir:\s*(.+)$/im.exec(ptr.trim());
       if (!m?.[1]) return null;
       gitDir = path3.resolve(path3.dirname(gitEntry), m[1].trim());
     }
-    const headRaw = (await fs.readFile(path3.join(gitDir, "HEAD"), "utf8")).trim();
+    const headRaw = (await fs2.readFile(path3.join(gitDir, "HEAD"), "utf8")).trim();
     const refMatch = /^ref:\s*refs\/heads\/(.+)$/.exec(headRaw);
     return refMatch?.[1]?.trim() || "HEAD";
   } catch {
@@ -986,9 +1062,9 @@ function normalizePathForCompare(p) {
 }
 async function boundedRealpath(p, deadlineMs) {
   if (deadlineMs === void 0) {
-    return fs.realpath(p).catch(() => p);
+    return fs2.realpath(p).catch(() => p);
   }
-  const res = await raceWithDeadline(fs.realpath(p), deadlineMs);
+  const res = await raceWithDeadline(fs2.realpath(p), deadlineMs);
   return res.ok ? res.value : p;
 }
 async function isHomeOrSystemRoot(workspaceDir, deadlineMs) {
@@ -996,7 +1072,7 @@ async function isHomeOrSystemRoot(workspaceDir, deadlineMs) {
   if (path3.parse(resolved).root === resolved) return true;
   if (isSystemUserParentPath(resolved)) return true;
   const homeCandidates = /* @__PURE__ */ new Set();
-  for (const cand of [os2.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+  for (const cand of [os3.homedir(), process.env.HOME, process.env.USERPROFILE]) {
     if (cand && cand.trim()) {
       homeCandidates.add(path3.resolve(cand.trim()));
     }
@@ -1159,7 +1235,7 @@ ${lines.join("\n")}`;
           continue;
         }
         const subRes = await raceWithDeadline(
-          fs.readdir(path3.join(workspaceDir, entry.name), {
+          fs2.readdir(path3.join(workspaceDir, entry.name), {
             withFileTypes: true
           }),
           deadlineMs
@@ -1246,7 +1322,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
     (async () => {
       if (!hasFile("package.json")) return;
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "package.json"), "utf8");
+        const raw = await fs2.readFile(path3.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw);
         const pkgName = typeof pkg.name === "string" ? pkg.name.trim() : "";
         const scriptNames = pkg.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? Object.keys(pkg.scripts).slice(0, 12) : [];
@@ -1263,7 +1339,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
       for (const name of ["Makefile", "makefile"]) {
         if (!hasFile(name)) continue;
         try {
-          const raw = await fs.readFile(path3.join(dirPath, name), "utf8");
+          const raw = await fs2.readFile(path3.join(dirPath, name), "utf8");
           const targets = [];
           for (const line of raw.split(/\r?\n/)) {
             const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
@@ -1284,7 +1360,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
     (async () => {
       if (!hasFile("pom.xml")) return;
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "pom.xml"), "utf8");
+        const raw = await fs2.readFile(path3.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
         const m = /<artifactId>\s*([^<\s]+)\s*<\/artifactId>/i.exec(stripped);
         hints.push(
@@ -1298,7 +1374,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
         if (!hasFile(name)) continue;
         try {
-          await fs.access(path3.join(dirPath, name));
+          await fs2.access(path3.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
           break;
         } catch {
@@ -1309,7 +1385,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
     (async () => {
       if (!hasFile("pyproject.toml")) return;
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "pyproject.toml"), "utf8");
+        const raw = await fs2.readFile(path3.join(dirPath, "pyproject.toml"), "utf8");
         const tools = [];
         if (/\[tool\.pytest/.test(raw)) tools.push("pytest");
         if (/\[tool\.ruff/.test(raw)) tools.push("ruff");
@@ -1326,7 +1402,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
     (async () => {
       if (!hasFile("Cargo.toml")) return;
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "Cargo.toml"), "utf8");
+        const raw = await fs2.readFile(path3.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
         hints.push(
           isWorkspace ? `${prefix}Cargo.toml (workspace)` : `${prefix}Cargo.toml`
@@ -1338,7 +1414,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
     (async () => {
       if (!hasFile("go.mod")) return;
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "go.mod"), "utf8");
+        const raw = await fs2.readFile(path3.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
@@ -1426,13 +1502,13 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
   const scanTimeoutMs = typeof options.scanTimeoutMs === "number" && Number.isFinite(options.scanTimeoutMs) ? Math.max(1, Math.trunc(options.scanTimeoutMs)) : DEFAULT_SCAN_TIMEOUT_MS;
   const scanDeadline = performance.now() + scanTimeoutMs;
-  const statRes = await raceWithDeadline(fs.stat(workspaceDir), scanDeadline);
+  const statRes = await raceWithDeadline(fs2.stat(workspaceDir), scanDeadline);
   if (!statRes.ok || !statRes.value.isDirectory()) return null;
   const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs, options.gitExec);
   const [isHomeRoot, topRes] = await Promise.all([
     isHomeOrSystemRoot(workspaceDir, scanDeadline),
     raceWithDeadline(
-      fs.readdir(workspaceDir, { withFileTypes: true }),
+      fs2.readdir(workspaceDir, { withFileTypes: true }),
       scanDeadline
     )
   ]);
@@ -1501,8 +1577,8 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
 
 // src/utils/updater-core.ts
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs2 } from "node:fs";
-import os3 from "node:os";
+import { promises as fs3 } from "node:fs";
+import os4 from "node:os";
 import path4 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 4;
@@ -1515,9 +1591,9 @@ function getHomeDir(env = process.env, platform = process.platform) {
     if (driveHome) return driveHome;
     const home = env.HOME?.trim();
     if (home) return home;
-    return os3.homedir();
+    return os4.homedir();
   }
-  return env.HOME?.trim() || env.USERPROFILE?.trim() || os3.homedir();
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os4.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
@@ -1570,7 +1646,7 @@ function parseUpdateChannel(raw) {
 }
 async function readJsonFile(filePath) {
   try {
-    const raw = await fs2.readFile(filePath, "utf8");
+    const raw = await fs3.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
@@ -1581,17 +1657,17 @@ async function readJsonFile(filePath) {
 }
 var tmpWriteSeq = 0;
 async function writeJsonAtomically(filePath, data) {
-  await fs2.mkdir(path4.dirname(filePath), { recursive: true });
+  await fs3.mkdir(path4.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
-  await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+  await fs3.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
-    await fs2.rename(tmpPath, filePath);
+    await fs3.rename(tmpPath, filePath);
   } catch {
     try {
-      await fs2.copyFile(tmpPath, filePath);
+      await fs3.copyFile(tmpPath, filePath);
     } finally {
-      await fs2.rm(tmpPath, { force: true }).catch(() => {
+      await fs3.rm(tmpPath, { force: true }).catch(() => {
       });
     }
   }
@@ -1870,7 +1946,7 @@ async function main() {
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
           const updaterPath = path5.join(pluginDir, "dist", "updater.mjs");
-          const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
+          const hasUpdater = await fs4.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
             await writeUpdateState({
               lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()

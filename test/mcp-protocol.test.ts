@@ -7,6 +7,10 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
 import { MAX_FRAME_BYTES, McpStdioServer } from "../src/protocol/mcp.js";
+import {
+  inferCwdFromAllAbsoluteToolArgs,
+  isExplicitAbsoluteOrHomePath,
+} from "../src/utils/mcp-cwd.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -1039,6 +1043,130 @@ describe("MCP Stdio Server end-to-end", () => {
       const emptyRootCall = emptyRootsLines.find((l) => l.id === 2);
       assert.equal(emptyRootCall?.result?.isError, true);
       assert.match(emptyRootCall?.result?.content?.[0]?.text ?? "", /'cwd' is required.*plugin directory/i);
+
+      // 4. Desktop 2.0 Hub WITHOUT roots/list succeeds when ALL target paths are absolute,
+      //    including JSON-stringified arrays and apply_edits verify.cwd (treated as a dir, not dirname!).
+      const absAppPath = path.join(realWorkspace, "app.ts");
+      assert.equal(
+        inferCwdFromAllAbsoluteToolArgs("apply_edits", {
+          edits: [{ path: absAppPath, hunks: [] }],
+          verify: { command: "echo ok", cwd: realWorkspace },
+        }),
+        realWorkspace,
+      );
+      assert.equal(
+        inferCwdFromAllAbsoluteToolArgs("batch_search", {
+          queries: JSON.stringify([{ type: "text", pattern: "hubApp", path: realWorkspace }]),
+        }),
+        realWorkspace,
+      );
+      assert.equal(
+        inferCwdFromAllAbsoluteToolArgs("run_checks", {
+          commands: JSON.stringify([{ command: "echo ok", cwd: realWorkspace }]),
+        }),
+        realWorkspace,
+      );
+      assert.equal(
+        inferCwdFromAllAbsoluteToolArgs("read_slices", {
+          lineRanges: JSON.stringify([`${absAppPath}:1-1`]),
+        }),
+        realWorkspace,
+      );
+      // Windows drive-relative paths (`/foo/bar`, `\foo\bar`) must NOT count as explicit absolute paths
+      assert.equal(isExplicitAbsoluteOrHomePath("/foo/bar", "win32"), false);
+      assert.equal(isExplicitAbsoluteOrHomePath("\\foo\\bar", "win32"), false);
+      assert.equal(isExplicitAbsoluteOrHomePath("C:\\repo\\app.ts", "win32"), true);
+      assert.equal(isExplicitAbsoluteOrHomePath("C:/repo/app.ts", "win32"), true);
+      assert.equal(isExplicitAbsoluteOrHomePath("\\\\server\\share\\app.ts", "win32"), true);
+
+      const allAbsHubRes = await runInPluginDir(
+        [
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "hub", version: "2.34.0" } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: [absAppPath] } } },
+          { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "read_slices", arguments: { lineRanges: [`${absAppPath}:1-1`] } } },
+          { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "batch_search", arguments: { queries: [{ type: "text", pattern: "hubApp", path: realWorkspace }] } } },
+          { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "apply_edits", arguments: { dryRun: true, edits: [{ path: absAppPath, hunks: [{ target: "return 1;", replacement: "return 2;" }] }] } } },
+        ],
+        { PLUGIN_ROOT: fakePluginDir },
+      );
+      assert.equal(allAbsHubRes.code, 0);
+      const allAbsLines = allAbsHubRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      for (const id of [2, 3, 4, 5]) {
+        const r = allAbsLines.find((l) => l.id === id);
+        assert.equal(r?.result?.isError, false, `Expected all-absolute call id=${id} to succeed: ${r?.result?.content?.[0]?.text}`);
+      }
+
+      // 5. roots-capable host STILL requests roots/list on an all-absolute first call, AND
+      //    dynamic `roots/list_changed` -> `roots: []` resets stale defaultCwd cleanly!
+      const resetChild = spawn(
+        process.execPath,
+        [path.join(fakePluginDir, "dist", "mcp-server.mjs")],
+        {
+          cwd: fakePluginDir,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+          env: buildCleanServerEnv({ PLUGIN_ROOT: fakePluginDir }),
+        },
+      );
+      const collectedReset: Array<Record<string, unknown>> = [];
+      let resetBuf = "";
+      let sawRootsRequestBeforeFirstCall = false;
+      await new Promise<void>((resolve, reject) => {
+        resetChild.on("error", reject);
+        resetChild.on("close", () => resolve());
+        resetChild.stdout.on("data", (d) => {
+          resetBuf += d.toString("utf8");
+          let nl = resetBuf.indexOf("\n");
+          while (nl !== -1) {
+            const line = resetBuf.slice(0, nl).trim();
+            resetBuf = resetBuf.slice(nl + 1);
+            if (line) {
+              const msg = JSON.parse(line) as Record<string, unknown>;
+              collectedReset.push(msg);
+              if (msg.method === "roots/list" && msg.id === "agy-fast-roots-1") {
+                sawRootsRequestBeforeFirstCall = true;
+                resetChild.stdin.write(
+                  `${JSON.stringify({ jsonrpc: "2.0", id: "agy-fast-roots-1", result: { roots: [{ uri: pathToFileURL(realWorkspace).href }] } })}\n`,
+                );
+              } else if (msg.id === 2) {
+                resetChild.stdin.write(
+                  `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/roots/list_changed" })}\n`,
+                );
+                resetChild.stdin.write(
+                  `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["app.ts"] } } })}\n`,
+                );
+              } else if (msg.method === "roots/list" && msg.id === "agy-fast-roots-2") {
+                resetChild.stdin.write(
+                  `${JSON.stringify({ jsonrpc: "2.0", id: "agy-fast-roots-2", result: { roots: [] } })}\n`,
+                );
+              } else if (msg.id === 3) {
+                resetChild.stdin.end();
+              }
+            }
+            nl = resetBuf.indexOf("\n");
+          }
+        });
+        resetChild.stdin.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: { roots: { listChanged: true } }, clientInfo: { name: "hub", version: "2.34.0" } } })}\n`,
+        );
+        resetChild.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+        // Send an all-absolute first call to prove roots-capable hosts STILL fetch roots/list
+        resetChild.stdin.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: [absAppPath] } } })}\n`,
+        );
+      });
+      assert.equal(sawRootsRequestBeforeFirstCall, true);
+      const r2 = collectedReset.find((l) => l.id === 2) as { result?: { isError?: boolean } } | undefined;
+      const r3 = collectedReset.find((l) => l.id === 3) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } } | undefined;
+      assert.equal(r2?.result?.isError, false);
+      assert.equal(r3?.result?.isError, true);
+      assert.match(r3?.result?.content?.[0]?.text ?? "", /'cwd' is required/);
     } finally {
       await fs.rm(fakeRoot, { recursive: true, force: true });
     }
@@ -1107,6 +1235,7 @@ describe("MCP Stdio Server end-to-end", () => {
         { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "read_slices", arguments: { outlines: ["project/app.ts"] } } },
         { jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "~", paths: ["project/app.ts"] } } },
         { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: fakeHome, paths: ["project/app.ts"] } } },
+        { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "quick_outline", arguments: { paths: [path.join(project, "app.ts")] } } },
       ]);
       assert.equal(homeRes.code, 0);
       assert.equal(homeRes.stderr, "");
@@ -1120,9 +1249,9 @@ describe("MCP Stdio Server end-to-end", () => {
       assert.equal(relResp?.result?.isError, true);
       assert.match(relResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path.*home directory/i);
       await assert.rejects(fs.access(path.join(fakeHome, "rogue.txt")));
-      for (const id of [6, 8, 9]) {
+      for (const id of [6, 8, 9, 10]) {
         const explicitResp = homeLines.find((l) => l.id === id);
-        assert.equal(explicitResp?.result?.isError, false, `Expected explicit cwd call id=${id} to succeed`);
+        assert.equal(explicitResp?.result?.isError, false, `Expected explicit/all-absolute call id=${id} to succeed`);
         assert.match(explicitResp?.result?.content?.[0]?.text ?? "", /homeApp/);
       }
 
