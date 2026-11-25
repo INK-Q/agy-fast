@@ -825,6 +825,8 @@ function execBinaryAsync(bin, args, options) {
 var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
 var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var WINDOWS_PS_STATEMENT_SEPARATOR_RE = /;\s+\S/;
+var WINDOWS_CMD_CONTEXT_RE = /(?:^|[;&|\r\n]\s*)@?(?:set(?:\s|$)|if\s+(?:errorlevel|exist|not\s+exist|defined)\b|cmd(?:\.exe)?(?:\s+\/[a-z]+)*\s+\/[ck]\b)|%[A-Za-z_][A-Za-z0-9_]*%|%~[A-Za-z]*\d|%\d|%\*/i;
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
@@ -1017,7 +1019,13 @@ function needsPowerShellOnWindows(command) {
     return true;
   }
   const unquoted = stripQuotedSpans(command, true);
-  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+  if (WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted)) {
+    return true;
+  }
+  if (WINDOWS_CMD_CONTEXT_RE.test(unquoted)) {
+    return false;
+  }
+  return WINDOWS_PS_STATEMENT_SEPARATOR_RE.test(unquoted);
 }
 function formatPowerShellCommand(command) {
   const trimmed = command.trim();

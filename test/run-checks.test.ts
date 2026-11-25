@@ -214,6 +214,20 @@ describe("run_checks", () => {
     assert.equal(needsPowerShellOnWindows("echo $(Get-Date)"), true);
     assert.equal(needsPowerShellOnWindows('@("a", "b") -join ","'), true);
 
+    // Unquoted `; ` chains PowerShell statements; compact values and cmd.exe contexts stay put
+    assert.equal(needsPowerShellOnWindows("git status; git diff"), true);
+    assert.equal(needsPowerShellOnWindows("git status 2>&1; git diff 2>&1"), true);
+    assert.equal(needsPowerShellOnWindows("echo one;\techo two"), true);
+    assert.equal(needsPowerShellOnWindows("echo %USERPROFILE%;C:\\bin"), false);
+    assert.equal(needsPowerShellOnWindows("set PATH=%PATH%;C:\\foo"), false);
+    assert.equal(needsPowerShellOnWindows("set PATH=%PATH%; C:\\foo"), false);
+    assert.equal(needsPowerShellOnWindows("key=a;b"), false);
+    assert.equal(needsPowerShellOnWindows("java -cp a.jar;b.jar Main"), false);
+    assert.equal(needsPowerShellOnWindows("set FOO=a; b"), false);
+    assert.equal(needsPowerShellOnWindows("if errorlevel 1 echo fail; echo done"), false);
+    assert.equal(needsPowerShellOnWindows("cmd /c echo one; echo two"), false);
+    assert.equal(needsPowerShellOnWindows('echo "git status; git diff"'), false);
+
     // Cross-platform CLI tools and quoted patterns must NOT false-positive as PowerShell
     assert.equal(needsPowerShellOnWindows("npm test"), false);
     assert.equal(needsPowerShellOnWindows("npm run test-unit"), false);

@@ -238,6 +238,12 @@ const WINDOWS_PS_UNQUOTED_SYNTAX_RE =
   /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 const WINDOWS_PS_CMDLET_RE =
   /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+// PowerShell chains statements with `; `, while cmd.exe treats `;` as part of
+// the argument. Require trailing whitespace so compact values (`key=a;b`,
+// `-cp a.jar;b.jar`) stay on cmd.exe, and ignore obvious cmd.exe contexts.
+const WINDOWS_PS_STATEMENT_SEPARATOR_RE = /;\s+\S/;
+const WINDOWS_CMD_CONTEXT_RE =
+  /(?:^|[;&|\r\n]\s*)@?(?:set(?:\s|$)|if\s+(?:errorlevel|exist|not\s+exist|defined)\b|cmd(?:\.exe)?(?:\s+\/[a-z]+)*\s+\/[ck]\b)|%[A-Za-z_][A-Za-z0-9_]*%|%~[A-Za-z]*\d|%\d|%\*/i;
 const EXPLICIT_POWERSHELL_INVOCATION_RE =
   /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 const PS_NON_INVOCATION_TAIL_RE =
@@ -450,8 +456,9 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
 
 /**
  * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
- * variables, subexpressions, or PascalCase `Verb-Noun` cmdlets outside quotes)
- * so cross-platform/cmd commands keep fast `cmd.exe` execution without altering
+ * variables, subexpressions, PascalCase `Verb-Noun` cmdlets, or unquoted `; `
+ * statement separators outside cmd.exe `%VAR%`/`set`/`if` contexts) so
+ * cross-platform/cmd commands keep fast `cmd.exe` execution without altering
  * quoting behavior.
  */
 export function needsPowerShellOnWindows(command: string): boolean {
@@ -463,10 +470,16 @@ export function needsPowerShellOnWindows(command: string): boolean {
     return true;
   }
   const unquoted = stripQuotedSpans(command, true);
-  return (
+  if (
     WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) ||
     WINDOWS_PS_CMDLET_RE.test(unquoted)
-  );
+  ) {
+    return true;
+  }
+  if (WINDOWS_CMD_CONTEXT_RE.test(unquoted)) {
+    return false;
+  }
+  return WINDOWS_PS_STATEMENT_SEPARATOR_RE.test(unquoted);
 }
 
 /**
