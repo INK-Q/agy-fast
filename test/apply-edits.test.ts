@@ -1912,4 +1912,40 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
+
+  it("defaults CI=1 and appends watch-mode hint on inline verify timeout", async () => {
+    const f = path.join(tmpDir, "verify-ci.js");
+    await fs.writeFile(f, "export const v = 1;\n", "utf8");
+    const nodeBin = JSON.stringify(process.execPath);
+
+    const prevCI = process.env.CI;
+    try {
+      delete process.env.CI;
+      const ciRes = await runApplyEdits({
+        cwd: tmpDir,
+        edits: [
+          { path: "verify-ci.js", hunks: [{ target: "v = 1", replacement: "v = 2" }] },
+        ],
+        verify: `${nodeBin} -e "console.log('VERIFY_CI=' + process.env.CI)"`,
+      });
+      assert.equal(ciRes.isError, false);
+      assert.match(ciRes.text, /Verify \[PASS/);
+      assert.match(ciRes.text, /VERIFY_CI=1/);
+    } finally {
+      if (prevCI === undefined) delete process.env.CI;
+      else process.env.CI = prevCI;
+    }
+
+    const timeoutRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        { path: "verify-ci.js", hunks: [{ target: "v = 2", replacement: "v = 3" }] },
+      ],
+      verify: `${nodeBin} -e "setTimeout(() => {}, 5000)" -- --watch`,
+      verifyTimeoutSec: 1,
+    });
+    assert.equal(timeoutRes.isError, false);
+    assert.match(timeoutRes.text, /Verify \[TIMEOUT/);
+    assert.match(timeoutRes.text, /Hint: command looks like a watch\/dev-server process/);
+  });
 });

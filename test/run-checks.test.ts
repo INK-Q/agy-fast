@@ -4,8 +4,11 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
 import {
+  WATCH_MODE_TIMEOUT_HINT,
+  buildNonInteractiveCheckEnv,
   buildPowerShellUtf8Command,
   decodeProcessOutput,
+  detectWatchModeHint,
   execBinaryAsync,
   formatPowerShellCommand,
   needsPowerShellOnWindows,
@@ -862,5 +865,142 @@ describe("run_checks", () => {
       assert.match(sigRes.text, /FAIL \(SIGKILL - possible OOM\)/);
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
+  });
+
+  it("defaults CI=1 when unset and preserves explicit CI values", async () => {
+    assert.equal(buildNonInteractiveCheckEnv({}).CI, "1");
+    assert.equal(buildNonInteractiveCheckEnv({ CI: undefined }).CI, "1");
+    assert.equal(buildNonInteractiveCheckEnv({ CI: "0" }).CI, "0");
+    assert.equal(buildNonInteractiveCheckEnv({ CI: "false" }).CI, "false");
+    assert.equal(buildNonInteractiveCheckEnv({ CI: "custom" }).CI, "custom");
+
+    const prevCI = process.env.CI;
+    try {
+      delete process.env.CI;
+      const defaultRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "ci-default",
+            command: `${nodeBin} -e "console.log('CI=' + process.env.CI)"`,
+          },
+        ],
+      });
+      assert.equal(defaultRes.isError, false);
+      assert.match(defaultRes.text, /CI=1/);
+
+      process.env.CI = "custom";
+      const explicitRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "ci-explicit",
+            command: `${nodeBin} -e "console.log('CI=' + process.env.CI)"`,
+          },
+        ],
+      });
+      assert.equal(explicitRes.isError, false);
+      assert.match(explicitRes.text, /CI=custom/);
+    } finally {
+      if (prevCI === undefined) delete process.env.CI;
+      else process.env.CI = prevCI;
+    }
+  });
+
+  it("detects watch/dev-server commands and emits a timeout hint in compact and full modes", async () => {
+    for (const watchCmd of [
+      "vitest",
+      "npx vitest src/a.test.ts",
+      "jest --watch",
+      "jest --watchAll",
+      "tsc -w",
+      "webpack --watch",
+      "vite dev",
+      "next dev",
+      "nuxt dev",
+      "astro dev",
+      "remix dev",
+      "nodemon src/index.ts",
+      "cargo watch -x test",
+      "pytest-watch",
+      "ptw",
+      "tsx watch src/server.ts",
+      `${nodeBin} -e "setTimeout(()=>{}, 5000)" -- --watch`,
+    ]) {
+      assert.equal(
+        detectWatchModeHint(watchCmd),
+        WATCH_MODE_TIMEOUT_HINT,
+        `expected watch hint for: ${watchCmd}`,
+      );
+    }
+
+    for (const nonWatchCmd of [
+      "vitest run",
+      "npx vitest --run",
+      "vitest bench",
+      "vitest --watch=false",
+      "jest --watch=false",
+      "npm test",
+      "tsc --noEmit",
+      "rg -w foo src/",
+      `${nodeBin} -e "setTimeout(()=>{}, 5000)"`,
+    ]) {
+      assert.equal(
+        detectWatchModeHint(nonWatchCmd),
+        null,
+        `expected no watch hint for: ${nonWatchCmd}`,
+      );
+    }
+
+    const compactRes = await runChecks(
+      {
+        outputMode: "compact",
+        timeoutSec: 5,
+        commands: [
+          {
+            name: "watch-hang",
+            command: `${nodeBin} -e "setTimeout(() => {}, 5000)" -- --watch`,
+          },
+        ],
+      },
+      400,
+    );
+    assert.equal(compactRes.isError, false);
+    assert.match(compactRes.text, /TIMEOUT/);
+    assert.ok(compactRes.text.includes(WATCH_MODE_TIMEOUT_HINT));
+
+    const fullRes = await runChecks(
+      {
+        outputMode: "full",
+        timeoutSec: 5,
+        commands: [
+          {
+            name: "watch-hang-full",
+            command: `${nodeBin} -e "setTimeout(() => {}, 5000)" -- --watch`,
+          },
+        ],
+      },
+      400,
+    );
+    assert.equal(fullRes.isError, false);
+    assert.match(fullRes.text, /TIMEOUT/);
+    assert.ok(fullRes.text.includes(WATCH_MODE_TIMEOUT_HINT));
+
+    const normalRes = await runChecks(
+      {
+        outputMode: "compact",
+        timeoutSec: 5,
+        commands: [
+          {
+            name: "plain-hang",
+            command: `${nodeBin} -e "setTimeout(() => {}, 5000)"`,
+          },
+        ],
+      },
+      400,
+    );
+    assert.equal(normalRes.isError, false);
+    assert.match(normalRes.text, /TIMEOUT/);
+    assert.ok(!normalRes.text.includes(WATCH_MODE_TIMEOUT_HINT));
   });
 });

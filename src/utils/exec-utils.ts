@@ -773,6 +773,47 @@ function spawnAndCollect(
   });
 }
 
+export const WATCH_MODE_TIMEOUT_HINT =
+  "Hint: command looks like a watch/dev-server process; pass --run or a non-watch command.";
+
+const WATCH_MODE_PATTERNS: readonly RegExp[] = [
+  /\bvitest\b(?!.*(?:^|\s)(?:run|--run|bench|--version|-v|--help|-h|--watch=false|--watch=0)(?=\s|$|=))/i,
+  /(?:^|\s)--watch(?:All)?(?:=(?!false\b|0\b)\S*)?(?=\s|$)/i,
+  /\b(?:jest|vitest|tsc|tsx|esbuild|webpack|rollup|babel|sass|tailwindcss|nodemon|cargo\s+watch|ptw|pytest-watch)\b.*(?:^|\s)-w(?=\s|$|=)/i,
+  /\b(?:vite|next|nuxt|astro|remix)\s+dev\b/i,
+  /\b(?:nodemon|ptw|pytest-watch)\b/i,
+  /\b(?:tsx|cargo)\s+watch\b/i,
+];
+
+/**
+ * Returns a concise hint when a timed-out command matches common watch-mode or
+ * dev-server CLI patterns that do not exit on their own.
+ */
+export function detectWatchModeHint(command: string): string | null {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  for (const re of WATCH_MODE_PATTERNS) {
+    if (re.test(trimmed)) return WATCH_MODE_TIMEOUT_HINT;
+  }
+  return null;
+}
+
+/**
+ * Defaults `CI=1` when unset so non-interactive test runners (vitest, jest,
+ * react-scripts, next lint, etc.) exit instead of entering watch/prompt mode,
+ * while preserving any explicit caller `CI` value (including `"0"` or `"false"`).
+ */
+export function buildNonInteractiveCheckEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  for (const key of Object.keys(baseEnv)) {
+    if (key.toUpperCase() === "CI" && baseEnv[key] !== undefined) {
+      return { ...baseEnv };
+    }
+  }
+  return { ...baseEnv, CI: "1" };
+}
+
 let cachedRgAvailable: boolean | null = null;
 let pendingRgProbe: Promise<boolean> | null = null;
 

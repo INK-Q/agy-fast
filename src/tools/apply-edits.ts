@@ -6,7 +6,12 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
+import {
+  MCP_CALL_BUDGET_SEC,
+  buildNonInteractiveCheckEnv,
+  detectWatchModeHint,
+  runShellCommandAsync,
+} from "../utils/exec-utils.js";
 import {
   detectUtf16Bom,
   hasUtf8Bom,
@@ -1505,6 +1510,7 @@ export async function runApplyEdits(
     const res = await runShellCommandAsync(verifySpec.command, {
       cwd: verifyCwd,
       timeoutMs,
+      env: buildNonInteractiveCheckEnv(),
     });
 
     const status = res.timedOut
@@ -1515,7 +1521,7 @@ export async function runApplyEdits(
           ? "PASS"
           : `FAIL (${formatExitFailureLabel(res.exitCode, res.signal)})`;
     const verifyPrefix = `\n\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
-    const preparedVerify = prepareCompactCommandOutput({
+    const rawPreparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
@@ -1523,6 +1529,10 @@ export async function runApplyEdits(
       timedOut: res.timedOut,
       error: res.error,
     });
+    const watchHint = res.timedOut ? detectWatchModeHint(verifySpec.command) : null;
+    const preparedVerify = watchHint
+      ? { ...rawPreparedVerify, bodyText: `${rawPreparedVerify.bodyText}\n${watchHint}` }
+      : rawPreparedVerify;
 
     const minApplied = `${header} (${formatAppliedSummaryCompact(summaryLines.length, noOpCount, false)}; list omitted to preserve verify diagnostics)`;
     const reservedForApplied =

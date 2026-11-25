@@ -6,7 +6,13 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
+import {
+  MCP_CALL_BUDGET_SEC,
+  buildNonInteractiveCheckEnv,
+  detectWatchModeHint,
+  runShellCommandAsync,
+  type ExecResult,
+} from "../utils/exec-utils.js";
 import { resolvePath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
@@ -220,6 +226,7 @@ export async function runChecks(
       : MCP_CALL_BUDGET_SEC * 1000;
   const wallStart = performance.now();
   const deadline = wallStart + safeBudgetMs;
+  const checkEnv = buildNonInteractiveCheckEnv();
   const outcomes = await mapWithConcurrency<NormalizedCommand, CheckRunOutcome>(
     normalized,
     concurrency,
@@ -230,6 +237,7 @@ export async function runChecks(
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
         timeoutMs: Math.min(spec.timeoutMs, remainingMs),
+        env: checkEnv,
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
       return { spec, result, passed };
@@ -356,9 +364,11 @@ export async function runChecks(
       ]
         .filter(Boolean)
         .join("\n");
-      const rawBody = result.error
+      const baseBody = result.error
         ? `spawn error: ${result.error}`
         : combined || "(no output)";
+      const watchHint = result.timedOut ? detectWatchModeHint(spec.command) : null;
+      const rawBody = watchHint ? `${baseBody}\n${watchHint}` : baseBody;
       const fullBlock = `${fullPrefix}${rawBody}`;
       return {
         notRun: false as const,
@@ -472,7 +482,7 @@ export async function runChecks(
       const header = `${badgeLine}\n$ ${spec.command}\n`;
 
       // Prepare & fold ONCE per failing command to measure true folded size
-      const prepared = prepareCompactCommandOutput({
+      const rawPrepared = prepareCompactCommandOutput({
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
@@ -480,6 +490,10 @@ export async function runChecks(
         timedOut: result.timedOut,
         error: result.error,
       });
+      const watchHint = result.timedOut ? detectWatchModeHint(spec.command) : null;
+      const prepared = watchHint
+        ? { ...rawPrepared, bodyText: `${rawPrepared.bodyText}\n${watchHint}` }
+        : rawPrepared;
       const pass1Ceiling = Math.max(
         bodyBudget,
         prepared.bodyText.length + 256,
