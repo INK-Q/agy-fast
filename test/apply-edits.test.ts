@@ -1912,4 +1912,108 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
+
+  it("reports full matched line spans and range-overlap hints when multiline targets cross startLine/endLine", async () => {
+    const spanFile = path.join(tmpDir, "span-drift.ts");
+    const content = [
+      "const l1 = 1;",
+      "const l2 = 2;",
+      "function demo() {",
+      "  const a = 1;",
+      "  const b = 2;",
+      "  return a + b;",
+      "}",
+      "const l8 = 8;",
+    ].join("\n") + "\n";
+    await fs.writeFile(spanFile, content, "utf8");
+
+    // Starts inside 2-5 at L3, extends past endLine=5 to L7
+    const tailOverflow = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "span-drift.ts",
+          hunks: [
+            {
+              startLine: 2,
+              endLine: 5,
+              target: "function demo() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}",
+              replacement: "function demo() {\n  return 3;\n}",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(tailOverflow.isError, true);
+    assert.match(
+      tailOverflow.text,
+      /Exact match spans L3-L7 \(starts inside range but extends past endLine 5\)/,
+    );
+
+    // Starts before startLine=5 at L3, ends inside 5-8 at L7
+    const headUnderflow = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "span-drift.ts",
+          hunks: [
+            {
+              startLine: 5,
+              endLine: 8,
+              target: "function demo() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}",
+              replacement: "function demo() {\n  return 3;\n}",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(headUnderflow.isError, true);
+    assert.match(
+      headUnderflow.text,
+      /Exact match spans L3-L7 \(starts before startLine 5\)/,
+    );
+
+    // Spans wider than both startLine=4 and endLine=5
+    const bothBounds = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "span-drift.ts",
+          hunks: [
+            {
+              startLine: 4,
+              endLine: 5,
+              target: "function demo() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}",
+              replacement: "function demo() {\n  return 3;\n}",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(bothBounds.isError, true);
+    assert.match(
+      bothBounds.text,
+      /Exact match spans L3-L7 \(extends beyond lines 4-5\)/,
+    );
+
+    // Single-line match outside range keeps compact L8 label without redundant -L8
+    const singleOutside = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "span-drift.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 3,
+              target: "const l8 = 8;",
+              replacement: "const l8 = 80;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(singleOutside.isError, true);
+    assert.match(singleOutside.text, /Exact match found outside range at L8 —/);
+  });
 });

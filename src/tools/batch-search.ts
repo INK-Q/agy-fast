@@ -26,6 +26,7 @@ import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
   sliceSafeChars,
+  sliceUtf8Bytes,
 } from "../utils/output-filter.js";
 
 export type SearchQueryType = "text" | "regex" | "glob" | "fuzzy" | "git";
@@ -1586,6 +1587,7 @@ async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<stri
 }
 
 const MAX_SEARCH_LINE_CHARS = 240;
+const MAX_SEARCH_LINE_BYTES = 300;
 
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
@@ -1595,11 +1597,24 @@ function isLowSurrogate(code: number): boolean {
   return code >= 0xdc00 && code <= 0xdfff;
 }
 
-function formatLineSnippet(line: SearchLine, maxChars = MAX_SEARCH_LINE_CHARS): string {
+function formatLineSnippet(
+  line: SearchLine,
+  maxChars = MAX_SEARCH_LINE_CHARS,
+  maxBytes = MAX_SEARCH_LINE_BYTES,
+): string {
   const text = line.text;
-  if (text.length <= maxChars) return text;
+  if (text.length <= maxChars && Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return text;
+  }
+  const clipPrefix = (raw: string): string => {
+    let out = raw.length > maxChars ? sliceSafeChars(raw, maxChars) : raw;
+    if (Buffer.byteLength(out, "utf8") > maxBytes) {
+      out = sliceUtf8Bytes(out, maxBytes);
+    }
+    return out;
+  };
   if (!line.isMatch || line.matchStart === undefined) {
-    return `${sliceSafeChars(text, maxChars)}...`;
+    return `${clipPrefix(text)}...`;
   }
 
   const len = text.length;
@@ -1607,8 +1622,8 @@ function formatLineSnippet(line: SearchLine, maxChars = MAX_SEARCH_LINE_CHARS): 
   const mEnd =
     line.matchEnd !== undefined ? clampInt(line.matchEnd, mStart, len) : mStart;
 
-  // Keep existing prefix truncation whenever the matched span fits inside [0, maxChars]
-  const prefix = sliceSafeChars(text, maxChars);
+  // Keep existing prefix truncation whenever the matched span fits inside [0, prefix.length]
+  const prefix = clipPrefix(text);
   if (mStart < prefix.length && mEnd <= prefix.length) {
     return `${prefix}...`;
   }
@@ -1642,9 +1657,26 @@ function formatLineSnippet(line: SearchLine, maxChars = MAX_SEARCH_LINE_CHARS): 
   }
   if (winEnd < winStart) winEnd = winStart;
 
+  let slice = text.slice(winStart, winEnd);
+  if (Buffer.byteLength(slice, "utf8") > maxBytes) {
+    // Tighten around mStart when multibyte text exceeds the per-line byte ceiling
+    const relMatch = Math.max(0, mStart - winStart);
+    if (Buffer.byteLength(slice.slice(0, relMatch), "utf8") > Math.floor(maxBytes * 0.4)) {
+      winStart = Math.max(0, mStart - Math.min(24, mStart));
+      if (winStart > 0 && winStart < len && isLowSurrogate(text.charCodeAt(winStart))) {
+        winStart = winStart === mStart && isHighSurrogate(text.charCodeAt(winStart - 1))
+          ? winStart - 1
+          : winStart + 1;
+      }
+      slice = text.slice(winStart, winEnd);
+    }
+    slice = sliceUtf8Bytes(slice, maxBytes);
+    winEnd = winStart + slice.length;
+  }
+
   const leadEllipsis = winStart > 0 ? "..." : "";
   const trailEllipsis = winEnd < len ? "..." : "";
-  return `${leadEllipsis}${text.slice(winStart, winEnd)}${trailEllipsis}`;
+  return `${leadEllipsis}${slice}${trailEllipsis}`;
 }
 
 function formatFileMatches(
