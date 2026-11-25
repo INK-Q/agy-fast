@@ -1543,4 +1543,188 @@ describe("batch_search", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
+
+  it("warns when sortBy mtime hits the glob scan cap while staying silent on complete scans", async () => {
+    const mtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-mtime-cap-"));
+    try {
+      for (let i = 1; i <= 12; i++) {
+        const sub = path.join(mtimeDir, `bucket-${String(i).padStart(2, "0")}`);
+        await fs.mkdir(sub, { recursive: true });
+        const filePath = path.join(sub, `item-${i}.log`);
+        await fs.writeFile(filePath, `entry ${i}\n`, "utf8");
+        const t = new Date(Date.now() - (20 - i) * 60_000);
+        await fs.utimes(filePath, t, t);
+      }
+
+      // 1. Scan cap smaller than total files -> explicit partial mtime warning
+      const cappedRes = await runBatchSearch(
+        {
+          cwd: mtimeDir,
+          queries: [
+            { type: "glob", pattern: "*", sortBy: "mtime", maxResults: 3 },
+            { type: "glob", pattern: "*", sortBy: "path", maxResults: 3 },
+          ],
+        },
+        { globScanLimit: 6 },
+      );
+      assert.equal(cappedRes.isError, false);
+      const [mtimeSec, pathSec] = cappedRes.text.split("\n\n");
+      assert.match(
+        mtimeSec!,
+        /truncated at 3 of 6\+ files; mtime order is partial \(scan cap reached; narrow 'path' or 'pattern'\)/,
+      );
+      // sortBy: "path" does NOT emit the mtime-specific warning
+      assert.match(pathSec!, /truncated at 3 of 6\+ files;/);
+      assert.doesNotMatch(pathSec!, /mtime order is partial/);
+
+      // 2. Complete scan (no scan cap truncation) -> sorted newest-first without partial warning
+      const fullRes = await runBatchSearch({
+        cwd: mtimeDir,
+        queries: [{ type: "glob", pattern: "*", sortBy: "mtime", maxResults: 3 }],
+      });
+      assert.equal(fullRes.isError, false);
+      assert.match(fullRes.text, /bucket-12\/item-12\.log/);
+      assert.match(fullRes.text, /truncated at 3 of 12 files;/);
+      assert.doesNotMatch(fullRes.text, /mtime order is partial/);
+    } finally {
+      await fs.rm(mtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks files truncated by the per-file match cap identically in rg and Node backends", async () => {
+    const capDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-perfile-cap-"));
+    try {
+      await fs.writeFile(
+        path.join(capDir, "alpha.py"),
+        Array.from({ length: 65 }, (_, i) => `hit_token_${i + 1} = ${i + 1}`).join("\n") + "\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(capDir, "beta.py"),
+        Array.from({ length: 12 }, (_, i) => `hit_token_beta_${i + 1} = ${i + 1}`).join("\n") + "\n",
+        "utf8",
+      );
+
+      // 1. Directory query with maxResults=80: alpha hits per-file cap (50), beta shows all 12 (total 62)
+      const rgRes = await runBatchSearch({
+        cwd: capDir,
+        queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+      });
+      const nodeRes = await runBatchSearch(
+        {
+          cwd: capDir,
+          queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgRes.isError, false);
+      assert.equal(rgRes.text, nodeRes.text, "rg and Node fallback output must match");
+      assert.match(
+        rgRes.text,
+        /alpha\.py[\s\S]*50: hit_token_50 = 50\n  \.\.\. \(\+more matches in this file; per-file cap 50 reached — narrow 'path' to see all\)\nbeta\.py/,
+      );
+      assert.doesNotMatch(rgRes.text, /hit_token_beta_12 = 12\n  \.\.\. \(\+more matches/);
+      assert.match(rgRes.text, /\.\.\. \[truncated at 62 matches\]$/);
+
+      // 2. Single-file target with maxResults=80 does NOT trigger per-file cap marker
+      const singleRg = await runBatchSearch({
+        cwd: capDir,
+        queries: [{ type: "text", pattern: "hit_token", path: "alpha.py", maxResults: 80 }],
+      });
+      const singleNode = await runBatchSearch(
+        {
+          cwd: capDir,
+          queries: [{ type: "text", pattern: "hit_token", path: "alpha.py", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(singleRg.text, singleNode.text);
+      assert.doesNotMatch(singleRg.text, /per-file cap/);
+      assert.match(singleRg.text, /65: hit_token_65 = 65/);
+
+      // 3. Budget-constrained formatting preserves per-file cap marker and stays within maxChars
+      const tightRg = await runBatchSearch({
+        cwd: capDir,
+        maxChars: 900,
+        queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+      });
+      const tightNode = await runBatchSearch(
+        {
+          cwd: capDir,
+          maxChars: 900,
+          queries: [{ type: "text", pattern: "hit_token", maxResults: 80 }],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(tightRg.text, tightNode.text);
+      assert.ok(tightRg.text.length <= 900, `Expected <= 900 chars, got ${tightRg.text.length}`);
+      assert.match(tightRg.text, /per-file cap 50/);
+    } finally {
+      await fs.rm(capDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports total file counts and distinguishing omitted dirs on truncated summary and nested glob queries (rg/Node parity)", async () => {
+    const treeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-summary-dirs-"));
+    try {
+      // Nested single-root layout: workspace/runs/exp-01..exp-04
+      for (const [exp, count] of [
+        ["exp-01", 3],
+        ["exp-02", 2],
+        ["exp-03", 4],
+        ["exp-04", 5],
+      ] as const) {
+        const dir = path.join(treeDir, "workspace", "runs", exp, "logs");
+        await fs.mkdir(dir, { recursive: true });
+        for (let i = 1; i <= count; i++) {
+          await fs.writeFile(
+            path.join(dir, `trial-${i}.json`),
+            `{"marker":"SUMMARY_DIR_TOKEN","exp":"${exp}","i":${i}}\n`,
+            "utf8",
+          );
+        }
+      }
+
+      // 1. files_with_matches & count truncated at 3 of 14 files descend past shared "runs/" to reveal runs/exp-04/, runs/exp-03/, runs/exp-02/
+      const summaryQueries = [
+        {
+          type: "text" as const,
+          path: "workspace",
+          pattern: "SUMMARY_DIR_TOKEN",
+          outputMode: "files_with_matches" as const,
+          maxResults: 3,
+        },
+        {
+          type: "text" as const,
+          path: "workspace",
+          pattern: "SUMMARY_DIR_TOKEN",
+          outputMode: "count" as const,
+          maxResults: 3,
+        },
+      ];
+      const rgSummary = await runBatchSearch({ cwd: treeDir, queries: summaryQueries });
+      const nodeSummary = await runBatchSearch(
+        { cwd: treeDir, queries: summaryQueries },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgSummary.isError, false);
+      assert.equal(rgSummary.text, nodeSummary.text, "truncated summary output must match between rg and Node");
+      for (const sec of rgSummary.text.split("\n\n")) {
+        assert.match(sec, /truncated; showing 3 files of 14; omitted dirs: runs\/exp-04\/ \(5\), runs\/exp-03\/ \(4\), runs\/exp-02\/ \(2\)/);
+      }
+
+      // 2. Glob query on the same nested tree also descends past shared "runs/"
+      const globRes = await runBatchSearch({
+        cwd: treeDir,
+        queries: [{ type: "glob", path: "workspace", pattern: "*.json", maxResults: 3 }],
+      });
+      assert.equal(globRes.isError, false);
+      assert.match(
+        globRes.text,
+        /truncated at 3 of 14 files; omitted dirs: runs\/exp-04\/ \(5\), runs\/exp-03\/ \(4\), runs\/exp-02\/ \(2\)/,
+      );
+    } finally {
+      await fs.rm(treeDir, { recursive: true, force: true });
+    }
+  });
 });
