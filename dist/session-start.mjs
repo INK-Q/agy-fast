@@ -883,7 +883,9 @@ var SNAPSHOT_PRIORITY_SUBDIRS = /* @__PURE__ */ new Set([
   "lib",
   "packages",
   "server",
+  "backend",
   "web",
+  "frontend",
   "client",
   "api",
   "tests",
@@ -1092,7 +1094,7 @@ var MANIFEST_SKIP_SUBDIRS_LOWER = new Set(
 function shortEntryName(name, maxLen = 28) {
   return name.length > maxLen ? `${sliceSafeChars(name, maxLen - 3)}...` : name;
 }
-async function getTwoLevelTree(workspaceDir, topRes, isHomeRoot, deadlineMs) {
+async function getTwoLevelTree(topRes, isHomeRoot, deadlineMs, readSubdir) {
   if (!topRes.ok) {
     return topRes.timedOut ? "Layout (2 levels):\n  ... (scan timed out)" : null;
   }
@@ -1158,12 +1160,7 @@ ${lines.join("\n")}`;
           };
           continue;
         }
-        const subRes = await raceWithDeadline(
-          fs.readdir(path3.join(workspaceDir, entry.name), {
-            withFileTypes: true
-          }),
-          deadlineMs
-        );
+        const subRes = await readSubdir(entry.name);
         if (!subRes.ok) {
           subResults[idx] = {
             name: `${entry.name}/`,
@@ -1266,7 +1263,7 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
           const raw = await fs.readFile(path3.join(dirPath, name), "utf8");
           const targets = [];
           for (const line of raw.split(/\r?\n/)) {
-            const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
+            const m = /^([A-Za-z0-9_.-]+)\s*::?(?![=:?])/.exec(line);
             if (m && m[1] && !m[1].startsWith(".")) {
               if (!targets.includes(m[1])) targets.push(m[1]);
               if (targets.length >= 10) break;
@@ -1343,11 +1340,50 @@ async function detectManifestsInDir(dirPath, prefix, knownFiles) {
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
       }
-    })()
+    })(),
+    // CMakeLists.txt
+    (async () => {
+      if (!hasFile("CMakeLists.txt")) return;
+      try {
+        const raw = await fs.readFile(path3.join(dirPath, "CMakeLists.txt"), "utf8");
+        const m = /^\s*project\s*\(\s*([A-Za-z0-9_.-]+)/im.exec(raw);
+        hints.push(
+          m?.[1] ? `${prefix}CMakeLists.txt (${m[1]}, cmake)` : `${prefix}CMakeLists.txt (cmake)`
+        );
+      } catch {
+      }
+    })(),
+    // deno.json / deno.jsonc
+    (async () => {
+      for (const name of ["deno.json", "deno.jsonc"]) {
+        if (!hasFile(name)) continue;
+        try {
+          await fs.access(path3.join(dirPath, name));
+          hints.push(`${prefix}${name} (deno)`);
+          break;
+        } catch {
+        }
+      }
+    })(),
+    // Package.swift / pubspec.yaml / Gemfile / composer.json / mix.exs
+    ...[
+      ["Package.swift", "swift"],
+      ["pubspec.yaml", "dart/flutter"],
+      ["Gemfile", "ruby"],
+      ["composer.json", "php"],
+      ["mix.exs", "elixir"]
+    ].map(([fileName, tag]) => async () => {
+      if (!hasFile(fileName)) return;
+      try {
+        await fs.access(path3.join(dirPath, fileName));
+        hints.push(`${prefix}${fileName} (${tag})`);
+      } catch {
+      }
+    })
   ]);
   return hints;
 }
-async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadlineMs) {
+async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadlineMs, readSubdir) {
   const rootKnownFiles = topRes.ok ? new Set(topRes.value.filter((e) => !e.isDirectory()).map((e) => e.name)) : void 0;
   const rootRes = await raceWithDeadline(
     detectManifestsInDir(workspaceDir, "", rootKnownFiles),
@@ -1358,7 +1394,12 @@ async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadl
   if (!isHomeRoot && performance.now() < deadlineMs && topRes.ok) {
     const subdirs = topRes.value.filter(
       (e) => e.isDirectory() && !shouldSkipSnapshotEntry(e.name, true, false, isHomeRoot) && !MANIFEST_SKIP_SUBDIRS_LOWER.has(e.name.toLowerCase())
-    ).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 8);
+    ).sort((a, b) => {
+      const aPrio = SNAPSHOT_PRIORITY_SUBDIRS.has(a.name.toLowerCase());
+      const bPrio = SNAPSHOT_PRIORITY_SUBDIRS.has(b.name.toLowerCase());
+      if (aPrio !== bPrio) return aPrio ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    }).slice(0, 8);
     let nextIdx = 0;
     const workerCount = Math.min(4, subdirs.length);
     await Promise.all(
@@ -1367,8 +1408,17 @@ async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadl
           const idx = nextIdx++;
           if (idx >= subdirs.length || performance.now() >= deadlineMs) break;
           const d = subdirs[idx];
+          const subDirRes = await readSubdir(d.name);
+          if (!subDirRes.ok) continue;
+          const subKnownFiles = new Set(
+            subDirRes.value.filter((e) => !e.isDirectory()).map((e) => e.name)
+          );
           const res = await raceWithDeadline(
-            detectManifestsInDir(path3.join(workspaceDir, d.name), `${d.name}/`),
+            detectManifestsInDir(
+              path3.join(workspaceDir, d.name),
+              `${d.name}/`,
+              subKnownFiles
+            ),
             deadlineMs
           );
           if (res.ok) {
@@ -1436,10 +1486,22 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
       scanDeadline
     )
   ]);
+  const subdirCache = /* @__PURE__ */ new Map();
+  const readSubdirCached = (name) => {
+    let cached = subdirCache.get(name);
+    if (!cached) {
+      cached = performance.now() >= scanDeadline ? Promise.resolve({ ok: false, timedOut: true }) : raceWithDeadline(
+        fs.readdir(path3.join(workspaceDir, name), { withFileTypes: true }),
+        scanDeadline
+      );
+      subdirCache.set(name, cached);
+    }
+    return cached;
+  };
   const [gitSummary, treeSummary, projectSummary] = await Promise.all([
     gitPromise,
-    getTwoLevelTree(workspaceDir, topRes, isHomeRoot, scanDeadline),
-    getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, scanDeadline)
+    getTwoLevelTree(topRes, isHomeRoot, scanDeadline, readSubdirCached),
+    getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, scanDeadline, readSubdirCached)
   ]);
   const header = `[agy-fast startup snapshot] Workspace: ${workspaceDir}`;
   const sections = [header, gitSummary, projectSummary, treeSummary].filter(
