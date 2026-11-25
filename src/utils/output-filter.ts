@@ -528,14 +528,17 @@ const GREEN_BUILD_OR_PASS_PATTERNS: RegExp[] = [
   /^cache hit,\s+replaying logs\b/i,
   /^Time:\s+\d+(?:\.\d+)?\s*(?:ms|s|m)\b/i,
   /^(?:yarn run v\d|•\s+Packages in scope:|•\s+Running\s+\S+\s+in\s+\d+\s+packages)/i,
-  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP)
+  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / nextest / pytest / unittest / TAP)
   /^[✓✔]\s+\S/,
   /^PASS\s+\S/,
+  /^PASS\s+\[\s*\d+(?:\.\d+)?s\s*\]\s+(?:\(\s*\d+\/\d+\s*\)\s+)?\S/,
   /^(?:---\s+PASS:\s*|===\s+(?:RUN|PAUSE|CONT)\s+)\S/,
   /^ok\t\S/,
   /^ok\s+\S+\s+(?:\d+(?:\.\d+)?s|\(cached\))/i,
   /^ok\s+\d+\s+-\s+\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\b/,
+  /^test\w*\s+\([A-Za-z_][\w.]*\)\s+\.\.\.\s+ok\s*$/,
+  /^\S+\.py::[^\t\r\n]{1,300}\s+PASSED(?:\s+\[\s*\d+%\s*\])?\s*$/,
   /^running\s+\d+\s+tests?$/i,
   /^(?:Test Files|Tests|Suites|Snapshots|Start at|Duration|test result:\s{0,4}ok\.)\s.*(?:\bpassed\b|\btotal\b|\b\d+(?:\.\d+)?(?:ms|s)\b|\bok\.)/i,
   // Rust / Go / Gradle / Maven progress (strictly scoped [INFO] whitelist)
@@ -553,6 +556,9 @@ const UNAMBIGUOUS_TEST_PASS_PATTERNS: RegExp[] = [
   /^ok\s+\d+\s+-\s+\S/,
   /^ok\t\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
+  /^test\w*\s+\([A-Za-z_][\w.]*\)\s+\.\.\.\s+ok\s*$/,
+  /^\S+\.py::[^\t\r\n]{1,300}\s+PASSED(?:\s+\[\s*\d+%\s*\])?\s*$/,
+  /^PASS\s+\[\s*\d+(?:\.\d+)?s\s*\]\s+(?:\(\s*\d+\/\d+\s*\)\s+)?\S/,
   /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/,
 ];
 
