@@ -296,22 +296,26 @@ export async function runChecks(
     return `${baseHeader}\n$ ${shortCmd}`;
   };
 
+  const sanitizeOneLineCmd = (cmd: string): string =>
+    cmd.replace(/[\r\n\t]+/g, " ").replace(/`/g, "'").trim();
+
   const formatCmdHeaderPrefix = (
     headerLine: string,
     cmd: string,
     blockCharShare: number,
     blockByteShare: number,
   ): string => {
-    const fullPrefix = `${headerLine}\n$ ${cmd}\n`;
+    const singleLineCmd = cmd.replace(/[\r\n\t]+/g, " ").trim();
+    const fullPrefix = `${headerLine}\n$ ${singleLineCmd}\n`;
     const headerLineBytes = Buffer.byteLength(headerLine, "utf8");
     const fullPrefixBytes = Buffer.byteLength(fullPrefix, "utf8");
-    const maxPrefixChars = Math.max(
-      headerLine.length + 24,
-      Math.floor(blockCharShare * 0.35),
+    const maxPrefixChars = Math.min(
+      headerLine.length + 280,
+      Math.max(headerLine.length + 24, Math.floor(blockCharShare * 0.35)),
     );
-    const maxPrefixBytes = Math.max(
-      headerLineBytes + 24,
-      Math.floor(blockByteShare * 0.35),
+    const maxPrefixBytes = Math.min(
+      headerLineBytes + 280,
+      Math.max(headerLineBytes + 24, Math.floor(blockByteShare * 0.35)),
     );
     if (fullPrefix.length <= maxPrefixChars && fullPrefixBytes <= maxPrefixBytes) {
       return fullPrefix;
@@ -323,7 +327,7 @@ export async function runChecks(
     }
     const maxCmdChars = Math.max(20, maxPrefixChars - headerLine.length - 4);
     const maxCmdBytes = Math.max(20, maxPrefixBytes - headerLineBytes - 4);
-    const displayCmd = capCmdDisplay(cmd, maxCmdChars, maxCmdBytes);
+    const displayCmd = capCmdDisplay(singleLineCmd, maxCmdChars, maxCmdBytes);
     return `${headerLine}\n$ ${displayCmd}\n`;
   };
 
@@ -455,7 +459,8 @@ export async function runChecks(
           maxChars: 300,
         });
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
-        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
+        const safePassCmd = capCmdDisplay(sanitizeOneLineCmd(spec.command), 120, 120);
+        const fullBlock = `${compactHeader} (\`${safePassCmd}\`): ${body}`;
         blocks[i] = fullBlock;
         passChars += fullBlock.length;
         passBytes += Buffer.byteLength(fullBlock, "utf8");
@@ -680,6 +685,13 @@ export async function runChecks(
             entry.prepared,
             targetChars,
           ).text;
+        }
+
+        if (Buffer.byteLength(compactedBody, "utf8") > allowedBodyBytes) {
+          compactedBody = truncateHeadTailWithByteNotice(
+            compactedBody,
+            allowedBodyBytes,
+          );
         }
 
         blocks[entry.index] = `${effectiveHeader}${compactedBody}`;

@@ -4114,6 +4114,18 @@ function isAscii(text) {
   }
   return true;
 }
+function isWordBoundaryAt(rawTarget, idx) {
+  const next = idx + 1 < rawTarget.length ? rawTarget.charCodeAt(idx + 1) : 0;
+  const nextIsWord = next >= 97 && next <= 122 || next >= 65 && next <= 90 || next >= 48 && next <= 57;
+  if (!nextIsWord) return false;
+  if (idx <= 0) return true;
+  const prev = rawTarget.charCodeAt(idx - 1);
+  if (prev === 47 || prev === 45 || prev === 95 || prev === 46 || prev === 32) {
+    return true;
+  }
+  const cur = rawTarget.charCodeAt(idx);
+  return prev >= 97 && prev <= 122 && cur >= 65 && cur <= 90;
+}
 function subsequenceCost(needle, haystack) {
   if (!needle) return 2147483647;
   if (isAscii(needle) && isAscii(haystack)) {
@@ -4123,18 +4135,47 @@ function subsequenceCost(needle, haystack) {
     if (contiguousAt2 >= 0) {
       return contiguousAt2 === 0 ? -100 : -60 + Math.min(25, contiguousAt2);
     }
-    let cursor2 = 0;
-    let first2 = -1;
-    let last2 = -1;
+    const qLen = query2.length;
     const hLen = lowered2.length;
-    for (let i = 0; i < query2.length; i++) {
-      const targetCode = query2.charCodeAt(i);
-      while (cursor2 < hLen && lowered2.charCodeAt(cursor2) !== targetCode) cursor2++;
-      if (cursor2 === hLen) return void 0;
-      if (first2 < 0) first2 = cursor2;
-      last2 = cursor2++;
+    const firstCode = query2.charCodeAt(0);
+    let bestCost;
+    let searchFrom = 0;
+    let attempts = 0;
+    while (searchFrom <= hLen - qLen && attempts < 12) {
+      const startPos = lowered2.indexOf(query2[0], searchFrom);
+      if (startPos < 0 || startPos > hLen - qLen) break;
+      attempts++;
+      searchFrom = startPos + 1;
+      let cursor2 = startPos + 1;
+      let prevMatch = startPos;
+      let consecutiveHits = 0;
+      let boundaryHits = isWordBoundaryAt(haystack, startPos) ? 1 : 0;
+      let failed = false;
+      for (let i = 1; i < qLen; i++) {
+        const targetCode = query2.charCodeAt(i);
+        while (cursor2 < hLen && lowered2.charCodeAt(cursor2) !== targetCode) cursor2++;
+        if (cursor2 === hLen) {
+          failed = true;
+          break;
+        }
+        if (cursor2 === prevMatch + 1) {
+          consecutiveHits++;
+        } else if (isWordBoundaryAt(haystack, cursor2)) {
+          boundaryHits++;
+        }
+        prevMatch = cursor2;
+        cursor2++;
+      }
+      if (failed) break;
+      const gapPenalty = Math.max(0, prevMatch - startPos + 1 - qLen) * 2;
+      const bonus = (startPos === 0 ? 12 : 0) + Math.min(36, consecutiveHits * 9 + boundaryHits * 7);
+      const cost = Math.max(-55, gapPenalty - bonus);
+      if (bestCost === void 0 || cost < bestCost) {
+        bestCost = cost;
+      }
+      if (firstCode < 0) break;
     }
-    return Math.max(0, last2 - first2 + 1 - query2.length) - (first2 === 0 ? 20 : 0);
+    return bestCost;
   }
   const lowered = [...haystack.toLowerCase()];
   const query = [...needle.toLowerCase()];
@@ -4143,13 +4184,18 @@ function subsequenceCost(needle, haystack) {
     return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
   }
   let cursor = 0;
-  let first = -1;
   let last = -1;
   for (const ch of query) {
     while (cursor < lowered.length && lowered[cursor] !== ch) cursor++;
     if (cursor === lowered.length) return void 0;
-    if (first < 0) first = cursor;
     last = cursor++;
+  }
+  let backCursor = last;
+  let first = last;
+  for (let i = query.length - 1; i >= 0; i--) {
+    const ch = query[i];
+    while (backCursor >= 0 && lowered[backCursor] !== ch) backCursor--;
+    first = backCursor--;
   }
   return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
 }
@@ -4157,26 +4203,36 @@ function scoreSubsequence(query, target) {
   const cost = subsequenceCost(query, target);
   return cost === void 0 ? -1 : Math.max(1, 1e3 - cost);
 }
-function fuzzyScorePath(query, candidatePosix) {
+function prepareFuzzyTokens(query) {
   const trimmed = query.trim().replace(/\\/g, "/");
-  if (!trimmed) return -1;
-  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (!trimmed) return [];
+  return trimmed.split(/\s+/).filter(Boolean).map((raw) => ({
+    raw,
+    lower: raw.toLowerCase(),
+    hasSlash: raw.includes("/")
+  }));
+}
+function scorePreparedTokens(tokens, candidatePosix) {
+  if (tokens.length === 0) return -1;
   const slashIdx = candidatePosix.lastIndexOf("/");
   const basename = slashIdx === -1 ? candidatePosix : candidatePosix.slice(slashIdx + 1);
+  const lowerBase = basename.toLowerCase();
   let totalScore = 0;
-  for (const token of tokens) {
-    const fullScore = scoreSubsequence(token, candidatePosix);
+  for (const tok of tokens) {
+    const fullScore = scoreSubsequence(tok.raw, candidatePosix);
     if (fullScore < 0) return -1;
-    const baseScore = !token.includes("/") ? scoreSubsequence(token, basename) : -1;
+    const baseScore = !tok.hasSlash ? scoreSubsequence(tok.raw, basename) : -1;
     totalScore += baseScore >= 0 ? Math.max(fullScore, baseScore + 45) : fullScore;
-    if (basename.toLowerCase() === token.toLowerCase()) totalScore += 60;
+    if (lowerBase === tok.lower) totalScore += 60;
   }
   return totalScore;
 }
 function rankFuzzyPaths(query, candidates, maxResults) {
+  const tokens = prepareFuzzyTokens(query);
+  if (tokens.length === 0) return { matches: [], totalMatched: 0 };
   const scored = [];
   for (const candidate of candidates) {
-    const score = fuzzyScorePath(query, candidate);
+    const score = scorePreparedTokens(tokens, candidate);
     if (score >= 0) scored.push({ path: candidate, score });
   }
   scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -4577,6 +4633,48 @@ function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
   return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
+var SAFE_RG_IDENTITY_ESCAPE_CHARS = /* @__PURE__ */ new Set([
+  ":",
+  "/",
+  "#",
+  "!",
+  '"',
+  "'",
+  ";",
+  ",",
+  "@",
+  "%",
+  "=",
+  "~",
+  "`"
+]);
+function sanitizeRgIdentityEscapes(pattern) {
+  if (!pattern.includes("\\")) return pattern;
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\" && i + 1 < pattern.length) {
+      const next = pattern[i + 1];
+      if (SAFE_RG_IDENTITY_ESCAPE_CHARS.has(next)) {
+        out += next;
+        i += 1;
+        continue;
+      }
+      out += ch + next;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+function patternTargetsHiddenPath(raw) {
+  if (!raw) return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith("!")) return false;
+  const norm = trimmed.replace(/\\/g, "/");
+  return /(?:^|[/{,!])\.(?!\.?(?:\/|$|,|\}))/.test(norm);
+}
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
@@ -4615,6 +4713,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   }
   const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
   const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  const relSearchRoot = toPosixPath(path5.relative(baseCwd, searchRoot));
+  if (patternTargetsHiddenPath(query.glob) || !relSearchRoot.startsWith("..") && patternTargetsHiddenPath(relSearchRoot)) {
+    args.push("--hidden");
+  }
   if (query.multiline) args.push("--multiline", "--multiline-dotall");
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
@@ -4650,6 +4752,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
+  const rgPattern = query.type === "regex" ? sanitizeRgIdentityEscapes(query.pattern) : query.pattern;
   const runRg = async (runArgs, opts) => {
     const res = await execBinaryAsync("rg", runArgs, {
       cwd: baseCwd,
@@ -4670,7 +4773,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       ...args,
       ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
       "--",
-      query.pattern,
+      rgPattern,
       rgSearchTarget
     ]);
     const files2 = [];
@@ -4719,7 +4822,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       "--with-filename",
       "--null",
       "--",
-      query.pattern,
+      rgPattern,
       rgSearchTarget
     ]);
     const counted = [];
@@ -4774,7 +4877,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
         "--json",
         ...contextLines > 0 ? ["-C", String(contextLines)] : [],
         "--",
-        query.pattern,
+        rgPattern,
         ...chunk
       ],
       { allowPartialError: !isFileTarget }
@@ -4985,7 +5088,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
-      rawGlob && !globNegated && patternTargetsHidden(rawGlob)
+      rawGlob && !globNegated && patternTargetsHiddenPath(rawGlob)
     );
     let ignoreDirs;
     if (rawGlob && !globNegated) {
@@ -5246,9 +5349,11 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
+  const matchesType = fileTypeMatcher(query.fileType);
   const matchBasename = !pattern.includes("/");
-  const includeHidden = patternTargetsHidden(pattern);
+  const includeHidden = patternTargetsHiddenPath(pattern);
   if (isFileTarget) {
+    if (!matchesType(searchRoot)) return "(no files matched)";
     const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
     const base = path5.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
@@ -5265,6 +5370,7 @@ ${rel}` : fallback2.emptyMessage;
     maxFiles: scanLimit,
     includeHidden,
     fileFilter: (relPosix) => {
+      if (!matchesType(relPosix)) return false;
       if (matcher.test(relPosix)) return true;
       if (matchBasename) {
         const base = relPosix.split("/").pop() ?? relPosix;
@@ -5282,6 +5388,7 @@ ${rel}` : fallback2.emptyMessage;
       maxFiles: scanLimit,
       includeHidden,
       fileFilter: (relPosix) => {
+        if (!matchesType(relPosix)) return false;
         const base = relPosix.split("/").pop() ?? relPosix;
         return fallback.match(relPosix, base);
       }
@@ -5307,11 +5414,28 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
+  const globNegated = Boolean(query.glob && query.glob.startsWith("!"));
+  const rawGlob = query.glob ? globNegated ? query.glob.slice(1) : query.glob : null;
+  const globRe = rawGlob ? globToRegExp(rawGlob) : null;
+  const matchesCandidate = (relPosix) => {
+    if (!matchesType(relPosix)) return false;
+    if (!globRe) return true;
+    const hit = globRe.test(relPosix) || !rawGlob.includes("/") && globRe.test(relPosix.split("/").pop() ?? relPosix);
+    return globNegated ? !hit : hit;
+  };
+  const includeHidden = patternTargetsHiddenPath(pattern) || patternTargetsHiddenPath(query.glob);
   const maxResults = clampInt(query.maxResults, 1, 200, 30);
-  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, {
+    maxFiles: 8e3,
+    includeHidden,
+    fileFilter: matchesCandidate
+  });
+  const candidates = walked.files.map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file))).filter((rel) => !isFileTarget || matchesCandidate(rel));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
-  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  if (matches.length === 0) {
+    return walked.truncated ? "(no files matched in first 8000 scanned files; narrow 'path' or 'fileType')" : "(no files matched)";
+  }
+  const body = matches.map((match) => match.path).join("\n");
   const footer = walked.truncated || totalMatched > maxResults ? `
 ... [truncated; showing ${matches.length} files]` : "";
   return body + footer;
@@ -5497,7 +5621,7 @@ function buildTruncatedNotice(shownMatches, totalMatches, shownFiles, totalFiles
   const filesLabel = shownFiles < totalFiles ? `across ${shownFiles} of ${totalFiles} files` : totalFiles === 1 ? "in 1 file" : `across ${totalFiles} files`;
   if (omittedContextOnly) {
     return `
-... [truncated: showed all ${shownMatches} ${shownMatches === 1 ? "match" : "matches"} ${filesLabel}; omitted context lines${maxResultsTruncated ? `; capped at ${totalMatches} matches` : ""}]`;
+... [truncated: showed all ${shownMatches} ${shownMatches === 1 ? "match" : "matches"} ${filesLabel}; omitted context lines${maxResultsTruncated ? `; capped at ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}` : ""}]`;
   }
   return `
 ... [truncated: showed ${shownMatches} of ${totalLabel} matches ${filesLabel}]`;
@@ -5623,7 +5747,7 @@ function formatBudgetedContentSection(params) {
       shownFiles += 1;
     }
   } else {
-    const worstTruncNotice = measureCost(
+    const stdTruncNotice = measureCost(
       buildTruncatedNotice(
         actualTotalMatches,
         actualTotalMatches,
@@ -5633,6 +5757,20 @@ function formatBudgetedContentSection(params) {
         false
       )
     );
+    const ctxTruncNotice = totalContextCount > 0 ? measureCost(
+      buildTruncatedNotice(
+        actualTotalMatches,
+        actualTotalMatches,
+        totalFiles,
+        totalFiles,
+        maxResultsTruncated,
+        true
+      )
+    ) : stdTruncNotice;
+    const worstTruncNotice = {
+      chars: Math.max(stdTruncNotice.chars, ctxTruncNotice.chars),
+      bytes: Math.max(stdTruncNotice.bytes, ctxTruncNotice.bytes)
+    };
     const minOmittedNotice = totalFiles > 1 ? measureCost(
       `
 ... [+${totalFiles} more files; use outputMode: "files_with_matches"]`
@@ -5882,9 +6020,27 @@ ${line.formatted}`);
       }
     }
   }
-  const result = `${parts.join("")}${omittedFilesLine}${truncLine}`;
+  const bodyText = parts.join("");
+  const result = `${bodyText}${omittedFilesLine}${truncLine}`;
   if (result.length <= charBudget && Buffer.byteLength(result, "utf8") <= byteBudget) {
     return result;
+  }
+  if (omittedContextOnly) {
+    const compactTrunc = buildTruncatedNotice(
+      shownMatches,
+      actualTotalMatches,
+      shownFiles,
+      totalFiles,
+      maxResultsTruncated,
+      false
+    );
+    const compactResult = `${bodyText}${omittedFilesLine}${compactTrunc}`;
+    if (compactResult.length <= charBudget && Buffer.byteLength(compactResult, "utf8") <= byteBudget) {
+      return compactResult;
+    }
+    if (bodyText.length <= charBudget && Buffer.byteLength(bodyText, "utf8") <= byteBudget) {
+      return bodyText;
+    }
   }
   return null;
 }
@@ -5932,7 +6088,7 @@ ${out}` };
         try {
           res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
         } catch (err) {
-          if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
+          if (err instanceof Error && (err.message.startsWith("rg spawn error:") || query.type === "regex" && /unrecognized escape sequence/i.test(err.message))) {
             res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
           } else {
             throw err;
@@ -6085,10 +6241,6 @@ async function runBatchSearch(input, options = {}) {
     text: fitSectionsToByteBudget(finalSections, maxChars, maxBytes, separator),
     isError: false
   };
-}
-function patternTargetsHidden(pattern) {
-  const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
-  return /(?:^|[/,{])\.[^./]/.test(normalized);
 }
 function globTargetsDir(glob, dir) {
   const normalized = glob.replace(/\\/g, "/").replace(/(^|[,{])(?:\.\/)+/g, "$1");
@@ -8965,19 +9117,21 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     return `${baseHeader}
 $ ${shortCmd}`;
   };
+  const sanitizeOneLineCmd = (cmd) => cmd.replace(/[\r\n\t]+/g, " ").replace(/`/g, "'").trim();
   const formatCmdHeaderPrefix = (headerLine, cmd, blockCharShare, blockByteShare) => {
+    const singleLineCmd = cmd.replace(/[\r\n\t]+/g, " ").trim();
     const fullPrefix = `${headerLine}
-$ ${cmd}
+$ ${singleLineCmd}
 `;
     const headerLineBytes = Buffer.byteLength(headerLine, "utf8");
     const fullPrefixBytes = Buffer.byteLength(fullPrefix, "utf8");
-    const maxPrefixChars = Math.max(
-      headerLine.length + 24,
-      Math.floor(blockCharShare * 0.35)
+    const maxPrefixChars = Math.min(
+      headerLine.length + 280,
+      Math.max(headerLine.length + 24, Math.floor(blockCharShare * 0.35))
     );
-    const maxPrefixBytes = Math.max(
-      headerLineBytes + 24,
-      Math.floor(blockByteShare * 0.35)
+    const maxPrefixBytes = Math.min(
+      headerLineBytes + 280,
+      Math.max(headerLineBytes + 24, Math.floor(blockByteShare * 0.35))
     );
     if (fullPrefix.length <= maxPrefixChars && fullPrefixBytes <= maxPrefixBytes) {
       return fullPrefix;
@@ -8990,7 +9144,7 @@ $ ${cmd}
     }
     const maxCmdChars = Math.max(20, maxPrefixChars - headerLine.length - 4);
     const maxCmdBytes = Math.max(20, maxPrefixBytes - headerLineBytes - 4);
-    const displayCmd = capCmdDisplay(cmd, maxCmdChars, maxCmdBytes);
+    const displayCmd = capCmdDisplay(singleLineCmd, maxCmdChars, maxCmdBytes);
     return `${headerLine}
 $ ${displayCmd}
 `;
@@ -9091,7 +9245,8 @@ $ ${spec.command}
           maxChars: 300
         });
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
-        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
+        const safePassCmd = capCmdDisplay(sanitizeOneLineCmd(spec.command), 120, 120);
+        const fullBlock = `${compactHeader} (\`${safePassCmd}\`): ${body}`;
         blocks[i] = fullBlock;
         passChars += fullBlock.length;
         passBytes += Buffer.byteLength(fullBlock, "utf8");
@@ -9276,6 +9431,12 @@ $ ${spec.command}
             entry.prepared,
             targetChars
           ).text;
+        }
+        if (Buffer.byteLength(compactedBody, "utf8") > allowedBodyBytes) {
+          compactedBody = truncateHeadTailWithByteNotice(
+            compactedBody,
+            allowedBodyBytes
+          );
         }
         blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
       }
