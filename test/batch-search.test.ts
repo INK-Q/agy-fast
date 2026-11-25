@@ -616,7 +616,7 @@ describe("batch_search", () => {
         assert.match(sections[3]!, /\(no matches\)/);
         assert.match(sections[4]!, /1: foo 1/);
         assert.match(sections[5]!, /\(no matches\)/);
-        assert.match(sections[6]!, /\(no matches\)/);
+        assert.match(sections[6]!, /\(skipped: target file appears to be binary\)/);
         assert.match(sections[7]!, /1: alpha/);
       }
     } finally {
@@ -1541,6 +1541,69 @@ describe("batch_search", () => {
       assert.ok(!res.text.includes("\\344\\270\\255"), `Unexpected octal-escaped path:\n${res.text}`);
     } finally {
       await fs.rm(cjkDir, { recursive: true, force: true });
+    }
+  });
+
+  it("searches explicit single-file targets over 2 MiB and surfaces explicit skip reasons across rg and Node backends", async () => {
+    const bigDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-bigfile-"));
+    try {
+      // Build a ~2.3 MiB JSONL file (above the 2 MiB directory-scan cap, well within the 20 MiB explicit-file cap)
+      const fillerLine = `${JSON.stringify({ idx: 0, msg: "x".repeat(120) })}\n`;
+      const repeatCount = Math.ceil((2.3 * 1024 * 1024) / fillerLine.length);
+      const bigContent = `${fillerLine.repeat(repeatCount)}${JSON.stringify({ event: "TAIL_MARKER_24H", ok: true })}\n`;
+      const bigPath = path.join(bigDir, "events.jsonl");
+      await fs.writeFile(bigPath, bigContent, "utf8");
+      await fs.writeFile(path.join(bigDir, "small.txt"), "SMALL_OK\n", "utf8");
+      await fs.writeFile(path.join(bigDir, "blob.bin"), Buffer.from("TAIL_MARKER_24H\x00binary\n"));
+
+      for (const forceNodeFallback of [false, true]) {
+        // 1. Explicit single-file target > 2 MiB succeeds across content, files_with_matches, and count modes
+        const singleRes = await runBatchSearch(
+          {
+            cwd: bigDir,
+            queries: [
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl" },
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl", outputMode: "files_with_matches" },
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl", outputMode: "count" },
+              // Directory scan still respects the 2 MiB cap to avoid stalling on repo-wide dumps
+              { type: "text", pattern: "TAIL_MARKER_24H" },
+              // Explicit binary target surfaces explicit skip reason instead of silent "(no matches)"
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "blob.bin" },
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "blob.bin", outputMode: "files_with_matches" },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(singleRes.isError, false);
+        const secs = singleRes.text.split("\n\n");
+        assert.match(secs[0]!, /events\.jsonl\n\s+\d+: .*TAIL_MARKER_24H/);
+        assert.match(secs[1]!, /^## Query 2.*\nevents\.jsonl$/);
+        assert.match(secs[2]!, /events\.jsonl: 1 matching lines/);
+        assert.match(secs[3]!, /\(no matches\)/);
+        assert.match(secs[4]!, /\(skipped: target file appears to be binary\)/);
+        assert.match(secs[5]!, /\(skipped: target file appears to be binary\)/);
+
+        // 2. Explicit single-file target above the explicit limit surfaces an explicit size-limit skip notice
+        const overCapRes = await runBatchSearch(
+          {
+            cwd: bigDir,
+            queries: [
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl" },
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl", outputMode: "count" },
+              // Caller glob mismatch still returns "(no matches)" before size check
+              { type: "text", pattern: "TAIL_MARKER_24H", path: "events.jsonl", glob: "*.ts" },
+            ],
+          },
+          { forceNodeFallback, explicitFileMaxBytes: 1024 * 1024 },
+        );
+        assert.equal(overCapRes.isError, false);
+        const overSecs = overCapRes.text.split("\n\n");
+        assert.match(overSecs[0]!, /\(skipped: target file exceeds 1 MiB search limit \(2\.\d MiB\)\)/);
+        assert.match(overSecs[1]!, /\(skipped: target file exceeds 1 MiB search limit \(2\.\d MiB\)\)/);
+        assert.match(overSecs[2]!, /\(no matches\)/);
+      }
+    } finally {
+      await fs.rm(bigDir, { recursive: true, force: true });
     }
   });
 });

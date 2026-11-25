@@ -1591,6 +1591,21 @@ const HTML_SEMANTIC_TAGS = new Set([
   "template",
 ]);
 
+const HTML_HEADING_LABEL_TAGS = new Set([
+  "section",
+  "article",
+  "aside",
+  "nav",
+  "dialog",
+  "header",
+  "footer",
+  "main",
+]);
+
+const HTML_HEADING_TAGS = new Set(["h1", "h2", "h3", "h4"]);
+const MAX_HEADING_SCAN = 512;
+const MAX_HEADING_LABEL_CHARS = 48;
+
 const HTML_CONTAINER_TAGS = new Set([
   "div",
   "ul",
@@ -1833,11 +1848,36 @@ function formatHtmlTagLabel(
   if (roleVal) {
     return `<${displayTag} role="${roleVal}">`;
   }
+  const ariaLabelVal = normalizeInlineAttr(parsed.attrs.get("aria-label"), 40);
+  if (ariaLabelVal) {
+    return `<${displayTag} aria-label="${ariaLabelVal}">`;
+  }
   const slotVal = normalizeInlineAttr(parsed.vueSlot, 36);
   if (lowerTag === "template" && slotVal) {
     return `<template #${slotVal}>`;
   }
   return `<${displayTag}>`;
+}
+
+function cleanHtmlHeadingText(rawInner: string): string {
+  const withoutComments = rawInner.replace(/<!--[\s\S]*?-->/g, " ");
+  const withoutTags = withoutComments.replace(/<[^>]*>/g, " ");
+  const decoded = withoutTags
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "'")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&middot;/gi, "·")
+    .replace(/&mdash;/gi, "—")
+    .replace(/&ndash;/gi, "–")
+    .replace(/"/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!decoded || !/[A-Za-z0-9\u4e00-\u9fff]/.test(decoded)) return "";
+  if (decoded.length <= MAX_HEADING_LABEL_CHARS) return decoded;
+  return `${sliceSafeChars(decoded, MAX_HEADING_LABEL_CHARS - 3).trimEnd()}...`;
 }
 
 function isJsScriptType(typeAttr: string | undefined): boolean {
@@ -1921,17 +1961,21 @@ function extractTemplateSymbols(
     startLine: number;
     emitted: boolean;
     symbol?: SymbolEntry;
+    needsHeadingLabel?: boolean;
   }
 
   const symbols: SymbolEntry[] = [];
   const stack: OpenFrame[] = [];
+  const emittedStack: OpenFrame[] = [];
   const stackTagCounts = new Map<string, number>();
   const pushFrame = (frame: OpenFrame) => {
     stack.push(frame);
+    if (frame.emitted) emittedStack.push(frame);
     stackTagCounts.set(frame.lowerTag, (stackTagCounts.get(frame.lowerTag) ?? 0) + 1);
   };
   const popFrame = (): OpenFrame => {
     const frame = stack.pop()!;
+    if (frame.emitted) emittedStack.pop();
     const prev = stackTagCounts.get(frame.lowerTag) ?? 0;
     if (prev <= 1) stackTagCounts.delete(frame.lowerTag);
     else stackTagCounts.set(frame.lowerTag, prev - 1);
@@ -1946,6 +1990,7 @@ function extractTemplateSymbols(
   let noCloseBodyBrace = false;
   let noCloseMustache = false;
   const noCloseRawSkip = new Set<string>();
+  let nextCloseTagPos = text.indexOf("</");
   let nextRightBrace = text.indexOf("}");
   let nextCloseMustache = mode === "vue" ? text.indexOf("}}") : -1;
 
@@ -2405,6 +2450,29 @@ function extractTemplateSymbols(
       continue;
     }
 
+    if (!selfClosing && nextCloseTagPos >= 0 && HTML_HEADING_TAGS.has(lowerTag)) {
+      const enclosingEmitted = emittedStack[emittedStack.length - 1];
+      if (enclosingEmitted?.needsHeadingLabel && enclosingEmitted.symbol) {
+        if (nextCloseTagPos < gtPos + 1) {
+          nextCloseTagPos = text.indexOf("</", gtPos + 1);
+        }
+        if (nextCloseTagPos >= 0 && nextCloseTagPos < gtPos + 1 + MAX_HEADING_SCAN) {
+          const scanEnd = Math.min(len, gtPos + 1 + MAX_HEADING_SCAN);
+          const windowText = text.slice(gtPos + 1, scanEnd);
+          const closeMatch = new RegExp(`</${lowerTag}\\s*>`, "i").exec(windowText);
+          if (closeMatch) {
+            const headingText = cleanHtmlHeadingText(
+              windowText.slice(0, closeMatch.index),
+            );
+            if (headingText) {
+              enclosingEmitted.symbol.name = `<${enclosingEmitted.lowerTag} "${headingText}">`;
+              enclosingEmitted.needsHeadingLabel = false;
+            }
+          }
+        }
+      }
+    }
+
     const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
     const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
     const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
@@ -2412,13 +2480,15 @@ function extractTemplateSymbols(
 
     let shouldEmit = false;
     let emittedSymbol: SymbolEntry | undefined;
+    let needsHeadingLabel = false;
 
     if (isComponent || isSemantic || isContainer) {
       const parsed = parseHtmlAttrs(rawAttrSlice);
       const hasIdentityAttr =
         Boolean(parsed.attrs.get("id")?.trim()) ||
         Boolean(parsed.attrs.get("data-testid")?.trim()) ||
-        Boolean(parsed.attrs.get("role")?.trim());
+        Boolean(parsed.attrs.get("role")?.trim()) ||
+        Boolean(parsed.attrs.get("aria-label")?.trim());
       // Skip nested Vue control-flow `<template v-if>` / `<template v-for>` wrappers
       // while keeping root `<template>`, named slots (`#header`), and identified templates.
       const keepTemplate =
@@ -2446,6 +2516,10 @@ function extractTemplateSymbols(
           endLine: openEndLine,
           depth: Math.min(MAX_HTML_DEPTH, emittedCount),
         };
+        needsHeadingLabel =
+          !selfClosing &&
+          HTML_HEADING_LABEL_TAGS.has(lowerTag) &&
+          !hasIdentityAttr;
         symbols.push(emittedSymbol);
       }
     }
@@ -2456,6 +2530,7 @@ function extractTemplateSymbols(
         startLine,
         emitted: shouldEmit,
         symbol: emittedSymbol,
+        needsHeadingLabel,
       });
       if (shouldEmit) emittedCount++;
     }
@@ -2482,6 +2557,289 @@ function extractHtmlSymbols(lines: string[]): SymbolEntry[] {
 function extractSfcSymbols(lines: string[], mode: "vue" | "svelte"): SymbolEntry[] {
   const symbols = extractTemplateSymbols(lines, mode);
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
+}
+
+function unquoteDiffPath(raw: string, stripGitPrefix: boolean): string {
+  // Strip optional unified diff timestamp suffix separated by tab (`--- a/foo\t2026-...`)
+  const tabIdx = raw.indexOf("\t");
+  let s = (tabIdx >= 0 ? raw.slice(0, tabIdx) : raw).trim();
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    s = s
+      .slice(1, -1)
+      .replace(/\\(["\\tnr])/g, (_m, ch: string) => {
+        if (ch === "t") return "\t";
+        if (ch === "n") return "\n";
+        if (ch === "r") return "\r";
+        return ch;
+      });
+  }
+  if (stripGitPrefix && s !== "/dev/null" && (s.startsWith("a/") || s.startsWith("b/"))) {
+    s = s.slice(2);
+  }
+  return s;
+}
+
+function parseGitDiffHeaderPaths(line: string): { oldPath: string; newPath: string } | null {
+  if (!line.startsWith("diff --git ")) return null;
+  const rest = line.slice("diff --git ".length).trim();
+  const quoted = /^"((?:[^"\\]|\\.)+)"\s+"((?:[^"\\]|\\.)+)"$/.exec(rest);
+  if (quoted) {
+    return {
+      oldPath: unquoteDiffPath(`"${quoted[1]!}"`, true),
+      newPath: unquoteDiffPath(`"${quoted[2]!}"`, true),
+    };
+  }
+  // Exact symmetric check handles unquoted paths containing spaces (`a/my file.ts b/my file.ts`)
+  if (rest.startsWith("a/") && (rest.length - 1) % 2 === 0) {
+    const mid = (rest.length - 1) / 2;
+    if (rest[mid] === " " && rest.slice(mid + 1, mid + 3) === "b/") {
+      const left = rest.slice(2, mid);
+      const right = rest.slice(mid + 3);
+      if (left === right) {
+        return { oldPath: left, newPath: right };
+      }
+    }
+  }
+  const splitIdx = rest.lastIndexOf(" b/");
+  if (splitIdx > 0) {
+    return {
+      oldPath: unquoteDiffPath(rest.slice(0, splitIdx), true),
+      newPath: unquoteDiffPath(rest.slice(splitIdx + 1), true),
+    };
+  }
+  return null;
+}
+
+function extractDiffSymbols(rawLines: string[]): SymbolEntry[] {
+  if (rawLines.length === 0) return [];
+  const lines = rawLines[0]!.startsWith("\uFEFF")
+    ? [rawLines[0]!.slice(1), ...rawLines.slice(1)]
+    : rawLines;
+
+  const symbols: SymbolEntry[] = [];
+  const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+
+  interface DiffFileState {
+    startLine: number;
+    oldPath: string;
+    newPath: string;
+    isNew: boolean;
+    isDeleted: boolean;
+    isRenamed: boolean;
+    isBinary: boolean;
+    additions: number;
+    deletions: number;
+    inMeta: boolean;
+    sym: SymbolEntry;
+  }
+
+  interface DiffHunkState {
+    sym: SymbolEntry;
+    oldRem: number;
+    newRem: number;
+  }
+
+  let currentFile: DiffFileState | null = null;
+  let currentHunk: DiffHunkState | null = null;
+
+  const closeHunk = (endLine: number): void => {
+    if (!currentHunk) return;
+    currentHunk.sym.endLine = Math.max(currentHunk.sym.startLine, endLine);
+    currentHunk = null;
+  };
+
+  const closeFile = (endLine: number): void => {
+    if (!currentFile) return;
+    closeHunk(endLine);
+    currentFile.sym.endLine = Math.max(currentFile.startLine, endLine);
+
+    const displayPath = currentFile.isDeleted
+      ? currentFile.oldPath || currentFile.newPath || "(deleted)"
+      : currentFile.isRenamed &&
+          currentFile.oldPath &&
+          currentFile.newPath &&
+          currentFile.oldPath !== currentFile.newPath
+        ? `${currentFile.oldPath} -> ${currentFile.newPath}`
+        : currentFile.newPath || currentFile.oldPath || "(unknown)";
+
+    const tags: string[] = [];
+    if (currentFile.isBinary) {
+      tags.push("[binary]");
+    } else {
+      if (currentFile.isNew) tags.push("[new]");
+      else if (currentFile.isDeleted) tags.push("[deleted]");
+      else if (currentFile.isRenamed) tags.push("[renamed]");
+      if (currentFile.additions > 0 || currentFile.deletions > 0) {
+        tags.push(`(+${currentFile.additions}/-${currentFile.deletions})`);
+      }
+    }
+
+    const label = tags.length > 0 ? `${displayPath} ${tags.join(" ")}` : displayPath;
+    currentFile.sym.name = sliceSafeChars(label, 140);
+    currentFile = null;
+  };
+
+  const createFileState = (
+    startLine: number,
+    oldPath: string,
+    newPath: string,
+    inMeta: boolean,
+  ): DiffFileState => {
+    const sym: SymbolEntry = {
+      kind: "file",
+      name: newPath || oldPath,
+      startLine,
+      endLine: startLine,
+      depth: 0,
+    };
+    symbols.push(sym);
+    return {
+      startLine,
+      oldPath,
+      newPath,
+      isNew: false,
+      isDeleted: false,
+      isRenamed: false,
+      isBinary: false,
+      additions: 0,
+      deletions: 0,
+      inMeta,
+      sym,
+    };
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const ln = i + 1;
+
+    // `diff --git ` cannot appear as a hunk body line (valid hunk lines start with ' ', '+', '-', '\\', or empty)
+    if (line.startsWith("diff --git ")) {
+      const parsed = parseGitDiffHeaderPaths(line);
+      if (parsed) {
+        closeFile(ln - 1);
+        currentFile = createFileState(ln, parsed.oldPath, parsed.newPath, true);
+        continue;
+      }
+    }
+
+    const inActiveHunk =
+      currentHunk !== null && (currentHunk.oldRem > 0 || currentHunk.newRem > 0);
+    if (inActiveHunk && currentHunk) {
+      if (line.startsWith("+")) {
+        currentHunk.newRem = Math.max(0, currentHunk.newRem - 1);
+        if (currentFile) currentFile.additions += 1;
+        continue;
+      }
+      if (line.startsWith("-")) {
+        currentHunk.oldRem = Math.max(0, currentHunk.oldRem - 1);
+        if (currentFile) currentFile.deletions += 1;
+        continue;
+      }
+      if (line.startsWith(" ") || line === "") {
+        currentHunk.oldRem = Math.max(0, currentHunk.oldRem - 1);
+        currentHunk.newRem = Math.max(0, currentHunk.newRem - 1);
+        continue;
+      }
+      if (line.startsWith("\\")) {
+        continue;
+      }
+      // Unexpected non-hunk line terminates the active hunk early
+      closeHunk(ln - 1);
+    }
+
+    if (currentFile) {
+      const hunkMatch = HUNK_RE.exec(line);
+      if (hunkMatch) {
+        closeHunk(ln - 1);
+        currentFile.inMeta = false;
+        const oldCount = hunkMatch[2] !== undefined ? Number(hunkMatch[2]) : 1;
+        const newCount = hunkMatch[4] !== undefined ? Number(hunkMatch[4]) : 1;
+        const closeAt = line.indexOf("@@", 2);
+        const rangeHeader = closeAt > 0 ? line.slice(0, closeAt + 2) : line;
+        const ctx = hunkMatch[5]!.trim();
+        const hunkName = ctx ? `${rangeHeader} ${sliceSafeChars(ctx, 64)}` : rangeHeader;
+        const sym: SymbolEntry = {
+          kind: "hunk",
+          name: hunkName,
+          startLine: ln,
+          endLine: ln,
+          depth: 1,
+        };
+        symbols.push(sym);
+        currentHunk = { sym, oldRem: oldCount, newRem: newCount };
+        continue;
+      }
+
+      if (currentFile.inMeta) {
+        if (line.startsWith("new file mode ")) {
+          currentFile.isNew = true;
+          continue;
+        }
+        if (line.startsWith("deleted file mode ")) {
+          currentFile.isDeleted = true;
+          continue;
+        }
+        if (line.startsWith("rename from ")) {
+          currentFile.isRenamed = true;
+          currentFile.oldPath = unquoteDiffPath(line.slice("rename from ".length), false);
+          continue;
+        }
+        if (line.startsWith("rename to ")) {
+          currentFile.isRenamed = true;
+          currentFile.newPath = unquoteDiffPath(line.slice("rename to ".length), false);
+          continue;
+        }
+        if (line.startsWith("Binary files ") || line === "GIT binary patch") {
+          currentFile.isBinary = true;
+          continue;
+        }
+        if (line.startsWith("--- ")) {
+          const p = unquoteDiffPath(line.slice(4), true);
+          if (p === "/dev/null") currentFile.isNew = true;
+          else if (p) currentFile.oldPath = p;
+          continue;
+        }
+        if (line.startsWith("+++ ")) {
+          const p = unquoteDiffPath(line.slice(4), true);
+          if (p === "/dev/null") currentFile.isDeleted = true;
+          else if (p) currentFile.newPath = p;
+          continue;
+        }
+      }
+
+      // Standard `git format-patch` email footer (`-- `) closes the final file cleanly
+      if (line === "-- ") {
+        closeFile(ln - 1);
+        continue;
+      }
+    }
+
+    // Plain unified diff (`diff -u` / non-git patch) pair outside metadata & active hunks
+    if (
+      !currentFile?.inMeta &&
+      line.startsWith("--- ") &&
+      i + 1 < lines.length &&
+      lines[i + 1]!.startsWith("+++ ")
+    ) {
+      closeFile(ln - 1);
+      const oldRaw = unquoteDiffPath(line.slice(4), true);
+      const newRaw = unquoteDiffPath(lines[i + 1]!.slice(4), true);
+      const state = createFileState(
+        ln,
+        oldRaw === "/dev/null" ? "" : oldRaw,
+        newRaw === "/dev/null" ? "" : newRaw,
+        false,
+      );
+      if (oldRaw === "/dev/null") state.isNew = true;
+      if (newRaw === "/dev/null") state.isDeleted = true;
+      currentFile = state;
+      i += 1;
+      continue;
+    }
+  }
+
+  closeFile(lines.length);
+  return symbols;
 }
 
 function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry[] {
@@ -2541,6 +2899,9 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".patch":
+    case ".diff":
+      return extractDiffSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }

@@ -276,6 +276,14 @@ export async function runChecks(
     return `${sliceUtf8Bytes(sliceSafeChars(cmd, charCap), byteCap)}...`;
   };
 
+  const MAX_ECHO_CMD_CHARS = 220;
+  const MAX_ECHO_CMD_BYTES = 220;
+
+  const formatBoundedEchoCommand = (cmd: string): string => {
+    const singleLine = cmd.replace(/[\r\n\t]+/g, " ").trim();
+    return capCmdDisplay(singleLine, MAX_ECHO_CMD_CHARS, MAX_ECHO_CMD_BYTES);
+  };
+
   const formatNotRunBlock = (spec: NormalizedCommand): string => {
     const baseHeader = `## [NOT RUN] ${spec.name}`;
     const notRunBudgetTotal =
@@ -292,7 +300,8 @@ export async function runChecks(
         : `${sliceSafeChars(baseHeader, perNotRunShare - 3)}...`;
     }
     const perNotRunCap = Math.min(180, cmdRoom);
-    const shortCmd = capCmdDisplay(spec.command, perNotRunCap, perNotRunCap);
+    const singleLine = spec.command.replace(/[\r\n\t]+/g, " ").trim();
+    const shortCmd = capCmdDisplay(singleLine, perNotRunCap, perNotRunCap);
     return `${baseHeader}\n$ ${shortCmd}`;
   };
 
@@ -349,7 +358,8 @@ export async function runChecks(
             ? "PASS"
             : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
-      const fullPrefix = `${headerLine}\n$ ${spec.command}\n`;
+      const echoCmd = formatBoundedEchoCommand(spec.command);
+      const fullPrefix = `${headerLine}\n$ ${echoCmd}\n`;
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr),
@@ -363,6 +373,7 @@ export async function runChecks(
       return {
         notRun: false as const,
         spec,
+        echoCmd,
         headerLine,
         fullPrefix,
         rawBody,
@@ -390,7 +401,7 @@ export async function runChecks(
       }
       const prefix = formatCmdHeaderPrefix(
         entry.headerLine,
-        entry.spec.command,
+        entry.echoCmd,
         charShare,
         byteShare,
       );
@@ -422,6 +433,7 @@ export async function runChecks(
     interface FailEntry {
       index: number;
       spec: NormalizedCommand;
+      echoCmd: string;
       badgeLine: string;
       header: string;
       prepared: PreparedCompactCommandOutput;
@@ -469,7 +481,8 @@ export async function runChecks(
           ? "TIMEOUT"
           : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
-      const header = `${badgeLine}\n$ ${spec.command}\n`;
+      const echoCmd = formatBoundedEchoCommand(spec.command);
+      const header = `${badgeLine}\n$ ${echoCmd}\n`;
 
       // Prepare & fold ONCE per failing command to measure true folded size
       const prepared = prepareCompactCommandOutput({
@@ -491,6 +504,7 @@ export async function runChecks(
       failEntries.push({
         index: i,
         spec,
+        echoCmd,
         badgeLine,
         header,
         prepared,
@@ -631,7 +645,7 @@ export async function runChecks(
 
         const effectiveHeader = formatCmdHeaderPrefix(
           entry.badgeLine,
-          entry.spec.command,
+          entry.echoCmd,
           blockCharBudget,
           blockByteBudget,
         );

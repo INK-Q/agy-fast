@@ -52,6 +52,32 @@ export interface BatchSearchInput {
 
 export interface BatchSearchRuntimeOptions {
   forceNodeFallback?: boolean;
+  /** Internal override for explicit single-file size limit (default 20 MiB). */
+  explicitFileMaxBytes?: number;
+}
+
+const DIR_SCAN_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const EXPLICIT_FILE_MAX_BYTES = 20 * 1024 * 1024;
+
+function formatByteLimitLabel(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    const mib = bytes / (1024 * 1024);
+    return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
+  }
+  if (bytes >= 1024) {
+    const kib = bytes / 1024;
+    return `${Number.isInteger(kib) ? kib : kib.toFixed(1)} KiB`;
+  }
+  return `${bytes} B`;
+}
+
+function formatSkippedOversizeReason(sizeBytes: number, limitBytes: number): string {
+  const limitLabel = formatByteLimitLabel(limitBytes);
+  let sizeLabel = formatByteLimitLabel(sizeBytes);
+  if (sizeLabel === limitLabel) {
+    sizeLabel = `${sizeBytes} B`;
+  }
+  return `target file exceeds ${limitLabel} search limit (${sizeLabel})`;
 }
 
 const READONLY_GIT_SUBCOMMANDS = new Set([
@@ -527,11 +553,19 @@ interface FileMatches {
   count?: number;
 }
 
+interface TextSearchResult {
+  files: FileMatches[];
+  totalMatches: number;
+  truncated: boolean;
+  skippedReason?: string;
+}
+
 async function runTextOrRegexWithRg(
   query: SearchQuery,
   searchRoot: string,
   baseCwd: string,
-): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
+  explicitFileMaxBytes = EXPLICIT_FILE_MAX_BYTES,
+): Promise<TextSearchResult> {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
@@ -541,9 +575,6 @@ async function runTextOrRegexWithRg(
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
-      return { files: [], totalMatches: 0, truncated: false };
-    }
-    if (fileStat.size > 2 * 1024 * 1024) {
       return { files: [], totalMatches: 0, truncated: false };
     }
     if (query.glob) {
@@ -556,12 +587,25 @@ async function runTextOrRegexWithRg(
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
+    if (fileStat.size > explicitFileMaxBytes) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: false,
+        skippedReason: formatSkippedOversizeReason(fileStat.size, explicitFileMaxBytes),
+      };
+    }
     const fh = await fs.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
       if (isLikelyBinary(head.subarray(0, bytesRead))) {
-        return { files: [], totalMatches: 0, truncated: false };
+        return {
+          files: [],
+          totalMatches: 0,
+          truncated: false,
+          skippedReason: "target file appears to be binary",
+        };
       }
     } finally {
       await fh.close();
@@ -569,7 +613,8 @@ async function runTextOrRegexWithRg(
   }
   const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
 
-  const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  const maxFileSizeArg = isFileTarget ? String(explicitFileMaxBytes) : "2M";
+  const args = ["--no-config", "--no-messages", "--max-filesize", maxFileSizeArg, "--crlf"];
   if (query.multiline) args.push("--multiline", "--multiline-dotall");
   if (typeGlobs) {
     for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
@@ -682,10 +727,20 @@ async function runTextOrRegexWithRg(
       files.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
     files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    const truncatedSummary = files.length > maxResults || cutShort(res);
+    if (files.length === 0 && cutShort(res) && res.stdout.length > 0) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: true,
+        skippedReason:
+          "match output exceeded 2 MiB capture buffer or timed out before a complete match could be parsed",
+      };
+    }
     return {
       files: files.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files.length > maxResults || cutShort(res),
+      truncated: truncatedSummary,
     };
   }
 
@@ -773,6 +828,7 @@ async function runTextOrRegexWithRg(
   if (currentChunk.length > 0) rgChunks.push(currentChunk);
 
   const byFile = new Map<string, Map<number, SearchLine>>();
+  let pass2CutShortWithOutput = false;
   for (const chunk of rgChunks) {
     const res = await runRg(
       [
@@ -786,7 +842,10 @@ async function runTextOrRegexWithRg(
       ],
       { allowPartialError: !isFileTarget },
     );
-    if (cutShort(res)) truncated = true;
+    if (cutShort(res)) {
+      truncated = true;
+      if (res.stdout.length > 0) pass2CutShortWithOutput = true;
+    }
 
     for (const rawLine of res.stdout.split("\n")) {
       if (!rawLine.trim()) continue;
@@ -921,6 +980,16 @@ async function runTextOrRegexWithRg(
     totalMatches += kept;
   }
 
+  if (files.length === 0 && pass2CutShortWithOutput) {
+    return {
+      files,
+      totalMatches,
+      truncated,
+      skippedReason:
+        "match output exceeded 2 MiB capture buffer or timed out before a complete match could be parsed",
+    };
+  }
+
   return { files, totalMatches, truncated };
 }
 
@@ -984,7 +1053,8 @@ async function runTextOrRegexWithNode(
   query: SearchQuery,
   searchRoot: string,
   baseCwd: string,
-): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
+  explicitFileMaxBytes = EXPLICIT_FILE_MAX_BYTES,
+): Promise<TextSearchResult> {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
   const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
@@ -1034,14 +1104,39 @@ async function runTextOrRegexWithNode(
   };
 
   const stat = await fs.stat(searchRoot);
-  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
+  const isFileTarget = stat.isFile();
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
   let targetFiles: Array<{ abs: string; rel: string }>;
-  if (stat.isFile()) {
+  if (isFileTarget) {
     const relPosix =
       toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
-    targetFiles = globMatchesFile(relPosix)
-      ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }]
-      : [];
+    if (!globMatchesFile(relPosix)) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (stat.size > explicitFileMaxBytes) {
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated: false,
+        skippedReason: formatSkippedOversizeReason(stat.size, explicitFileMaxBytes),
+      };
+    }
+    const fh = await fs.open(searchRoot, "r");
+    try {
+      const head = Buffer.alloc(Math.min(stat.size, 8192));
+      const { bytesRead } = await fh.read(head, 0, head.length, 0);
+      if (isLikelyBinary(head.subarray(0, bytesRead))) {
+        return {
+          files: [],
+          totalMatches: 0,
+          truncated: false,
+          skippedReason: "target file appears to be binary",
+        };
+      }
+    } finally {
+      await fh.close();
+    }
+    targetFiles = [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }];
   } else {
     const includeHidden = Boolean(
       rawGlob && !globNegated && patternTargetsHidden(rawGlob),
@@ -1162,8 +1257,11 @@ async function runTextOrRegexWithNode(
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }): Promise<{ relFile: string; lines: string[]; matchedLines: MatchedLineInfo[]; count: number; fileTruncated: boolean } | null> => {
         try {
+          const maxFileBytes = isFileTarget
+            ? explicitFileMaxBytes
+            : DIR_SCAN_MAX_FILE_BYTES;
           const st = await fs.stat(absFile);
-          if (st.size > 2 * 1024 * 1024) return null;
+          if (st.size > maxFileBytes) return null;
           const buf = await fs.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
@@ -2217,6 +2315,7 @@ async function executeSingleQuery(
   index: number,
   baseCwd: string,
   useRg: boolean,
+  explicitFileMaxBytes: number,
 ): Promise<ExecutedQuerySection> {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
@@ -2257,20 +2356,23 @@ async function executeSingleQuery(
     }
 
     if (query.type === "text" || query.type === "regex") {
-      let res;
+      let res: TextSearchResult;
       if (useRg) {
         try {
-          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
+          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd, explicitFileMaxBytes);
         } catch (err) {
           // Only fallback on spawn error; surface regex errors directly
           if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
-            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, explicitFileMaxBytes);
           } else {
             throw err;
           }
         }
       } else {
-        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, explicitFileMaxBytes);
+      }
+      if (res.skippedReason) {
+        return { header, text: `${header}\n(skipped: ${res.skippedReason})` };
       }
       if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
         const body = res.files.map(({ file, count }) => query.outputMode === "count"
@@ -2388,11 +2490,17 @@ export async function runBatchSearch(
   const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex",
   );
+  const explicitFileMaxBytes =
+    options.explicitFileMaxBytes !== undefined &&
+    Number.isFinite(options.explicitFileMaxBytes) &&
+    options.explicitFileMaxBytes >= 1
+      ? Math.trunc(options.explicitFileMaxBytes)
+      : EXPLICIT_FILE_MAX_BYTES;
   const useRg =
     needsTextSearch && !options.forceNodeFallback && (await isRipgrepAvailable());
 
   const executed = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, explicitFileMaxBytes)),
   );
 
   const separator = "\n\n";

@@ -1271,4 +1271,144 @@ describe("read_slices", () => {
     assert.match(encRes.text, /be\.rc\nERROR: UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 BE\]/);
     assert.match(encRes.text, /u32\.txt\nERROR: Binary file cannot be read as text:/);
   });
+
+  it("extracts unified diff (.patch/.diff) file spans, stats, renames, binary markers, and hunk contexts", async () => {
+    const gitPatch = [
+      "From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001", // 1 (email preamble ignored)
+      "Subject: [PATCH] demo change", // 2
+      "---", // 3 (stat separator ignored)
+      " src/app.ts | 5 +++--", // 4
+      "diff --git a/src/app.ts b/src/app.ts", // 5
+      "index 1111111..2222222 100644", // 6
+      "--- a/src/app.ts", // 7
+      "+++ b/src/app.ts", // 8
+      "@@ -10,4 +10,5 @@ export function boot() {", // 9
+      " const x = 1;", // 10
+      "--- removed yaml-like separator inside hunk must NOT split file", // 11
+      "+++ added marker inside hunk must NOT split file", // 12
+      "+const y = 2;", // 13
+      " return x;", // 14
+      "@@ -40,2 +41,3 @@ export function shutdown() {", // 15
+      " close();", // 16
+      "+flush();", // 17
+      " done();", // 18
+      "diff --git a/configs/new file.yaml b/configs/new file.yaml", // 19 (spaces in path)
+      "new file mode 100644", // 20
+      "--- /dev/null", // 21
+      "+++ b/configs/new file.yaml", // 22
+      "@@ -0,0 +1,2 @@", // 23
+      "+enabled: true", // 24
+      "+retries: 3", // 25
+      "diff --git a/docs/old.md b/docs/new.md", // 26
+      "similarity index 90%", // 27
+      "rename from docs/old.md", // 28
+      "rename to docs/new.md", // 29
+      "--- a/docs/old.md", // 30
+      "+++ b/docs/new.md", // 31
+      "@@ -1,2 +1,2 @@", // 32
+      "-# Old", // 33
+      "+# New", // 34
+      " body", // 35
+      "diff --git a/assets/logo.png b/assets/logo.png", // 36
+      "Binary files a/assets/logo.png and b/assets/logo.png differ", // 37
+      "-- ", // 38 (git format-patch signature closes final file)
+      "2.43.0", // 39
+    ].join("\n");
+
+    const gitSyms = extractSymbols("changes.patch", gitPatch);
+    assert.deepEqual(
+      gitSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "file:src/app.ts (+3/-1):5-18:d0",
+        "hunk:@@ -10,4 +10,5 @@ export function boot() {:9-14:d1",
+        "hunk:@@ -40,2 +41,3 @@ export function shutdown() {:15-18:d1",
+        "file:configs/new file.yaml [new] (+2/-0):19-25:d0",
+        "hunk:@@ -0,0 +1,2 @@:23-25:d1",
+        "file:docs/old.md -> docs/new.md [renamed] (+1/-1):26-35:d0",
+        "hunk:@@ -1,2 +1,2 @@:32-35:d1",
+        "file:assets/logo.png [binary]:36-37:d0",
+      ],
+    );
+
+    // Plain `diff -u` unified diff (without `diff --git`) with timestamps and deleted file
+    const plainDiff = [
+      "--- a/lib/alpha.py\t2026-11-24 10:00:00", // 1
+      "+++ b/lib/alpha.py\t2026-11-24 10:01:00", // 2
+      "@@ -1,2 +1,2 @@ def run():", // 3
+      "-return 1", // 4
+      "+return 2", // 5
+      " pass", // 6
+      "--- a/lib/obsolete.py\t2026-11-24 10:00:00", // 7
+      "+++ /dev/null\t1970-01-01 00:00:00", // 8
+      "@@ -1,1 +0,0 @@", // 9
+      "-old = True", // 10
+    ].join("\n");
+
+    const plainSyms = extractSymbols("fix.diff", plainDiff);
+    assert.deepEqual(
+      plainSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "file:lib/alpha.py (+1/-1):1-6:d0",
+        "hunk:@@ -1,2 +1,2 @@ def run()::3-6:d1",
+        "file:lib/obsolete.py [deleted] (+0/-1):7-10:d0",
+        "hunk:@@ -1,1 +0,0 @@:9-10:d1",
+      ],
+    );
+
+    // End-to-end quick_outline on a .patch file keeps all file entries cleanly under budget
+    const patchPath = path.join(tmpDir, "review.patch");
+    await fs.writeFile(patchPath, `${gitPatch}\n`, "utf8");
+    const outlineRes = await runQuickOutline({ cwd: tmpDir, paths: ["review.patch"] });
+    assert.equal(outlineRes.isError, false);
+    assert.match(outlineRes.text, /L5-L18 \[file\] src\/app\.ts \(\+3\/-1\)/);
+    assert.match(outlineRes.text, /L19-L25 \[file\] configs\/new file\.yaml \[new\] \(\+2\/-0\)/);
+    assert.match(outlineRes.text, /L26-L35 \[file\] docs\/old\.md -> docs\/new\.md \[renamed\]/);
+    assert.match(outlineRes.text, /L36-L37 \[file\] assets\/logo\.png \[binary\]/);
+  });
+
+  it("enriches unlabeled HTML semantic blocks with aria-label or first heading text without leaking across nesting", () => {
+    const deckHtml = [
+      "<!doctype html>", // 1
+      "<html>", // 2
+      "<body>", // 3
+      "  <main>", // 4 (outer main has no direct heading -> stays <main>)
+      '    <section class="slide">', // 5
+      '      <div class="header"><h2>Part I &amp; <code>Core</code> Architecture</h2></div>', // 6
+      "      <h3>Secondary subtitle ignored</h3>", // 7
+      "    </section>", // 8
+      '    <section aria-label="Pricing Breakdown">', // 9 (explicit aria-label preserved over inner h2)
+      "      <h2>Should not overwrite aria-label</h2>", // 10
+      "    </section>", // 11
+      '    <section id="metrics">', // 12 (explicit id preserved over inner h2)
+      "      <h2>Metrics</h2>", // 13
+      "    </section>", // 14
+      "    <article>", // 15
+      "      <h2></h2>", // 16 (empty heading skipped)
+      "      <h3>\n        Benchmark Results &mdash; Phase 2\n      </h3>", // 17-19
+      '      <div aria-label="Latency Chart"></div>', // 20
+      "    </article>", // 21
+      "  </main>", // 22
+      "</body>", // 23
+      "</html>", // 24
+    ].join("\n");
+
+    const syms = extractSymbols("slides.html", deckHtml);
+    assert.deepEqual(
+      syms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<body>:3-23:d0",
+        "<main>:4-22:d1",
+        '<section "Part I & Core Architecture">:5-8:d2',
+        '<section aria-label="Pricing Breakdown">:9-11:d2',
+        "<section #metrics>:12-14:d2",
+        '<article "Benchmark Results — Phase 2">:15-21:d2',
+        '<div aria-label="Latency Chart">:20-20:d2',
+      ],
+    );
+
+    // Linear-time guard for unclosed heading floods
+    const t0 = performance.now();
+    extractSymbols("unclosed-headings.html", "<section>" + "<h2>".repeat(50_000) + "</section>");
+    assert.ok(performance.now() - t0 < 1000);
+  });
 });
