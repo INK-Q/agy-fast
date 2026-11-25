@@ -2,7 +2,7 @@
 
 
 // src/mcp-server.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import os4 from "node:os";
 import path7 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
@@ -649,6 +649,7 @@ ${serialized}`);
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -1008,21 +1009,27 @@ function stripQuotedSpans(command, stripDoubleQuotes) {
   }
   return out;
 }
+function hasEmbeddedNewline(command) {
+  return /[\r\n]/.test(command.trim());
+}
 function needsPowerShellOnWindows(command) {
-  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+  const trimmed = command.trim();
+  if (!trimmed || EXPLICIT_POWERSHELL_INVOCATION_RE.test(trimmed)) {
     return false;
   }
-  const withoutSingle = stripQuotedSpans(command, false);
+  const withoutSingle = stripQuotedSpans(trimmed, false);
   if (WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE.test(withoutSingle)) {
     return true;
   }
-  const unquoted = stripQuotedSpans(command, true);
+  const unquoted = stripQuotedSpans(trimmed, true);
   return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
 }
-function formatPowerShellCommand(command) {
-  const trimmed = command.trim();
+function formatSinglePowerShellLine(line) {
+  const leadMatch = /^([ \t]*)/.exec(line);
+  const indent = leadMatch?.[1] ?? "";
+  const trimmed = line.slice(indent.length);
   if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
-    return command;
+    return line;
   }
   const quote = trimmed[0];
   let idx = 1;
@@ -1037,21 +1044,636 @@ function formatPowerShellCommand(command) {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
+      if (!/^[ \t]+/.test(afterQuote)) {
+        return line;
+      }
       const rest = afterQuote.replace(/^[ \t]+/, "");
-      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
-        return command;
+      if (rest && !/^[\r\n]/.test(rest) && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+        return `${indent}& ${trimmed}`;
       }
-      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
-        return `& ${trimmed}`;
-      }
-      return command;
+      return line;
     }
     idx++;
   }
-  return command;
+  return line;
+}
+function advancePowerShellQuoteState(line, state) {
+  if (state.hereQuote) {
+    const closeMarker = state.hereQuote === '"' ? '"@' : "'@";
+    if (line.startsWith(closeMarker) && line.slice(2).trim() === "") {
+      state.hereQuote = null;
+    }
+    return;
+  }
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+    if (state.quote === "'") {
+      if (ch === "'") {
+        if (next === "'") i++;
+        else state.quote = null;
+      }
+      continue;
+    }
+    if (state.quote === '"') {
+      if (ch === "`" && next !== void 0) {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') i++;
+        else state.quote = null;
+      }
+      continue;
+    }
+    if (ch === "#") break;
+    if (ch === "@" && (next === '"' || next === "'") && line.slice(i + 2).trim() === "") {
+      state.hereQuote = next;
+      return;
+    }
+    if (ch === "'" || ch === '"') {
+      state.quote = ch;
+    }
+  }
+}
+function formatPowerShellCommand(command) {
+  if (!/[\r\n]/.test(command)) {
+    const trimmed = command.trim();
+    if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
+      return command;
+    }
+    const formatted = formatSinglePowerShellLine(trimmed);
+    return formatted === trimmed ? command : formatted;
+  }
+  const parts = command.split(/(\r\n|\n|\r)/);
+  const state = {
+    quote: null,
+    hereQuote: null
+  };
+  let changed = false;
+  const outParts = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const line = parts[i] ?? "";
+    const sep = parts[i + 1] ?? "";
+    const formatted = state.quote === null && state.hereQuote === null ? formatSinglePowerShellLine(line) : line;
+    if (formatted !== line) changed = true;
+    outParts.push(formatted, sep);
+    advancePowerShellQuoteState(line, state);
+  }
+  return changed ? outParts.join("") : command;
+}
+var PS_FAIL_FAST_STMT_CHECK = "$__agyOk = $?; $__agyCode = $LASTEXITCODE; if ($__agyCode -and $__agyCode -ne 0) { exit $__agyCode }; if (-not $__agyOk -and $null -eq $__agyCode) { exit 1 }; $global:LASTEXITCODE = $null";
+var PS_LINE_CONTINUATION_TAIL_RE = /(?:`|\||,|&&|\|\||[{(=]|(?<!\+)\+)\s*$/;
+var PS_NEXT_BLOCK_CONT_RE = /^\s*(?:[{}|]|else\b|elseif\b|catch\b|finally\b)/i;
+function wrapMultilinePowerShellFailFast(script) {
+  const lines = script.split(/\r?\n/);
+  const state = {
+    quote: null,
+    hereQuote: null
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  const out = ["$global:LASTEXITCODE = $null"];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const wasInMultilineToken = state.quote !== null || state.hereQuote !== null;
+    out.push(line);
+    if (state.hereQuote) {
+      advancePowerShellQuoteState(line, state);
+      continue;
+    }
+    let codePart = "";
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j];
+      const next = line[j + 1];
+      if (state.quote === "'") {
+        if (ch === "'") {
+          if (next === "'") j++;
+          else state.quote = null;
+        }
+        continue;
+      }
+      if (state.quote === '"') {
+        if (ch === "`" && next !== void 0) {
+          j++;
+          continue;
+        }
+        if (ch === '"') {
+          if (next === '"') j++;
+          else state.quote = null;
+        }
+        continue;
+      }
+      if (ch === "#") break;
+      if (ch === "@" && (next === '"' || next === "'") && line.slice(j + 2).trim() === "") {
+        state.hereQuote = next;
+        break;
+      }
+      if (ch === "'" || ch === '"') {
+        state.quote = ch;
+        codePart += " __STR__ ";
+        continue;
+      }
+      if (ch === "{") braceDepth++;
+      else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+      else if (ch === "(") parenDepth++;
+      else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+      else if (ch === "[") bracketDepth++;
+      else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+      codePart += ch;
+    }
+    const trimmedCode = codePart.trim();
+    if (!trimmedCode && !wasInMultilineToken) continue;
+    if (state.quote !== null || state.hereQuote !== null || braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+      continue;
+    }
+    if (PS_LINE_CONTINUATION_TAIL_RE.test(trimmedCode)) continue;
+    let nextNonEmpty = "";
+    for (let k = i + 1; k < lines.length; k++) {
+      const t = lines[k].trim();
+      if (t && !t.startsWith("#")) {
+        nextNonEmpty = t;
+        break;
+      }
+    }
+    if (nextNonEmpty && PS_NEXT_BLOCK_CONT_RE.test(nextNonEmpty)) continue;
+    out.push(PS_FAIL_FAST_STMT_CHECK);
+  }
+  return out.join("\n");
 }
 function buildPowerShellUtf8Command(command) {
+  const trimmed = command.trim();
+  if (hasEmbeddedNewline(trimmed)) {
+    const formatted = formatPowerShellCommand(trimmed);
+    return `${PS_UTF8_PREFIX}
+${wrapMultilinePowerShellFailFast(formatted)}`;
+  }
   return `${PS_UTF8_PREFIX} ${formatPowerShellCommand(command)}`;
+}
+function encodePowerShellCommand(script) {
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+var MAX_PS_ENCODED_COMMAND_CHARS = 28e3;
+var EXPLICIT_PS_VALUE_FLAGS = /* @__PURE__ */ new Set(["-executionpolicy", "-ep"]);
+function parseExplicitMultilinePowerShell(command) {
+  const trimmed = command.trim();
+  if (!hasEmbeddedNewline(trimmed)) return null;
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return null;
+  const rawBin = binMatch[0].trim();
+  const bin = rawBin.startsWith('"') && rawBin.endsWith('"') || rawBin.startsWith("'") && rawBin.endsWith("'") ? rawBin.slice(1, -1) : rawBin;
+  let rest = trimmed.slice(binMatch[0].length);
+  const flags = [];
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return null;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return null;
+    const tok = tokMatch[1];
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return null;
+      sawCommandFlag = true;
+      break;
+    }
+    if (WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      flags.push(tok);
+      continue;
+    }
+    if (EXPLICIT_PS_VALUE_FLAGS.has(lower)) {
+      rest = rest.trimStart();
+      const valMatch = /^(\S+)/.exec(rest);
+      if (!valMatch) return null;
+      flags.push(tok, valMatch[1]);
+      rest = rest.slice(valMatch[1].length);
+      continue;
+    }
+    return null;
+  }
+  if (!sawCommandFlag) return null;
+  const payload = rest.trim();
+  if (!payload) return null;
+  let script = payload;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    let idx = 1;
+    let closedAt = -1;
+    while (idx < payload.length) {
+      if (quote === '"' && (payload[idx] === "`" || payload[idx] === "\\") && payload[idx + 1] === '"') {
+        idx += 2;
+        continue;
+      }
+      if (payload[idx] === quote) {
+        if (payload[idx + 1] === quote) {
+          idx += 2;
+          continue;
+        }
+        closedAt = idx;
+        break;
+      }
+      idx++;
+    }
+    if (closedAt !== payload.length - 1) return null;
+    script = payload.slice(1, -1);
+    if (quote === "'") {
+      script = script.replace(/''/g, "'");
+    } else {
+      script = script.replace(/\\"/g, '"');
+    }
+  }
+  return { bin, flags, script };
+}
+function hasNewlineInsideQuotes(command) {
+  let quote = null;
+  let atLineStart = true;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "\n" || ch === "\r") return true;
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\n" || ch === "\r") return true;
+      if (ch === "\\") {
+        let bs = 0;
+        while (i + bs < command.length && command[i + bs] === "\\") bs++;
+        if (command[i + bs] === '"') {
+          i += bs;
+          if (bs % 2 === 0) quote = null;
+          continue;
+        }
+        i += bs - 1;
+        continue;
+      }
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "\n" || ch === "\r") {
+      atLineStart = true;
+      continue;
+    }
+    if (atLineStart) {
+      if (ch === " " || ch === "	") continue;
+      atLineStart = false;
+      const rest = command.slice(i);
+      if (rest.startsWith("::") || /^@?rem(?:\s|$)/i.test(rest)) {
+        while (i < command.length && command[i] !== "\n" && command[i] !== "\r") {
+          i++;
+        }
+        i--;
+        continue;
+      }
+    }
+    if (ch === '"') {
+      quote = '"';
+      continue;
+    }
+    if (ch === "'") {
+      const prev = i > 0 ? command[i - 1] : "";
+      if ((i === 0 || /[\s=]/.test(prev)) && command.indexOf("'", i + 1) !== -1) {
+        quote = "'";
+      }
+    }
+  }
+  return false;
+}
+var WINDOWS_CMD_BUILTINS = /* @__PURE__ */ new Set([
+  "assoc",
+  "break",
+  "call",
+  "cd",
+  "chdir",
+  "cls",
+  "color",
+  "copy",
+  "date",
+  "del",
+  "dir",
+  "echo",
+  "endlocal",
+  "erase",
+  "exit",
+  "for",
+  "ftype",
+  "goto",
+  "if",
+  "md",
+  "mkdir",
+  "mklink",
+  "move",
+  "path",
+  "pause",
+  "popd",
+  "prompt",
+  "pushd",
+  "rd",
+  "rem",
+  "ren",
+  "rename",
+  "rmdir",
+  "set",
+  "setlocal",
+  "shift",
+  "start",
+  "time",
+  "title",
+  "type",
+  "ver",
+  "verify",
+  "vol"
+]);
+var DIRECT_FORBIDDEN_UNQUOTED_RE = /[|&;><()`$%]/;
+function parseDirectMultilineCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  const tokens = [];
+  let i = 0;
+  while (i < trimmed.length) {
+    while (i < trimmed.length && (trimmed[i] === " " || trimmed[i] === "	")) i++;
+    if (i >= trimmed.length) break;
+    if (trimmed[i] === "\r" || trimmed[i] === "\n") return null;
+    let tok = "";
+    let quote = null;
+    while (i < trimmed.length) {
+      const ch = trimmed[i];
+      if (quote === null) {
+        if (ch === " " || ch === "	") break;
+        if (ch === "\r" || ch === "\n") return null;
+        if (DIRECT_FORBIDDEN_UNQUOTED_RE.test(ch)) return null;
+        if (ch === '"' || ch === "'") {
+          quote = ch;
+          i++;
+          continue;
+        }
+        tok += ch;
+        i++;
+        continue;
+      }
+      if (quote === "'") {
+        if (ch === "'") {
+          quote = null;
+          i++;
+          continue;
+        }
+        tok += ch;
+        i++;
+        continue;
+      }
+      if (ch === "\\") {
+        let bs = 0;
+        while (i + bs < trimmed.length && trimmed[i + bs] === "\\") bs++;
+        if (trimmed[i + bs] === '"') {
+          tok += "\\".repeat(Math.floor(bs / 2));
+          if (bs % 2 === 1) {
+            tok += '"';
+          } else {
+            quote = null;
+          }
+          i += bs + 1;
+          continue;
+        }
+        tok += "\\".repeat(bs);
+        i += bs;
+        continue;
+      }
+      if (ch === '"') {
+        quote = null;
+        i++;
+        continue;
+      }
+      tok += ch;
+      i++;
+    }
+    if (quote !== null) return null;
+    tokens.push(tok);
+  }
+  if (tokens.length === 0) return null;
+  const bin = tokens[0];
+  if (!bin) return null;
+  if (/\.(?:cmd|bat)$/i.test(bin)) return null;
+  const base = path.win32.basename(bin).toLowerCase().replace(/\.exe$/, "");
+  if (WINDOWS_CMD_BUILTINS.has(base) || WINDOWS_BATCH_SHIMS.has(base)) return null;
+  return { bin, args: tokens.slice(1) };
+}
+var WINDOWS_BATCH_SHIMS = /* @__PURE__ */ new Set([
+  "npm",
+  "npx",
+  "pnpm",
+  "pnpx",
+  "yarn",
+  "yarnpkg",
+  "corepack",
+  "tsc",
+  "tsx",
+  "eslint",
+  "prettier",
+  "vitest",
+  "jest",
+  "biome",
+  "next",
+  "vite",
+  "astro",
+  "nuxt",
+  "ng",
+  "nx",
+  "turbo",
+  "playwright",
+  "cypress"
+]);
+function escapeBatchStrayPercents(line) {
+  let out = "";
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== "%") {
+      out += line[i];
+      continue;
+    }
+    if (line[i + 1] === "%") {
+      out += "%%";
+      i++;
+      continue;
+    }
+    const envMatch = /^%(?:[A-Za-z_][A-Za-z0-9_]*|(?:Common)?ProgramFiles\(x86\))%/i.exec(
+      line.slice(i)
+    );
+    if (envMatch) {
+      out += envMatch[0];
+      i += envMatch[0].length - 1;
+      continue;
+    }
+    out += "%%";
+  }
+  return out;
+}
+function prefixCallForWindowsBatchShims(line) {
+  let out = "";
+  let inQuotes = false;
+  let atStmtStart = true;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (!inQuotes && atStmtStart) {
+      if (ch === " " || ch === "	") {
+        out += ch;
+        continue;
+      }
+      let cursor = i;
+      let atPrefix = "";
+      if (line[cursor] === "@") {
+        atPrefix = "@";
+        cursor++;
+        while (cursor < line.length && (line[cursor] === " " || line[cursor] === "	")) {
+          atPrefix += line[cursor];
+          cursor++;
+        }
+      }
+      let rawTok = "";
+      if (cursor < line.length && line[cursor] === '"') {
+        const closeQuote = line.indexOf('"', cursor + 1);
+        if (closeQuote !== -1) {
+          const tailMatch = /^[^\s&|><()]*/.exec(line.slice(closeQuote + 1));
+          const end = closeQuote + 1 + (tailMatch ? tailMatch[0].length : 0);
+          rawTok = line.slice(cursor, end);
+        }
+      } else if (cursor < line.length) {
+        const tokMatch = /^([^\s&|><()"]+)/.exec(line.slice(cursor));
+        if (tokMatch) {
+          rawTok = tokMatch[1];
+        }
+      }
+      if (rawTok) {
+        const unquoted = rawTok.replace(/"/g, "");
+        const base = path.win32.basename(unquoted).toLowerCase();
+        const baseNoExt = base.replace(/\.(?:cmd|bat)$/i, "");
+        const isCallKeyword = unquoted.toLowerCase() === "call";
+        if (!isCallKeyword && (WINDOWS_BATCH_SHIMS.has(baseNoExt) || /\.(?:cmd|bat)$/i.test(base))) {
+          out += `${atPrefix}call ${rawTok}`;
+        } else {
+          out += `${atPrefix}${rawTok}`;
+        }
+        i = cursor + rawTok.length - 1;
+        atStmtStart = false;
+        continue;
+      }
+      if (atPrefix) {
+        out += atPrefix;
+        i = cursor - 1;
+        atStmtStart = false;
+        continue;
+      }
+      atStmtStart = false;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      out += ch;
+      continue;
+    }
+    if (!inQuotes && (ch === "&" || ch === "|")) {
+      if (line[i + 1] === ch) {
+        out += ch + ch;
+        i++;
+        atStmtStart = true;
+        continue;
+      }
+      if (ch === "&") {
+        out += ch;
+        atStmtStart = true;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+function buildWindowsCmdBatchScript(command) {
+  const rawLines = command.trim().split(/\r?\n/);
+  const out = ["@echo off"];
+  let parenDepth = 0;
+  for (const rawLine of rawLines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("::") || /^@?rem(?:\s|$)/i.test(trimmed)) {
+      out.push(rawLine);
+      continue;
+    }
+    const processed = prefixCallForWindowsBatchShims(escapeBatchStrayPercents(rawLine));
+    out.push(processed);
+    let inQuotes = false;
+    for (let i = 0; i < rawLine.length; i++) {
+      const ch = rawLine[i];
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+        continue;
+      }
+      if (!inQuotes) {
+        if (ch === "(") parenDepth++;
+        else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+      }
+    }
+    const continuesLine = /\^\s*$/.test(rawLine);
+    const isLabel = /^:[A-Za-z0-9_.-]+$/.test(trimmed);
+    if (parenDepth === 0 && !continuesLine && !isLabel) {
+      out.push("if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%");
+    }
+  }
+  return `${out.join("\r\n")}\r
+`;
+}
+var tempScriptSeq = 0;
+async function runPowerShellScript(psExecutable, extraFlags, fullScript, useEncoded, options) {
+  const baseFlags = extraFlags.length > 0 ? extraFlags : ["-NoLogo", "-NoProfile", "-NonInteractive"];
+  if (!useEncoded) {
+    return spawnAndCollect(
+      psExecutable,
+      [...baseFlags, "-Command", fullScript],
+      false,
+      options
+    );
+  }
+  const encoded = encodePowerShellCommand(fullScript);
+  if (encoded.length <= MAX_PS_ENCODED_COMMAND_CHARS) {
+    return spawnAndCollect(
+      psExecutable,
+      [...baseFlags, "-EncodedCommand", encoded],
+      false,
+      options
+    );
+  }
+  const tmpPs1 = path.join(
+    os.tmpdir(),
+    `agy-fast-ps-${process.pid}-${Date.now()}-${tempScriptSeq++}.ps1`
+  );
+  try {
+    await fs.writeFile(tmpPs1, `\uFEFF${fullScript}\r
+`, "utf8");
+    const fileFlags = baseFlags.some(
+      (f) => EXPLICIT_PS_VALUE_FLAGS.has(f.toLowerCase())
+    ) ? baseFlags : [...baseFlags, "-ExecutionPolicy", "Bypass"];
+    return await spawnAndCollect(
+      psExecutable,
+      [...fileFlags, "-File", tmpPs1],
+      false,
+      options
+    );
+  } finally {
+    await fs.rm(tmpPs1, { force: true }).catch(() => {
+    });
+  }
+}
+async function runWindowsMultilineCmdBatch(command, options) {
+  const tmpCmd = path.join(
+    os.tmpdir(),
+    `agy-fast-cmd-${process.pid}-${Date.now()}-${tempScriptSeq++}.cmd`
+  );
+  const cmdExe = process.env.ComSpec || getWindowsSystem32Binary("cmd.exe").bin;
+  try {
+    await fs.writeFile(tmpCmd, buildWindowsCmdBatchScript(command), "utf8");
+    return await spawnAndCollect(cmdExe, ["/d", "/c", tmpCmd], false, options);
+  } finally {
+    await fs.rm(tmpCmd, { force: true }).catch(() => {
+    });
+  }
 }
 var cachedWindowsPowerShell;
 var cachedWindowsPowerShellExecPath = null;
@@ -1141,18 +1763,74 @@ async function runShellCommandAsync(command, options) {
     env: withNonInteractiveGitEnv(options.env)
   };
   if (process.platform === "win32") {
-    const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command).trim();
+    const isMultiline = hasEmbeddedNewline(effectiveCommand);
+    if (isMultiline && EXPLICIT_POWERSHELL_INVOCATION_RE.test(effectiveCommand)) {
+      const parsedExplicit = parseExplicitMultilinePowerShell(effectiveCommand);
+      if (parsedExplicit) {
+        const scriptBody = buildPowerShellUtf8Command(parsedExplicit.script);
+        return runPowerShellScript(
+          parsedExplicit.bin,
+          parsedExplicit.flags,
+          scriptBody,
+          true,
+          effectiveOptions
+        );
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        durationMs: 0,
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        error: "Multiline explicit PowerShell invocation with outer shell chaining is not supported on Windows; pass the PowerShell script directly without wrapping it in `pwsh -Command`."
+      };
+    }
     if (needsPowerShellOnWindows(effectiveCommand)) {
       const psBin = await resolveWindowsPowerShell();
       if (psBin) {
         const utf8Command = buildPowerShellUtf8Command(effectiveCommand);
-        return spawnAndCollect(
+        return runPowerShellScript(
           cachedWindowsPowerShellExecPath ?? psBin,
-          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
-          false,
+          [],
+          utf8Command,
+          isMultiline,
           effectiveOptions
         );
       }
+      if (isMultiline) {
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          durationMs: 0,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          error: "Multiline PowerShell command requires pwsh or powershell.exe on Windows, which was not found."
+        };
+      }
+    }
+    if (isMultiline) {
+      if (hasNewlineInsideQuotes(effectiveCommand)) {
+        const direct = parseDirectMultilineCommand(effectiveCommand);
+        if (direct) {
+          return spawnAndCollect(direct.bin, direct.args, false, effectiveOptions);
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          durationMs: 0,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          error: "Multiline quoted arguments combined with shell operators are not supported by cmd.exe on Windows; use a script file or PowerShell syntax."
+        };
+      }
+      return runWindowsMultilineCmdBatch(effectiveCommand, effectiveOptions);
     }
     return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
@@ -1291,7 +1969,7 @@ async function isRipgrepAvailable() {
 }
 
 // src/utils/host-compat.ts
-import fs from "node:fs";
+import fs2 from "node:fs";
 import os2 from "node:os";
 import path2 from "node:path";
 
@@ -2516,7 +3194,7 @@ function getConfigPath(env = process.env) {
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
-    const raw = fs.readFileSync(getConfigPath(env), "utf8");
+    const raw = fs2.readFileSync(getConfigPath(env), "utf8");
     const parsed = JSON.parse(raw);
     return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
   } catch {
@@ -2525,7 +3203,7 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/tools/apply-edits.ts
-import { promises as fs3 } from "node:fs";
+import { promises as fs4 } from "node:fs";
 import path4 from "node:path";
 
 // src/utils/arg-validation.ts
@@ -2601,7 +3279,7 @@ function formatCorruptedArrayError(options) {
 }
 
 // src/utils/fs-utils.ts
-import { promises as fs2 } from "node:fs";
+import { promises as fs3 } from "node:fs";
 import os3 from "node:os";
 import path3 from "node:path";
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
@@ -2669,7 +3347,7 @@ function detectUtf16Bom(buf) {
   return null;
 }
 async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
-  const stat = await fs2.stat(filePath);
+  const stat = await fs3.stat(filePath);
   if (!stat.isFile()) {
     throw new Error(`Not a regular file: ${filePath}`);
   }
@@ -2678,7 +3356,7 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
       `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
     );
   }
-  const buf = await fs2.readFile(filePath);
+  const buf = await fs3.readFile(filePath);
   const utf16Bom = detectUtf16Bom(buf);
   if (utf16Bom) {
     throw new Error(
@@ -2857,7 +3535,7 @@ async function walkFiles(rootDir, options = {}) {
     if (truncated) return null;
     activeReaddirs++;
     try {
-      return await fs2.readdir(dir, { withFileTypes: true });
+      return await fs3.readdir(dir, { withFileTypes: true });
     } finally {
       activeReaddirs--;
       if (truncated) {
@@ -3314,7 +3992,7 @@ function countLines(text) {
 }
 var OVERWRITE_HEADER_PEEK_BYTES = 8192;
 async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
-  const fh = await fs3.open(filePath, "r");
+  const fh = await fs4.open(filePath, "r");
   try {
     const buf = Buffer.allocUnsafe(maxBytes);
     const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
@@ -3341,7 +4019,7 @@ async function readOverwriteOriginal(writeTargetPath, size, relPath) {
       return { ok: false, error: nonTextErr2 };
     }
   }
-  const buffer = await fs3.readFile(writeTargetPath);
+  const buffer = await fs4.readFile(writeTargetPath);
   const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
   if (nonTextErr) {
     return { ok: false, error: nonTextErr };
@@ -3364,7 +4042,7 @@ function isGitInternalPath(filePath, platform = process.platform) {
 }
 async function canonicalizeTargetPath(absPath) {
   try {
-    return await fs3.realpath(absPath);
+    return await fs4.realpath(absPath);
   } catch {
     const trailingSegments = [];
     let current = absPath;
@@ -3376,7 +4054,7 @@ async function canonicalizeTargetPath(absPath) {
       trailingSegments.push(path4.basename(current));
       current = parent;
       try {
-        const realAncestor = await fs3.realpath(current);
+        const realAncestor = await fs4.realpath(current);
         return path4.join(realAncestor, ...trailingSegments.reverse());
       } catch {
       }
@@ -3388,7 +4066,7 @@ async function findMissingAncestorDirs(dir) {
   let current = path4.resolve(dir);
   while (true) {
     try {
-      await fs3.lstat(current);
+      await fs4.lstat(current);
       break;
     } catch (err) {
       if (err?.code !== "ENOENT") {
@@ -3419,42 +4097,42 @@ async function commitPlannedWrites(plans) {
           createdDirs.push(d);
         }
       }
-      await fs3.mkdir(dir, { recursive: true });
+      await fs4.mkdir(dir, { recursive: true });
       const tmpPath = path4.join(
         dir,
         `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
       );
       try {
-        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs4.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs3.chmod(tmpPath, plan.originalMode);
+          await fs4.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs4.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs3.rename(tmpPath, target);
+        await fs4.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs4.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs3.unlink(target);
+            await fs4.unlink(target);
           } catch {
           }
         }
-        await fs3.writeFile(target, plan.newContent, "utf8");
+        await fs4.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs3.chmod(target, plan.originalMode);
+            await fs4.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -3467,23 +4145,23 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs3.unlink(target).catch(() => {
+          await fs4.unlink(target).catch(() => {
           });
-          await fs3.symlink(item.originalSymlinkTarget, target);
+          await fs4.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs3.writeFile(target, item.originalBuffer);
+          await fs4.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs3.chmod(target, item.originalMode);
+            await fs4.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs3.unlink(target);
+          await fs4.unlink(target);
         }
       } catch {
       }
     }
     for (let i = createdDirs.length - 1; i >= 0; i--) {
       try {
-        await fs3.rmdir(createdDirs[i]);
+        await fs4.rmdir(createdDirs[i]);
       } catch {
       }
     }
@@ -3745,7 +4423,7 @@ async function runApplyEdits(input) {
   if (!input.dryRun && validatedVerify?.cwd) {
     const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
     try {
-      const st = await fs3.stat(resolvedVerifyCwd);
+      const st = await fs4.stat(resolvedVerifyCwd);
       if (!st.isDirectory()) {
         return {
           text: `Validation failed (0 files modified):
@@ -3819,10 +4497,10 @@ async function runApplyEdits(input) {
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs3.lstat(item.writeTargetPath);
+        const lst = await fs4.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs3.stat(item.writeTargetPath);
+            const st = await fs4.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -3854,7 +4532,7 @@ async function runApplyEdits(input) {
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs4.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -3863,7 +4541,7 @@ async function runApplyEdits(input) {
             }
           }
         } else {
-          const st = await fs3.stat(item.writeTargetPath);
+          const st = await fs4.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -4090,7 +4768,7 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 }
 
 // src/tools/batch-search.ts
-import { promises as fs4 } from "node:fs";
+import { promises as fs5 } from "node:fs";
 import path5 from "node:path";
 
 // src/utils/fuzzy-match.ts
@@ -4583,7 +5261,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs4.stat(searchRoot);
+  const fileStat = await fs5.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -4602,7 +5280,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs4.open(searchRoot, "r");
+    const fh = await fs5.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -4977,7 +5655,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs4.stat(searchRoot);
+  const stat = await fs5.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
@@ -5073,9 +5751,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
-          const st = await fs4.stat(absFile);
+          const st = await fs5.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs4.readFile(absFile);
+          const buf = await fs5.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
@@ -5212,7 +5890,7 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs5.lstat(path5.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -5906,7 +6584,7 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs4.stat(searchRoot);
+      targetStat = await fs5.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
@@ -6029,7 +6707,7 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs5.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -8765,7 +9443,7 @@ async function runQuickOutline(input) {
 }
 
 // src/tools/run-checks.ts
-import { promises as fs5 } from "node:fs";
+import { promises as fs6 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -8843,7 +9521,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs5.stat(baseCwd);
+    const st = await fs6.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -8875,7 +9553,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs5.stat(cmdCwd);
+        const st = await fs6.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -9935,7 +10613,7 @@ var DEFAULT_PLUGIN_ROOT = path7.resolve(
 function canonicalizeDir(dirPath) {
   const resolved = path7.resolve(dirPath);
   try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+    return typeof fs7.realpathSync.native === "function" ? fs7.realpathSync.native(resolved) : fs7.realpathSync(resolved);
   } catch {
     return resolved;
   }
@@ -9991,7 +10669,7 @@ function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
   }
   const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
   if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs7.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs7.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -10158,7 +10836,7 @@ function createAgyFastServer(options = {}) {
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs6.statSync(candidate).isDirectory()) {
+          if (fs7.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
