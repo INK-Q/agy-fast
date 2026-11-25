@@ -1912,4 +1912,151 @@ describe("apply_edits", () => {
     assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
     assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
+
+  it("diagnoses tab-vs-space, indent-width, and trailing-whitespace mismatches with visible tab markers only when tabs exist", async () => {
+    const goFile = path.join(tmpDir, "service.go");
+    await fs.writeFile(
+      goFile,
+      [
+        "package main",
+        "",
+        "func compute(x int) int {",
+        "\tif x > 0 {",
+        "\t\treturn x * 2",
+        "\t}",
+        "\treturn 0",
+        "}",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // 1. Tab-indented file vs space-indented target -> explicit tab hint + visible → markers & legend
+    const tabVsSpace = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "service.go",
+          hunks: [
+            {
+              target: "    if x > 0 {\n        return x * 2\n    }",
+              replacement: "\tif x > 0 {\n\t\treturn x * 3\n\t}",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(tabVsSpace.isError, true);
+    assert.match(
+      tabVsSpace.text,
+      /Whitespace mismatch at L4-L6: file uses tabs \(\\t\), target used spaces\./,
+    );
+    assert.match(tabVsSpace.text, /Closest match near line 4 \(lines \d+-\d+\) \(→ = tab\):/);
+    assert.match(tabVsSpace.text, /4: →if x > 0 \{/);
+    assert.match(tabVsSpace.text, /5: →→return x \* 2/);
+
+    // 2. Space-indented file vs tab-indented target, indent-width mismatch, and trailing-space mismatch
+    const pyFile = path.join(tmpDir, "calc.py");
+    await fs.writeFile(
+      pyFile,
+      [
+        "def run(val):",
+        "    if val:",
+        "        return val + 1   ",
+        "    return 0",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // 2a. File uses spaces, target used tabs -> no → legend since file region has no leading tabs
+    const spaceVsTab = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "calc.py",
+          hunks: [
+            {
+              target: "\tif val:\n\t\treturn val + 1",
+              replacement: "    if val:\n        return val + 2",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(spaceVsTab.isError, true);
+    assert.match(
+      spaceVsTab.text,
+      /Whitespace mismatch at L2-L3: file uses spaces, target used tabs \(\\t\); trailing horizontal whitespace mismatch\./,
+    );
+    assert.doesNotMatch(spaceVsTab.text, /\(→ = tab\)/);
+
+    // 2b. Indentation width mismatch (2 spaces vs 4 spaces) -> non-tab snippet unaffected
+    const indentWidth = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "calc.py",
+          hunks: [
+            {
+              target: "  if val:\n    return val + 1   ",
+              replacement: "    if val:\n        return val + 2",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(indentWidth.isError, true);
+    assert.match(indentWidth.text, /Whitespace mismatch at L2-L3: indentation width mismatch\./);
+    assert.doesNotMatch(indentWidth.text, /\(→ = tab\)/);
+
+    // 2c. Trailing horizontal whitespace mismatch only (file has trailing spaces on L3 before newline)
+    const trailingSpace = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "calc.py",
+          hunks: [
+            {
+              startLine: 2,
+              endLine: 4,
+              target: "        return val + 1\n    return 0",
+              replacement: "        return val + 2\n    return 0",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(trailingSpace.isError, true);
+    assert.match(
+      trailingSpace.text,
+      /Whitespace mismatch at L3-L4: trailing horizontal whitespace mismatch\./,
+    );
+    assert.doesNotMatch(trailingSpace.text, /\(→ = tab\)/);
+
+    // 2d. Single-line target with extra trailing spaces not present in file
+    const targetTrailingSpace = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "calc.py",
+          hunks: [
+            {
+              target: "    return 0  ",
+              replacement: "    return 1",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(targetTrailingSpace.isError, true);
+    assert.match(
+      targetTrailingSpace.text,
+      /Whitespace mismatch at L4: trailing horizontal whitespace mismatch\./,
+    );
+    assert.doesNotMatch(targetTrailingSpace.text, /\(→ = tab\)/);
+  });
 });

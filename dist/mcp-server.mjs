@@ -2978,6 +2978,17 @@ function getLineWindowOffsets(text, lineStarts, startLine, endLine) {
   return { windowStart, windowEnd };
 }
 var MAX_NEARBY_LINES = 26;
+function regionHasLeadingTab(fileLines, from, to) {
+  for (let ln = from; ln <= to; ln++) {
+    const lineText = fileLines[ln - 1] ?? "";
+    if (/^ *\t/.test(lineText)) return true;
+  }
+  return false;
+}
+function renderSnippetLine(lineText, showLeadingTabs) {
+  const rendered = showLeadingTabs ? lineText.replace(/^[\t ]+/, (ws) => ws.replace(/\t/g, "\u2192")) : lineText;
+  return rendered.length > 160 ? `${sliceSafeChars(rendered, 157)}...` : rendered;
+}
 function formatNearbyLines(text, startLine, endLine) {
   const lines = text.split("\n");
   if (startLine === void 0 && endLine === void 0) return "";
@@ -2985,18 +2996,101 @@ function formatNearbyLines(text, startLine, endLine) {
   const rawTo = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
   const truncated = rawTo - from + 1 > MAX_NEARBY_LINES;
   const to = truncated ? from + MAX_NEARBY_LINES - 1 : rawTo;
+  const showLeadingTabs = regionHasLeadingTab(lines, from, to);
+  const tabLegend = showLeadingTabs ? " (\u2192 = tab)" : "";
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = lines[ln - 1] ?? "";
-    snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`
-    );
+    snippet.push(`    ${ln}: ${renderSnippetLine(lineText, showLeadingTabs)}`);
   }
   const extra = truncated ? `
     ... (${rawTo - to} more lines in range omitted)` : "";
   return `
-  Nearby lines (${from}-${to}):
+  Nearby lines (${from}-${to})${tabLegend}:
 ${snippet.join("\n")}${extra}`;
+}
+function detectWhitespaceMismatchHint(fileLines, normTarget, rangeStartLine, rangeEndLine, outsideRangeLabel = false) {
+  if (fileLines.length === 0 || !normTarget) return null;
+  const rawTargetLines = normTarget.split("\n");
+  if (normTarget.endsWith("\n") && rawTargetLines.length > 1) {
+    rawTargetLines.pop();
+  }
+  const m = rawTargetLines.length;
+  if (m === 0) return null;
+  const trimmedTarget = rawTargetLines.map((l) => l.trim());
+  if (!trimmedTarget.some((l) => l.length > 0)) return null;
+  const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
+  const scanEnd = Math.min(
+    fileLines.length - 1,
+    (rangeEndLine ?? fileLines.length) - 1
+  );
+  if (scanStart > scanEnd || scanEnd - scanStart + 1 < m) return null;
+  for (let i = scanStart; i <= scanEnd - m + 1; i++) {
+    let matched = true;
+    for (let k = 0; k < m; k++) {
+      if (fileLines[i + k].trim() !== trimmedTarget[k]) {
+        matched = false;
+        break;
+      }
+    }
+    if (!matched) continue;
+    let fileTabsTargetSpaces = false;
+    let fileSpacesTargetTabs = false;
+    let tabStyleDiff = false;
+    let indentWidthDiff = false;
+    let trailingWhitespaceDiff = false;
+    for (let k = 0; k < m; k++) {
+      const fLine = fileLines[i + k];
+      const tLine = rawTargetLines[k];
+      if (fLine === tLine) continue;
+      if (trimmedTarget[k].length === 0) {
+        trailingWhitespaceDiff = true;
+        continue;
+      }
+      const fLead = /^[\t ]*/.exec(fLine)[0];
+      const tLead = /^[\t ]*/.exec(tLine)[0];
+      const fTrail = /[\t ]*$/.exec(fLine)[0];
+      const tTrail = /[\t ]*$/.exec(tLine)[0];
+      if (fLead !== tLead) {
+        const fHasTab = fLead.includes("	");
+        const tHasTab = tLead.includes("	");
+        const fHasSpace = fLead.includes(" ");
+        const tHasSpace = tLead.includes(" ");
+        if (fHasTab && !tHasTab && tHasSpace) {
+          fileTabsTargetSpaces = true;
+        } else if (!fHasTab && fHasSpace && tHasTab) {
+          fileSpacesTargetTabs = true;
+        } else if (fHasTab !== tHasTab) {
+          tabStyleDiff = true;
+        } else {
+          indentWidthDiff = true;
+        }
+      }
+      if (fTrail !== tTrail) {
+        trailingWhitespaceDiff = true;
+      }
+    }
+    const reasons = [];
+    if (fileTabsTargetSpaces) {
+      reasons.push("file uses tabs (\\t), target used spaces");
+    } else if (fileSpacesTargetTabs) {
+      reasons.push("file uses spaces, target used tabs (\\t)");
+    } else if (tabStyleDiff) {
+      reasons.push("tab/space indentation mismatch");
+    } else if (indentWidthDiff) {
+      reasons.push("indentation width mismatch");
+    }
+    if (trailingWhitespaceDiff) {
+      reasons.push("trailing horizontal whitespace mismatch");
+    }
+    if (reasons.length === 0) continue;
+    const startLn = i + 1;
+    const endLn = i + m;
+    const loc = startLn === endLn ? `L${startLn}` : `L${startLn}-L${endLn}`;
+    const scopePrefix = outsideRangeLabel ? " outside range" : "";
+    return ` Whitespace mismatch${scopePrefix} at ${loc}: ${reasons.join("; ")}.`;
+  }
+  return null;
 }
 function extractLineTokens(trimmedLine) {
   const tokens = trimmedLine.match(/[A-Za-z0-9_$]{3,}|[\u4e00-\u9fff]{2,}/g);
@@ -3111,15 +3205,15 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   const span = Math.min(Math.max(targetLines.length, 4), 8);
   const from = Math.max(1, bestStart + 1 - 2);
   const to = Math.min(fileLines.length, Math.min(from + 13, bestStart + 1 + span + 2));
+  const showLeadingTabs = regionHasLeadingTab(fileLines, from, to);
+  const tabLegend = showLeadingTabs ? " (\u2192 = tab)" : "";
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
-    snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`
-    );
+    snippet.push(`    ${ln}: ${renderSnippetLine(lineText, showLeadingTabs)}`);
   }
   return `
-  Closest match near line ${bestStart + 1} (lines ${from}-${to}):
+  Closest match near line ${bestStart + 1} (lines ${from}-${to})${tabLegend}:
 ${snippet.join("\n")}`;
 }
 function planHunksForContent(normalizedContent, hunks, displayPath) {
@@ -3186,14 +3280,21 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
         } else {
           const effStart = hunk.startLine ?? 1;
           const effEnd = hunk.endLine ?? lineStarts.length;
+          const fileLines = normalizedContent.split("\n");
+          const wsHint = detectWhitespaceMismatchHint(fileLines, normTarget, effStart, effEnd) || detectWhitespaceMismatchHint(fileLines, normTarget, void 0, void 0, true) || "";
+          let snippetHint;
           if (effEnd - effStart + 1 > MAX_NEARBY_LINES - 4) {
-            hint = findClosestRegionSnippet(normalizedContent, normTarget, effStart, effEnd) || findClosestRegionSnippet(normalizedContent, normTarget) || formatNearbyLines(normalizedContent, effStart, effEnd);
+            snippetHint = findClosestRegionSnippet(normalizedContent, normTarget, effStart, effEnd) || findClosestRegionSnippet(normalizedContent, normTarget) || formatNearbyLines(normalizedContent, effStart, effEnd);
           } else {
-            hint = formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
+            snippetHint = formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
           }
+          hint = `${wsHint}${snippetHint}`;
         }
       } else {
-        hint = findClosestRegionSnippet(normalizedContent, normTarget);
+        const fileLines = normalizedContent.split("\n");
+        const wsHint = detectWhitespaceMismatchHint(fileLines, normTarget) || "";
+        const snippetHint = findClosestRegionSnippet(normalizedContent, normTarget);
+        hint = `${wsHint}${snippetHint}`;
       }
       errors.push(
         `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${hint}`
