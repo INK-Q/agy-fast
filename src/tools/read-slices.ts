@@ -40,13 +40,14 @@ export interface SymbolEntry {
   depth: number;
 }
 
-type BraceLang = "js" | "c" | "go" | "rust" | "shell" | "json";
+type BraceLang = "js" | "c" | "go" | "rust" | "shell" | "json" | "css";
 
 interface ScanState {
   inBlockComment: boolean;
   templateExprStack: number[]; // tracks open `{` depth inside `${...}` of nested template strings
   inBacktick: boolean;
   parenDepth?: number;
+  rustRawHashes?: number;
 }
 
 function isRegexStartContext(line: string, slashIdx: number): boolean {
@@ -54,6 +55,19 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
   while (j >= 0 && /\s/.test(line[j]!)) j--;
   if (j < 0) return true;
   const prev = line[j]!;
+  if (prev === "!") {
+    // TypeScript postfix non-null assertion (`arr[0]! / 2`, `fn()! / n`, `x! / y`) is a value, not unary `!`
+    let b = j - 1;
+    while (b >= 0 && /\s/.test(line[b]!)) b--;
+    if (b >= 0 && /[\w$)\]'`"]/.test(line[b]!)) return false;
+    return true;
+  }
+  if ((prev === "+" || prev === "-") && j > 0 && line[j - 1] === prev) {
+    // Postfix `i++ / 2` or `i-- / 2` ends an expression
+    let b = j - 2;
+    while (b >= 0 && /\s/.test(line[b]!)) b--;
+    if (b >= 0 && /[\w$)\]]/.test(line[b]!)) return false;
+  }
   if ("=(,:![&|?{};~+-*%^<>".includes(prev)) return true;
   // Check preceding keyword (return, case, throw, in, of, typeof, void, delete, new)
   let k = j;
@@ -70,6 +84,34 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
     word === "delete" ||
     word === "new"
   );
+}
+
+function hasClosingRegexSlashOnLine(line: string, openSlashIdx: number): boolean {
+  let escaped = false;
+  let inClass = false;
+  for (let i = openSlashIdx + 1; i < line.length; i++) {
+    const ch = line[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      continue;
+    }
+    if (ch === "]") {
+      inClass = false;
+      continue;
+    }
+    if (ch === "/" && !inClass) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isJsxSelfClosingSlash(line: string, slashIdx: number): boolean {
@@ -93,6 +135,8 @@ function scanBracesOnLine(
   close: number;
   openParen: number;
   closeParen: number;
+  openBracket: number;
+  closeBracket: number;
   endsWithSemi: boolean;
   lastCodeChar: string;
 } {
@@ -100,6 +144,8 @@ function scanBracesOnLine(
   let close = 0;
   let openParen = 0;
   let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
   let parenDepth = state.parenDepth ?? 0;
   let seenOpen = alreadySeenOpen;
   let inSingle = false;
@@ -117,6 +163,25 @@ function scanBracesOnLine(
       if (ch === "*" && next === "/") {
         state.inBlockComment = false;
         i++;
+      }
+      continue;
+    }
+
+    if (lang === "rust" && (state.rustRawHashes ?? -1) >= 0) {
+      if (ch === '"') {
+        const needed = state.rustRawHashes!;
+        let matchedHashes = true;
+        for (let h = 0; h < needed; h++) {
+          if (line[i + 1 + h] !== "#") {
+            matchedHashes = false;
+            break;
+          }
+        }
+        if (matchedHashes) {
+          state.rustRawHashes = -1;
+          i += needed;
+          lastCodeChar = '"';
+        }
       }
       continue;
     }
@@ -181,13 +246,14 @@ function scanBracesOnLine(
       break;
     }
     if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "/") break;
-    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "*") {
+    if (lang === "css" && ch === "/" && next === "/" && (i === 0 || line[i - 1] !== ":")) break;
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust" || lang === "css") && ch === "/" && next === "*") {
       state.inBlockComment = true;
       i++;
       continue;
     }
 
-    // Regex literal (JS/TS only); never treat JSX closing `</Tag>` or self-closing `/>` as a regex start
+    // Regex literal (JS/TS only); never treat JSX closing `</Tag>`, self-closing `/>`, or single-slash division as regex
     if (
       lang === "js" &&
       ch === "/" &&
@@ -195,11 +261,28 @@ function scanBracesOnLine(
       next !== "*" &&
       !isJsxSelfClosingSlash(line, i) &&
       line[i - 1] !== "<" &&
-      isRegexStartContext(line, i)
+      isRegexStartContext(line, i) &&
+      hasClosingRegexSlashOnLine(line, i)
     ) {
       inRegex = true;
       inRegexClass = false;
       continue;
+    }
+
+    // Rust raw strings: r"...", r#"..."#, br#"..."#, cr#"..."#
+    if (
+      lang === "rust" &&
+      (ch === "r" || ((ch === "b" || ch === "c") && next === "r")) &&
+      (i === 0 || !/[\w']/.test(line[i - 1]!))
+    ) {
+      const rIdx = ch === "r" ? i : i + 1;
+      let hashEnd = rIdx + 1;
+      while (hashEnd < line.length && line[hashEnd] === "#") hashEnd++;
+      if (line[hashEnd] === '"') {
+        state.rustRawHashes = hashEnd - (rIdx + 1);
+        i = hashEnd;
+        continue;
+      }
     }
 
     if (ch === "'" && lang !== "json") {
@@ -251,6 +334,12 @@ function scanBracesOnLine(
       closeParen++;
       parenDepth = Math.max(0, parenDepth - 1);
       lastCodeChar = ")";
+    } else if (ch === "[") {
+      openBracket++;
+      lastCodeChar = "[";
+    } else if (ch === "]") {
+      closeBracket++;
+      lastCodeChar = "]";
     } else if (!/\s/.test(ch)) {
       lastCodeChar = ch;
     }
@@ -263,6 +352,8 @@ function scanBracesOnLine(
     close,
     openParen,
     closeParen,
+    openBracket,
+    closeBracket,
     endsWithSemi: lastCodeChar === ";",
     lastCodeChar,
   };
@@ -313,10 +404,96 @@ function findBraceBlockEnd(
   return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
 }
 
-function findTypeAliasEnd(lines: string[], startIdx: number): number {
+function skipBalancedTypeParams(
+  lines: string[],
+  startLineIdx: number,
+  startCol: number,
+  maxLines = 6,
+): { lineIdx: number; col: number } | null {
+  const firstLine = lines[startLineIdx] ?? "";
+  let i = startCol;
+  while (i < firstLine.length && /\s/.test(firstLine[i]!)) i++;
+  if (firstLine[i] !== "<") {
+    return { lineIdx: startLineIdx, col: i };
+  }
+
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  const limitLine = Math.min(lines.length - 1, startLineIdx + maxLines);
+
+  for (let ln = startLineIdx; ln <= limitLine; ln++) {
+    const text = lines[ln] ?? "";
+    const fromCol = ln === startLineIdx ? i : 0;
+    for (let c = fromCol; c < text.length; c++) {
+      const ch = text[c]!;
+      const prev = c > 0 ? text[c - 1] : "";
+      if (quote) {
+        if (ch === "\\") {
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "/" && text[c + 1] === "/") break;
+      if (ch === "(") {
+        parenDepth++;
+      } else if (ch === ")") {
+        parenDepth = Math.max(0, parenDepth - 1);
+      } else if (ch === "<") {
+        angleDepth++;
+      } else if (ch === ">" && prev !== "=") {
+        angleDepth--;
+        if (angleDepth === 0 && parenDepth === 0) {
+          return { lineIdx: ln, col: c + 1 };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function findTypeAliasEqualsPos(
+  lines: string[],
+  startIdx: number,
+): { lineIdx: number; col: number } | null {
   const firstLine = lines[startIdx] ?? "";
-  const eqIdx = firstLine.indexOf("=");
-  const rhs = eqIdx >= 0 ? firstLine.slice(eqIdx + 1) : firstLine;
+  const headMatch = /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)/.exec(
+    firstLine,
+  );
+  if (!headMatch) return null;
+  const afterGenerics = skipBalancedTypeParams(
+    lines,
+    startIdx,
+    headMatch[0].length,
+  );
+  if (!afterGenerics) return null;
+
+  const limitLine = Math.min(lines.length - 1, afterGenerics.lineIdx + 2);
+  for (let ln = afterGenerics.lineIdx; ln <= limitLine; ln++) {
+    const text = lines[ln] ?? "";
+    let col = ln === afterGenerics.lineIdx ? afterGenerics.col : 0;
+    while (col < text.length && /\s/.test(text[col]!)) col++;
+    if (col < text.length) {
+      if (text[col] === "=" && text[col + 1] !== ">") {
+        return { lineIdx: ln, col };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function findTypeAliasEnd(lines: string[], startIdx: number): number {
+  const eqPos = findTypeAliasEqualsPos(lines, startIdx);
+  const eqLineIdx = eqPos ? eqPos.lineIdx : startIdx;
+  const eqLine = lines[eqLineIdx] ?? "";
+  const rhs = eqPos ? eqLine.slice(eqPos.col + 1) : eqLine;
   const state: ScanState = {
     inBlockComment: false,
     templateExprStack: [],
@@ -325,14 +502,14 @@ function findTypeAliasEnd(lines: string[], startIdx: number): number {
   };
   const firstScan = scanBracesOnLine(rhs, state, "js");
   if (firstScan.open > firstScan.close) {
-    return findBraceBlockEnd(lines, startIdx, "js");
+    return findBraceBlockEnd(lines, eqLineIdx, "js");
   }
   if (firstScan.endsWithSemi && firstScan.openParen <= firstScan.closeParen) {
-    return startIdx + 1;
+    return eqLineIdx + 1;
   }
 
   // Handle multiline union/intersection/mapped types without braces (including semi: false style)
-  let endIdx = startIdx;
+  let endIdx = eqLineIdx;
   let parenBal = firstScan.openParen - firstScan.closeParen;
   let prevLast = firstScan.lastCodeChar;
   const maxScan = Math.min(lines.length - 1, startIdx + 40);
@@ -369,7 +546,7 @@ function findParenCallEnd(lines: string[], startIdx: number): number {
     parenDepth: 0,
   };
   let seenParen = false;
-  const maxScan = Math.min(lines.length, startIdx + 400);
+  const maxScan = Math.min(lines.length, startIdx + 2000);
   for (let i = startIdx; i < maxScan; i++) {
     const { openParen } = scanBracesOnLine(lines[i]!, state, "js");
     if (openParen > 0) seenParen = true;
@@ -378,6 +555,112 @@ function findParenCallEnd(lines: string[], startIdx: number): number {
     }
   }
   return startIdx + 1;
+}
+
+function findJsBalancedExprEnd(
+  lines: string[],
+  fromLineIdx: number,
+  fromCol = 0,
+): number {
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0,
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, fromLineIdx + 2000);
+
+  for (let i = fromLineIdx; i < maxScan; i++) {
+    const slice = i === fromLineIdx ? lines[i]!.slice(fromCol) : lines[i]!;
+    const scan = scanBracesOnLine(slice, state, "js");
+    if (scan.open > 0 || scan.openParen > 0 || scan.openBracket > 0) {
+      seenOpen = true;
+    }
+    braceDepth += scan.open - scan.close;
+    parenDepth += scan.openParen - scan.closeParen;
+    bracketDepth += scan.openBracket - scan.closeBracket;
+    if (seenOpen && braceDepth <= 0 && parenDepth <= 0 && bracketDepth <= 0) {
+      return i + 1;
+    }
+  }
+
+  return seenOpen ? Math.min(lines.length, maxScan) : fromLineIdx + 1;
+}
+
+function findConstAssignEq(line: string): { name: string; eqCol: number } | null {
+  const m = /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b/.exec(line);
+  if (!m || !m[1]) return null;
+  let angle = 0;
+  let paren = 0;
+  let brace = 0;
+  let bracket = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  for (let k = m[0].length; k < line.length; k++) {
+    const ch = line[k]!;
+    const prev = k > 0 ? line[k - 1] : "";
+    if (quote) {
+      if (ch === "\\") {
+        k++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "/" && line[k + 1] === "/") break;
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    else if (ch === "<") angle++;
+    else if (ch === ">" && prev !== "=" && angle > 0) angle--;
+    else if (
+      ch === "=" &&
+      prev !== "=" &&
+      prev !== "!" &&
+      line[k + 1] !== "=" &&
+      line[k + 1] !== ">" &&
+      angle === 0 &&
+      paren === 0 &&
+      brace === 0 &&
+      bracket === 0
+    ) {
+      return { name: m[1], eqCol: k };
+    }
+  }
+  return null;
+}
+
+const TS_COMPONENT_WRAPPER_RE =
+  /^(?:(?:React\s*\.\s*)?(?:memo|forwardRef|lazy)|defineComponent|defineAsyncComponent|observer)\b/;
+const TS_STATE_CONFIG_WRAPPER_RE =
+  /^(?:(?:React\s*\.\s*)?createContext|defineStore|createStore|defineConfig|createSlice|createAsyncThunk)\b/;
+
+function matchWrapperCallEnd(
+  lines: string[],
+  lineIdx: number,
+  colAfterWrapper: number,
+): number | null {
+  const afterGen = skipBalancedTypeParams(lines, lineIdx, colAfterWrapper, 8);
+  if (!afterGen) return null;
+  for (let ln = afterGen.lineIdx; ln <= Math.min(lines.length - 1, afterGen.lineIdx + 2); ln++) {
+    const text = lines[ln] ?? "";
+    let c = ln === afterGen.lineIdx ? afterGen.col : 0;
+    while (c < text.length && /\s/.test(text[c]!)) c++;
+    if (c < text.length) {
+      return text[c] === "(" ? findJsBalancedExprEnd(lines, ln, c) : null;
+    }
+  }
+  return null;
 }
 
 function hasArrowOrBraceWithin(lines: string[], startIdx: number, maxLookahead = 12): { hasArrow: boolean; hasBrace: boolean } {
@@ -416,11 +699,6 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
       nameGroup: 1,
     },
     {
-      re: /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*=/,
-      kind: "type",
-      nameGroup: 1,
-    },
-    {
       re: /^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)/,
       kind: "enum",
       nameGroup: 1,
@@ -439,8 +717,9 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
   const multilineArrowStartRe =
     /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\(/;
 
-  const methodHeaderRe =
-    /^([ \t]{1,4})(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(/;
+  const typeHeaderRe = /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)/;
+  const classMemberStartRe =
+    /^([ \t]{1,6})(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*(\*\s*)?(#?[A-Za-z_$][\w$]*)/;
   const controlKeywords = new Set([
     "if",
     "for",
@@ -513,6 +792,21 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
       }
 
       if (!matchedTop) {
+        const mtp = typeHeaderRe.exec(line);
+        if (mtp && mtp[1] && findTypeAliasEqualsPos(lines, i) !== null) {
+          const endLine = findTypeAliasEnd(lines, i);
+          symbols.push({
+            kind: "type",
+            name: mtp[1],
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+          matchedTop = true;
+        }
+      }
+
+      if (!matchedTop) {
         const ma = multilineArrowStartRe.exec(line);
         if (ma && ma[1]) {
           const { hasArrow } = hasArrowOrBraceWithin(lines, i, 12);
@@ -529,6 +823,127 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
               currentFnEnd = endLine;
             }
             matchedTop = true;
+          }
+        }
+      }
+
+      if (!matchedTop) {
+        const assign = findConstAssignEq(line);
+        if (assign) {
+          let rhsLineIdx = i;
+          let rhsCol = assign.eqCol + 1;
+          while (rhsCol < line.length && /\s/.test(line[rhsCol]!)) rhsCol++;
+          if (rhsCol >= line.length && i + 1 < lines.length) {
+            rhsLineIdx = i + 1;
+            const nextL = lines[rhsLineIdx]!;
+            rhsCol = 0;
+            while (rhsCol < nextL.length && /\s/.test(nextL[rhsCol]!)) rhsCol++;
+          }
+          const rhsSlice = (lines[rhsLineIdx] ?? "").slice(rhsCol);
+          const compMatch = TS_COMPONENT_WRAPPER_RE.exec(rhsSlice);
+          const stateMatch = !compMatch ? TS_STATE_CONFIG_WRAPPER_RE.exec(rhsSlice) : null;
+          const wrapperMatch = compMatch ?? stateMatch;
+          if (wrapperMatch) {
+            const endLine = matchWrapperCallEnd(
+              lines,
+              rhsLineIdx,
+              rhsCol + wrapperMatch[0].length,
+            );
+            if (endLine !== null) {
+              symbols.push({
+                kind: compMatch ? "component" : "const",
+                name: assign.name,
+                startLine: i + 1,
+                endLine,
+                depth: 0,
+              });
+              if (endLine - (i + 1) >= 40) {
+                currentFnEnd = endLine;
+              }
+              matchedTop = true;
+            }
+          }
+        }
+      }
+
+      if (!matchedTop && /^export\s+default\b/.test(line)) {
+        const prefixMatch = /^export\s+default\s+/.exec(line);
+        if (prefixMatch) {
+          const restCol = prefixMatch[0].length;
+          const rest = line.slice(restCol);
+          if (/^(?:async\s+)?function\*?\s*\(/.test(rest)) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "function",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0,
+            });
+            matchedTop = true;
+          } else if (/^(?:abstract\s+)?class\b/.test(rest)) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "class",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0,
+            });
+            currentClassEnd = endLine;
+            currentClassIndent = -1;
+            matchedTop = true;
+          } else if (
+            /^(?:async\s+)?(?:\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/.test(rest) ||
+            (/^(?:async\s+)?\(/.test(rest) && hasArrowOrBraceWithin(lines, i, 12).hasArrow)
+          ) {
+            const endLine = findBraceBlockEnd(lines, i, "js");
+            symbols.push({
+              kind: "function",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0,
+            });
+            matchedTop = true;
+          } else if (rest.startsWith("{") || rest.startsWith("[")) {
+            const endLine = findJsBalancedExprEnd(lines, i, restCol);
+            symbols.push({
+              kind: "export",
+              name: "default",
+              startLine: i + 1,
+              endLine,
+              depth: 0,
+            });
+            matchedTop = true;
+          } else {
+            const compWrap = TS_COMPONENT_WRAPPER_RE.exec(rest);
+            const anyCallWrap = /^([A-Za-z_$][\w$.]*)/.exec(rest);
+            if (compWrap) {
+              const endLine = matchWrapperCallEnd(lines, i, restCol + compWrap[0].length);
+              if (endLine !== null) {
+                symbols.push({
+                  kind: "component",
+                  name: "default",
+                  startLine: i + 1,
+                  endLine,
+                  depth: 0,
+                });
+                matchedTop = true;
+              }
+            } else if (anyCallWrap && anyCallWrap[1]) {
+              const endLine = matchWrapperCallEnd(lines, i, restCol + anyCallWrap[0].length);
+              if (endLine !== null) {
+                symbols.push({
+                  kind: "export",
+                  name: "default",
+                  startLine: i + 1,
+                  endLine,
+                  depth: 0,
+                });
+                matchedTop = true;
+              }
+            }
           }
         }
       }
@@ -551,23 +966,46 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
     }
 
     if (!matchedTop && i + 1 <= currentClassEnd) {
-      const mm = methodHeaderRe.exec(line);
-      if (mm && mm[1] && mm[2] && !controlKeywords.has(mm[2])) {
-        const indentWidth = mm[1].replace(/\t/g, "  ").length;
-        if (currentClassIndent === -1) {
-          currentClassIndent = indentWidth;
-        }
-        if (indentWidth === currentClassIndent) {
-          const { hasBrace } = hasArrowOrBraceWithin(lines, i, 10);
-          if (hasBrace) {
-            const endLine = findBraceBlockEnd(lines, i, "js");
-            symbols.push({
-              kind: "method",
-              name: mm[2],
-              startLine: i + 1,
-              endLine,
-              depth: 1,
-            });
+      const mm = classMemberStartRe.exec(line);
+      const indentRaw = mm?.[1];
+      const memberName = mm?.[3];
+      if (indentRaw && memberName && !controlKeywords.has(memberName)) {
+        const indentWidth = indentRaw.replace(/\t/g, "  ").length;
+        const afterGen = skipBalancedTypeParams(lines, i, mm[0].length, 4);
+        const tailOnLine =
+          afterGen && afterGen.lineIdx === i
+            ? line.slice(afterGen.col).trimStart()
+            : afterGen
+              ? (lines[afterGen.lineIdx] ?? "").slice(afterGen.col).trimStart()
+              : "";
+        const isMethodCallSig = tailOnLine.startsWith("(");
+        const restAfterName = line.slice(mm[0].length);
+        const isArrowProp =
+          !mm[2] &&
+          /^\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\(|[A-Za-z_$][\w$]*\s*=>)/.test(
+            restAfterName,
+          );
+
+        if (isMethodCallSig || isArrowProp) {
+          if (currentClassIndent === -1) {
+            currentClassIndent = indentWidth;
+          }
+          if (indentWidth === currentClassIndent) {
+            const probe = hasArrowOrBraceWithin(
+              lines,
+              afterGen ? afterGen.lineIdx : i,
+              10,
+            );
+            if (isMethodCallSig ? probe.hasBrace : probe.hasArrow) {
+              const endLine = findBraceBlockEnd(lines, i, "js");
+              symbols.push({
+                kind: "method",
+                name: memberName,
+                startLine: i + 1,
+                endLine,
+                depth: 1,
+              });
+            }
           }
         }
       }
@@ -609,6 +1047,121 @@ function isPythonFStringPrefix(line: string, quoteIdx: number): boolean {
   return prefix === "f" || prefix === "fr" || prefix === "rf";
 }
 
+function isPythonPep695TypeAlias(lines: string[], startIdx: number): string | null {
+  const firstLine = lines[startIdx] ?? "";
+  const m = /^([ \t]*)type\s+([A-Za-z_]\w*)\s*(\[|=)/.exec(firstLine);
+  if (!m || !m[2] || !m[3]) return null;
+  if (m[3] === "=") {
+    return firstLine[m[0].length] === "=" ? null : m[2];
+  }
+
+  // Balanced `[...]` type parameters followed by `=` (not `==`)
+  let bracket = 0;
+  let quote: '"' | "'" | null = null;
+  const maxLine = Math.min(lines.length - 1, startIdx + 8);
+  for (let ln = startIdx; ln <= maxLine; ln++) {
+    const text = lines[ln] ?? "";
+    const fromCol = ln === startIdx ? m[0].length - 1 : 0;
+    for (let c = fromCol; c < text.length; c++) {
+      const ch = text[c]!;
+      if (quote) {
+        if (ch === "\\") {
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "#") break;
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "[") bracket++;
+      else if (ch === "]") {
+        bracket--;
+        if (bracket === 0) {
+          for (let a = ln; a <= Math.min(lines.length - 1, ln + 2); a++) {
+            const tail = a === ln ? text.slice(c + 1) : (lines[a] ?? "");
+            const trimmedTail = tail.replace(/#.*$/, "").trimStart();
+            if (!trimmedTail) continue;
+            return trimmedTail.startsWith("=") && !trimmedTail.startsWith("==")
+              ? m[2]
+              : null;
+          }
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function parsePythonMatchSubject(
+  lines: string[],
+  startIdx: number,
+  isContinuation: boolean[],
+): string | null {
+  const firstLine = lines[startIdx] ?? "";
+  const m = /^[ \t]*match(?:\s+|\s*(?=[(\[]))(.*)$/.exec(firstLine);
+  if (!m) return null;
+
+  const chunks: string[] = [m[1] ?? ""];
+  let k = startIdx + 1;
+  while (k < lines.length && isContinuation[k]) {
+    chunks.push(lines[k] ?? "");
+    k++;
+  }
+
+  let cleaned = "";
+  let bracket = 0;
+  let quote: '"' | "'" | null = null;
+  for (const rawChunk of chunks) {
+    for (let c = 0; c < rawChunk.length; c++) {
+      const ch = rawChunk[c]!;
+      if (quote) {
+        cleaned += ch;
+        if (ch === "\\") {
+          if (c + 1 < rawChunk.length) cleaned += rawChunk[c + 1]!;
+          c++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "#") break;
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        cleaned += ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") bracket++;
+      else if (ch === ")" || ch === "]" || ch === "}") bracket = Math.max(0, bracket - 1);
+      else if (
+        bracket === 0 &&
+        ch === "=" &&
+        rawChunk[c - 1] !== "=" &&
+        rawChunk[c - 1] !== "!" &&
+        rawChunk[c - 1] !== "<" &&
+        rawChunk[c - 1] !== ">" &&
+        rawChunk[c - 1] !== ":" &&
+        rawChunk[c + 1] !== "="
+      ) {
+        // Assignment (`match = ...`, `match += ...`), not a `match <subject>:` statement
+        return null;
+      }
+      cleaned += ch;
+    }
+    cleaned += " ";
+  }
+
+  const trimmed = cleaned.trim();
+  if (!trimmed.endsWith(":") || bracket !== 0) return null;
+  const subject = trimmed.slice(0, -1).replace(/\s+/g, " ").trim();
+  if (!subject || /^[=:,]/.test(subject)) return null;
+  return sliceSafeChars(subject, 48);
+}
+
 function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
@@ -621,11 +1174,16 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   const isContinuation = new Array<boolean>(lines.length).fill(false);
   const inStringContinuation = new Array<boolean>(lines.length).fill(false);
   let activeQuote: '"""' | "'''" | null = null;
+  let activeTripleIsFString = false;
   let activeSingleQuote: '"' | "'" | null = null;
   let activeSingleIsFString = false;
   let bracketDepth = 0;
   let backslashContinued = false;
-  const fExprStack: Array<{ quote: '"' | "'"; braceDepth: number; baseBracketDepth: number }> = [];
+  const fExprStack: Array<{
+    quote: '"' | "'" | '"""' | "'''";
+    braceDepth: number;
+    baseBracketDepth: number;
+  }> = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -666,8 +1224,30 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
           j += 2;
           continue;
         }
+        if (activeTripleIsFString) {
+          if (line[j] === "{") {
+            if (line[j + 1] === "{") {
+              j += 2;
+              continue;
+            }
+            fExprStack.push({
+              quote: activeQuote,
+              braceDepth: 1,
+              baseBracketDepth: bracketDepth,
+            });
+            activeQuote = null;
+            activeTripleIsFString = false;
+            j++;
+            continue;
+          }
+          if (line[j] === "}" && line[j + 1] === "}") {
+            j += 2;
+            continue;
+          }
+        }
         if (line.startsWith(activeQuote, j)) {
           activeQuote = null;
+          activeTripleIsFString = false;
           j += 3;
           continue;
         }
@@ -711,13 +1291,9 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
         j++;
       } else {
         if (line[j] === "#") break;
-        if (line.startsWith('"""', j)) {
-          activeQuote = '"""';
-          j += 3;
-          continue;
-        }
-        if (line.startsWith("'''", j)) {
-          activeQuote = "'''";
+        if (line.startsWith('"""', j) || line.startsWith("'''", j)) {
+          activeQuote = line.startsWith('"""', j) ? '"""' : "'''";
+          activeTripleIsFString = isPythonFStringPrefix(line, j);
           j += 3;
           continue;
         }
@@ -749,8 +1325,13 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
             }
             if (specDepth === 0) {
               fExprStack.pop();
-              activeSingleQuote = top.quote;
-              activeSingleIsFString = true;
+              if (top.quote === '"""' || top.quote === "'''") {
+                activeQuote = top.quote;
+                activeTripleIsFString = true;
+              } else {
+                activeSingleQuote = top.quote;
+                activeSingleIsFString = true;
+              }
             }
             continue;
           }
@@ -763,8 +1344,13 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
           if (line[j] === "}") {
             if (top.braceDepth === 1) {
               fExprStack.pop();
-              activeSingleQuote = top.quote;
-              activeSingleIsFString = true;
+              if (top.quote === '"""' || top.quote === "'''") {
+                activeQuote = top.quote;
+                activeTripleIsFString = true;
+              } else {
+                activeSingleQuote = top.quote;
+                activeSingleIsFString = true;
+              }
               j++;
               continue;
             }
@@ -788,61 +1374,141 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
     }
   }
 
-  const raw: Array<{ indent: number; kind: string; name: string; defIdx: number }> = [];
+  interface PyRawEntry {
+    indent: number;
+    rawKind: "class" | "callable" | "type" | "match";
+    name: string;
+    defIdx: number;
+    isSuiteBlock: boolean;
+  }
+
+  const raw: PyRawEntry[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (isContinuation[i]) continue;
-    const m = re.exec(lines[i]!);
-    if (!m) continue;
-    const indent = m[1]!.replace(/\t/g, "    ").length;
-    const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3]!, defIdx: i });
+    const line = lines[i]!;
+    const indent = indentOf(line);
+
+    const m = re.exec(line);
+    if (m && m[3]) {
+      raw.push({
+        indent,
+        rawKind: m[2] === "class" ? "class" : "callable",
+        name: m[3],
+        defIdx: i,
+        isSuiteBlock: true,
+      });
+      continue;
+    }
+
+    const typeAliasName = isPythonPep695TypeAlias(lines, i);
+    if (typeAliasName) {
+      raw.push({
+        indent,
+        rawKind: "type",
+        name: typeAliasName,
+        defIdx: i,
+        isSuiteBlock: false,
+      });
+      continue;
+    }
+
+    const matchSubj = parsePythonMatchSubject(lines, i, isContinuation);
+    if (matchSubj) {
+      raw.push({
+        indent,
+        rawKind: "match",
+        name: matchSubj,
+        defIdx: i,
+        isSuiteBlock: true,
+      });
+    }
   }
+
+  const suiteStack: Array<{ kind: string; indent: number; endLine: number }> = [];
 
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx]!;
-    // Decorators directly above the def belong to the symbol.
+    while (
+      suiteStack.length > 0 &&
+      (item.defIdx + 1 > suiteStack[suiteStack.length - 1]!.endLine ||
+        item.indent <= suiteStack[suiteStack.length - 1]!.indent)
+    ) {
+      suiteStack.pop();
+    }
+
     let startIdx = item.defIdx;
-    for (let j = item.defIdx - 1; j >= 0; j--) {
-      if (isContinuation[j] || !lines[j]!.trim()) continue;
-      const trimmed = lines[j]!.trimStart();
-      if (trimmed.startsWith("#")) continue;
-      if (!trimmed.startsWith("@") || indentOf(lines[j]!) !== item.indent) break;
-      startIdx = j;
-    }
-    let endIdx = lines.length - 1;
-    for (let j = item.defIdx + 1; j < lines.length; j++) {
-      if (isContinuation[j]) continue;
-      const l = lines[j]!;
-      const trimmed = l.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      if (indentOf(l) <= item.indent) {
-        endIdx = j - 1;
-        break;
+    if (item.rawKind === "class" || item.rawKind === "callable") {
+      // Decorators directly above the def/class belong to the symbol.
+      const prevFloor = idx > 0 ? raw[idx - 1]!.defIdx : -1;
+      for (let j = item.defIdx - 1; j > prevFloor; j--) {
+        if (isContinuation[j] || !lines[j]!.trim()) continue;
+        const trimmed = lines[j]!.trimStart();
+        if (trimmed.startsWith("#")) continue;
+        if (!trimmed.startsWith("@") || indentOf(lines[j]!) !== item.indent) break;
+        startIdx = j;
       }
     }
-    // Trailing blank lines and comments at or left of the def indent introduce
-    // what follows, not this body.
-    while (endIdx > item.defIdx) {
-      const trimmed = lines[endIdx]!.trim();
-      if (
-        trimmed &&
-        !(
-          !isContinuation[endIdx] &&
-          trimmed.startsWith("#") &&
-          indentOf(lines[endIdx]!) <= item.indent
-        )
-      ) {
-        break;
+
+    let endIdx = item.defIdx;
+    if (!item.isSuiteBlock) {
+      while (endIdx + 1 < lines.length && isContinuation[endIdx + 1]) {
+        endIdx++;
       }
-      endIdx--;
+    } else {
+      endIdx = lines.length - 1;
+      for (let j = item.defIdx + 1; j < lines.length; j++) {
+        if (isContinuation[j]) continue;
+        const l = lines[j]!;
+        const trimmed = l.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        if (indentOf(l) <= item.indent) {
+          endIdx = j - 1;
+          break;
+        }
+      }
+      // Trailing blank lines and comments at or left of the def indent introduce
+      // what follows, not this body.
+      while (endIdx > item.defIdx) {
+        const trimmed = lines[endIdx]!.trim();
+        if (
+          trimmed &&
+          !(
+            !isContinuation[endIdx] &&
+            trimmed.startsWith("#") &&
+            indentOf(lines[endIdx]!) <= item.indent
+          )
+        ) {
+          break;
+        }
+        endIdx--;
+      }
     }
+
+    const inClass = suiteStack.some((s) => s.kind === "class");
+    const finalKind =
+      item.rawKind === "callable"
+        ? inClass
+          ? "method"
+          : "function"
+        : item.rawKind;
+    const depth =
+      suiteStack.length > 0 ? Math.min(2, suiteStack.length) : item.indent > 0 ? 1 : 0;
+
     symbols.push({
-      kind: item.kind,
+      kind: finalKind,
       name: item.name,
       startLine: startIdx + 1,
       endLine: endIdx + 1,
-      depth: item.indent > 0 ? 1 : 0,
+      depth,
     });
+
+    if (item.isSuiteBlock) {
+      suiteStack.push({
+        kind: finalKind,
+        indent: item.indent,
+        endLine: endIdx + 1,
+      });
+    }
   }
 
   return symbols;
@@ -1159,27 +1825,115 @@ function extractGdScriptSymbols(rawLines: string[]): SymbolEntry[] {
   return symbols;
 }
 
+function formatGoReceiverType(rawRecv: string): string {
+  const withoutGenerics = rawRecv.replace(/\[[\s\S]*\]\s*$/, "").trim();
+  const parts = withoutGenerics.split(/\s+/);
+  const last = parts[parts.length - 1] ?? withoutGenerics;
+  return last.replace(/^\*+/, "");
+}
+
+function findGoSpecEnd(lines: string[], startIdx: number): number {
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0,
+  };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  const maxScan = Math.min(lines.length, startIdx + 2000);
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanBracesOnLine(lines[i]!, state, "go");
+    braceDepth += scan.open - scan.close;
+    parenDepth += scan.openParen - scan.closeParen;
+    if (braceDepth <= 0 && parenDepth <= 0 && !state.inBlockComment && !state.inBacktick) {
+      return i + 1;
+    }
+  }
+  return startIdx + 1;
+}
+
 function extractGoSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
-  const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
-  const typeRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(struct|interface)\b/;
+  const funcRe = /^func\s+(?:\(([^)]+)\)\s*)?([A-Za-z_]\w*)/;
+  const typeGroupOpenRe = /^type\s*\(\s*(?:\/\/.*|\/\*.*\*\/\s*)?$/;
+  const singleTypeBlockRe =
+    /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?(struct|interface)\b/;
+  const singleTypeOtherRe =
+    /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?\S/;
+  const groupedTypeSpecRe =
+    /^[ \t]*([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(?:=\s*)?(?:(struct|interface)\b|(\S))/;
+
   const commentState: ScanState = {
     inBlockComment: false,
     templateExprStack: [],
     inBacktick: false,
   };
 
+  let inTypeGroup = false;
+  let groupParenDepth = 0;
+  let groupBraceDepth = 0;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const wasInComment = commentState.inBlockComment;
     const wasInBacktick = commentState.inBacktick;
-    scanBracesOnLine(line, commentState, "go");
-    if (wasInComment || wasInBacktick) continue;
+    const parenBefore = groupParenDepth;
+    const braceBefore = groupBraceDepth;
+
+    const scan = scanBracesOnLine(line, commentState, "go");
+    if (inTypeGroup) {
+      groupBraceDepth = Math.max(0, groupBraceDepth + scan.open - scan.close);
+      groupParenDepth = Math.max(0, groupParenDepth + scan.openParen - scan.closeParen);
+    }
+
+    if (wasInComment || wasInBacktick) {
+      if (inTypeGroup && groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
+      if (inTypeGroup && groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
+
+    if (inTypeGroup) {
+      if (parenBefore === 1 && braceBefore === 0 && !trimmed.startsWith(")")) {
+        const gm = groupedTypeSpecRe.exec(line);
+        if (gm && gm[1]) {
+          const kind = gm[2] ?? "type";
+          const endLine = gm[2]
+            ? findBraceBlockEnd(lines, i, "go")
+            : findGoSpecEnd(lines, i);
+          symbols.push({
+            kind,
+            name: gm[1],
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+        }
+      }
+      if (groupParenDepth === 0) {
+        inTypeGroup = false;
+      }
+      continue;
+    }
+
+    if (typeGroupOpenRe.test(trimmed)) {
+      inTypeGroup = true;
+      groupParenDepth = Math.max(1, scan.openParen - scan.closeParen);
+      groupBraceDepth = Math.max(0, scan.open - scan.close);
+      if (groupParenDepth === 0) inTypeGroup = false;
+      continue;
+    }
 
     const fm = funcRe.exec(line);
     if (fm && fm[2]) {
       const recv = fm[1]?.trim();
-      const name = recv ? `(${recv}) ${fm[2]}` : fm[2];
+      const recvType = recv ? formatGoReceiverType(recv) : "";
+      const name = recvType ? `${recvType}.${fm[2]}` : fm[2];
       symbols.push({
         kind: recv ? "method" : "function",
         name,
@@ -1189,13 +1943,26 @@ function extractGoSymbols(lines: string[]): SymbolEntry[] {
       });
       continue;
     }
-    const tm = typeRe.exec(line);
+
+    const tm = singleTypeBlockRe.exec(line);
     if (tm && tm[1] && tm[2]) {
       symbols.push({
         kind: tm[2],
         name: tm[1],
         startLine: i + 1,
         endLine: findBraceBlockEnd(lines, i, "go"),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const to = singleTypeOtherRe.exec(line);
+    if (to && to[1]) {
+      symbols.push({
+        kind: "type",
+        name: to[1],
+        startLine: i + 1,
+        endLine: findGoSpecEnd(lines, i),
         depth: 0,
       });
     }
@@ -1216,8 +1983,9 @@ function extractRustSymbols(lines: string[]): SymbolEntry[] {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const wasInComment = commentState.inBlockComment;
+    const wasInRaw = (commentState.rustRawHashes ?? -1) >= 0;
     scanBracesOnLine(line, commentState, "rust");
-    if (wasInComment) continue;
+    if (wasInComment || wasInRaw) continue;
 
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
@@ -1238,125 +2006,1006 @@ function extractRustSymbols(lines: string[]): SymbolEntry[] {
   return symbols;
 }
 
-function extractCLikeSymbols(lines: string[]): SymbolEntry[] {
-  const symbols: SymbolEntry[] = [];
-  const typeRe =
-    /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|sealed|data|open|export|partial)\s+)*(class|interface|enum|struct|record|protocol|namespace)\s+([A-Za-z_]\w*)/;
-  const kwFuncRe =
-    /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
-  // C / C++ / Java / C# functions and class methods (return-type + name + '(')
-  const cMethodRe =
-    /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|inline|constexpr|extern|async|synchronized|native|unsigned|signed|const)\s+)*(?:[A-Za-z_~][\w:<>,\[\]\s*&]*?\s+)([A-Za-z_~][\w:]*)\s*\([^;]*$/;
-  const excludedNames = new Set([
-    "if",
-    "for",
-    "while",
-    "switch",
-    "catch",
-    "else",
-    "return",
-    "sizeof",
-    "alignof",
-    "decltype",
-    "new",
-    "delete",
-    "throw",
-    "typedef",
-    "using",
-    "case",
-  ]);
+interface CLikeScanState {
+  inBlockComment: boolean;
+  rawStringDelim: string | null;
+  inVerbatimString: boolean;
+  inPreprocessorCont: boolean;
+}
 
-  const commentState: ScanState = {
+function scanCLikeLine(
+  line: string,
+  state: CLikeScanState,
+): {
+  code: string;
+  openBrace: number;
+  closeBrace: number;
+  openParen: number;
+  closeParen: number;
+  isPreprocessor: boolean;
+} {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+
+  if (state.inPreprocessorCont) {
+    const trimmedEnd = line.trimEnd();
+    state.inPreprocessorCont = trimmedEnd.endsWith("\\");
+    return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: true };
+  }
+
+  if (!state.inBlockComment && state.rawStringDelim === null && !state.inVerbatimString) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("#")) {
+      state.inPreprocessorCont = line.trimEnd().endsWith("\\");
+      return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: true };
+    }
+  }
+
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+
+  while (i < line.length) {
+    const ch = line[i]!;
+    const next = line[i + 1];
+
+    if (state.inBlockComment) {
+      if (ch === "*" && next === "/") {
+        state.inBlockComment = false;
+        code += " ";
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+
+    if (state.rawStringDelim !== null) {
+      const closeSeq = `)${state.rawStringDelim}"`;
+      if (ch === ")" && line.startsWith(closeSeq, i)) {
+        state.rawStringDelim = null;
+        code += '""';
+        i += closeSeq.length;
+      } else {
+        i++;
+      }
+      continue;
+    }
+
+    if (state.inVerbatimString) {
+      if (ch === '"' && next === '"') {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        state.inVerbatimString = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (inSingle) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+
+    if (inDouble) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      i++;
+      continue;
+    }
+
+    if (ch === "/" && next === "/") break;
+    if (ch === "/" && next === "*") {
+      state.inBlockComment = true;
+      code += " ";
+      i += 2;
+      continue;
+    }
+
+    // C++11 raw string literal: R"delim(...)delim"
+    if (ch === "R" && next === '"' && (i === 0 || !/\w/.test(line[i - 1]!))) {
+      const parenPos = line.indexOf("(", i + 2);
+      if (parenPos >= 0 && /^[A-Za-z0-9_]{0,16}$/.test(line.slice(i + 2, parenPos))) {
+        state.rawStringDelim = line.slice(i + 2, parenPos);
+        code += '""';
+        i = parenPos + 1;
+        continue;
+      }
+    }
+
+    // C# verbatim string: @"..." / $@"..." / @$"..."
+    if (
+      (ch === "@" && next === '"') ||
+      ((ch === "$" && next === "@" && line[i + 2] === '"') ||
+        (ch === "@" && next === "$" && line[i + 2] === '"'))
+    ) {
+      state.inVerbatimString = true;
+      code += '""';
+      i += ch === "@" && next === '"' ? 2 : 3;
+      continue;
+    }
+
+    if (ch === "'") {
+      inSingle = true;
+      code += "''";
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inDouble = true;
+      code += '""';
+      i++;
+      continue;
+    }
+
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    i++;
+  }
+
+  return { code, openBrace, closeBrace, openParen, closeParen, isPreprocessor: false };
+}
+
+function findCLikeBlockEnd(
+  lines: string[],
+  startIdx: number,
+  startFromLineIdx = startIdx,
+  startFromCol = 0,
+): { endLine: number; hasBrace: boolean; closeLineCode: string } {
+  const state: CLikeScanState = {
     inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false,
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false,
   };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, startIdx + 2000);
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!;
-    const wasInComment = commentState.inBlockComment;
-    scanBracesOnLine(line, commentState, "c");
-    if (wasInComment) continue;
+  for (let i = startFromLineIdx; i < maxScan; i++) {
+    const rawLine = i === startFromLineIdx ? lines[i]!.slice(startFromCol) : lines[i]!;
+    const scan = scanCLikeLine(rawLine, state);
+    if (scan.isPreprocessor) continue;
 
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("#")) {
-      continue;
+    if (scan.openBrace > 0) seenOpen = true;
+    braceDepth += scan.openBrace - scan.closeBrace;
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (seenOpen && braceDepth <= 0) {
+      return { endLine: i + 1, hasBrace: true, closeLineCode: scan.code };
     }
-
-    const tm = typeRe.exec(line);
-    if (tm && tm[2] && tm[3]) {
-      const indented = (tm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: tm[2],
-        name: tm[3],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0,
-      });
-      continue;
+    if (!seenOpen && parenDepth === 0 && scan.code.trimEnd().endsWith(";")) {
+      return { endLine: i + 1, hasBrace: false, closeLineCode: scan.code };
     }
-    const fm = kwFuncRe.exec(line);
-    if (fm && fm[2]) {
-      const indented = (fm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: indented ? "method" : "function",
-        name: fm[2],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0,
-      });
-      continue;
+    if (!seenOpen && i > startIdx + 40) {
+      return { endLine: startIdx + 1, hasBrace: false, closeLineCode: "" };
     }
+  }
 
-    // Match C/C++/Java/C# function/method definitions that open a brace block
-    const cm = cMethodRe.exec(line);
-    if (cm && cm[2] && !excludedNames.has(cm[2]) && !trimmed.includes("=")) {
-      const { hasBrace } = hasArrowOrBraceWithin(lines, i, 8);
-      if (hasBrace) {
-        const indented = (cm[1]?.length ?? 0) > 0;
-        symbols.push({
-          kind: indented ? "method" : "function",
-          name: cm[2],
-          startLine: i + 1,
-          endLine: findBraceBlockEnd(lines, i, "c"),
-          depth: indented ? 1 : 0,
-        });
+  return {
+    endLine: seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1,
+    hasBrace: seenOpen,
+    closeLineCode: "",
+  };
+}
+
+function findCLikeCallableBodyEnd(
+  lines: string[],
+  startIdx: number,
+  openParenColOnCode: number,
+  firstLineCode: string,
+): number | null {
+  const state: CLikeScanState = {
+    inBlockComment: false,
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false,
+  };
+  let parenDepth = 0;
+  let closedParams = false;
+  let inInitList = false;
+  let initBraceDepth = 0;
+  let sawFatArrow = false;
+  const maxHeaderLine = Math.min(lines.length, startIdx + 16);
+
+  for (let i = startIdx; i < maxHeaderLine; i++) {
+    const code =
+      i === startIdx
+        ? firstLineCode.slice(openParenColOnCode)
+        : scanCLikeLine(lines[i]!, state).code;
+
+    for (let c = 0; c < code.length; c++) {
+      const ch = code[c]!;
+      const next = code[c + 1];
+
+      if (!closedParams) {
+        if (ch === "(") parenDepth++;
+        else if (ch === ")") {
+          parenDepth--;
+          if (parenDepth <= 0) {
+            closedParams = true;
+            parenDepth = 0;
+          }
+        }
+        continue;
+      }
+
+      if (sawFatArrow) {
+        if (ch === "{") {
+          return findCLikeBlockEnd(lines, startIdx, i, 0).endLine;
+        }
+        if (ch === "(") parenDepth++;
+        else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+        else if (ch === ";" && parenDepth === 0) return i + 1;
+        continue;
+      }
+
+      if (ch === "=" && next === ">") {
+        sawFatArrow = true;
+        c++;
+        continue;
+      }
+
+      if (ch === ":" && next !== ":" && !inInitList) {
+        inInitList = true;
+        continue;
+      }
+
+      if (inInitList) {
+        if (ch === "(") {
+          parenDepth++;
+          continue;
+        }
+        if (ch === ")") {
+          parenDepth = Math.max(0, parenDepth - 1);
+          continue;
+        }
+        if (ch === "{") {
+          // Member brace-initializer `member_{0}` follows an identifier or `>`, whereas body `{` follows `)`, `}`, whitespace, or start of line
+          let prevIdx = c - 1;
+          while (prevIdx >= 0 && /\s/.test(code[prevIdx]!)) prevIdx--;
+          const prevCh = prevIdx >= 0 ? code[prevIdx]! : "";
+          if (initBraceDepth > 0 || /[\w>]/.test(prevCh)) {
+            initBraceDepth++;
+            continue;
+          }
+          // Standalone `{` opens the constructor/method body! Receive remaining slice on line `i`
+          const rawPos = lines[i]!.lastIndexOf("{");
+          return findCLikeBlockEnd(lines, startIdx, i, Math.max(0, rawPos)).endLine;
+        }
+        if (ch === "}" && initBraceDepth > 0) {
+          initBraceDepth--;
+          continue;
+        }
+        if (ch === ";" && parenDepth === 0 && initBraceDepth === 0) {
+          return null;
+        }
+        continue;
+      }
+
+      if (ch === ";") {
+        return null;
+      }
+      if (ch === "{") {
+        const firstBraceCol = i === startIdx ? lines[i]!.indexOf("{") : lines[i]!.indexOf("{");
+        return findCLikeBlockEnd(lines, startIdx, i, Math.max(0, firstBraceCol)).endLine;
       }
     }
   }
+
+  return null;
+}
+
+const CLIKE_EXCLUDED_NAMES = new Set([
+  "if",
+  "for",
+  "while",
+  "switch",
+  "catch",
+  "else",
+  "do",
+  "try",
+  "lock",
+  "using",
+  "fixed",
+  "checked",
+  "unchecked",
+  "unsafe",
+  "foreach",
+  "when",
+  "return",
+  "sizeof",
+  "alignof",
+  "decltype",
+  "typeof",
+  "nameof",
+  "static_assert",
+  "assert",
+  "new",
+  "delete",
+  "throw",
+  "typedef",
+  "case",
+  "requires",
+  "noexcept",
+]);
+
+const CLIKE_MODIFIERS = new Set([
+  "public",
+  "private",
+  "protected",
+  "internal",
+  "file",
+  "static",
+  "final",
+  "abstract",
+  "sealed",
+  "override",
+  "virtual",
+  "inline",
+  "__inline",
+  "__forceinline",
+  "constexpr",
+  "consteval",
+  "constinit",
+  "explicit",
+  "extern",
+  "async",
+  "synchronized",
+  "native",
+  "unsafe",
+  "readonly",
+  "new",
+  "partial",
+  "friend",
+  "open",
+  "suspend",
+  "mutating",
+]);
+
+function stripInlineTemplatePrefix(code: string): { rest: string; stripped: boolean } {
+  const m = /^\s*template\s*</.exec(code);
+  if (!m) return { rest: code, stripped: false };
+  let angle = 0;
+  let paren = 0;
+  for (let i = m[0].length - 1; i < code.length; i++) {
+    const ch = code[i]!;
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "<" && paren === 0) angle++;
+    else if (ch === ">" && paren === 0) {
+      angle--;
+      if (angle === 0) {
+        return { rest: code.slice(i + 1), stripped: true };
+      }
+    }
+  }
+  return { rest: "", stripped: true };
+}
+
+function matchCLikeCallableHeader(
+  code: string,
+  inTypeScope: boolean,
+  currentTypeName: string | null,
+): { name: string; openParenCol: number } | null {
+  const trimmed = code.trimStart();
+  if (
+    !trimmed ||
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("@") ||
+    trimmed.startsWith("}") ||
+    trimmed.startsWith(";") ||
+    trimmed.startsWith(":")
+  ) {
+    return null;
+  }
+
+  // Locate parameter-list `(` at angleDepth === 0 && parenDepth === 0, skipping C# tuple return types like `public (int, string) Foo(`
+  let angle = 0;
+  let paren = 0;
+  let candParenCol = -1;
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i]!;
+    if (ch === "<" && paren === 0) angle++;
+    else if (ch === ">" && paren === 0 && angle > 0) angle--;
+    else if (ch === "(") {
+      if (paren === 0 && angle === 0) {
+        // Check if preceded by an identifier or generic `<...>` (not a modifier like `public (int, string)`)
+        const before = code.slice(0, i).trimEnd();
+        const wordBefore = /([A-Za-z_~]\w*)\s*(?:<[^>]*>\s*)?$/.exec(before);
+        if (wordBefore && wordBefore[1] && !CLIKE_MODIFIERS.has(wordBefore[1])) {
+          candParenCol = i;
+          break;
+        }
+      }
+      paren++;
+    } else if (ch === ")") {
+      paren = Math.max(0, paren - 1);
+    }
+  }
+
+  if (candParenCol < 0) return null;
+
+  let head = code.slice(0, candParenCol).trimEnd();
+  // Strip optional generic type parameter list on method name (`Parse<T>` or `Get<T, U>`)
+  if (head.endsWith(">")) {
+    let d = 0;
+    for (let k = head.length - 1; k >= 0; k--) {
+      if (head[k] === ">") d++;
+      else if (head[k] === "<") {
+        d--;
+        if (d === 0) {
+          head = head.slice(0, k).trimEnd();
+          break;
+        }
+      }
+    }
+  }
+
+  // Match C++ `operator==`, `operator()`, etc. or qualified/destructor identifier `[Ns::][~]Name`
+  let rawName = "";
+  let prefix = "";
+  const opMatch = /^(.*?\s)(operator\s*(?:\(\)|\[\]|[+\-*/%^&|~!=<>]+))$/.exec(head);
+  if (opMatch && opMatch[2]) {
+    prefix = opMatch[1]!.trim();
+    rawName = opMatch[2].replace(/\s+/g, "");
+  } else {
+    const nameMatch = /^([\s\S]*?)((?:[A-Za-z_]\w*::)*~?[A-Za-z_]\w*)$/.exec(head);
+    if (!nameMatch || !nameMatch[2]) return null;
+    prefix = nameMatch[1]!.trim();
+    rawName = nameMatch[2];
+  }
+
+  const parts = rawName.split("::");
+  const shortName = parts[parts.length - 1]!.replace(/^~/, "");
+  if (CLIKE_EXCLUDED_NAMES.has(rawName) || CLIKE_EXCLUDED_NAMES.has(shortName)) {
+    return null;
+  }
+
+  // Strip C++11 `[[...]]` attributes and leading modifiers from prefix
+  let rem = prefix.replace(/\[\[[^\]]*\]\]\s*/g, "").trim();
+  while (rem) {
+    const modMatch = /^([A-Za-z_]\w*)\b\s*(?:"C"\s*)?/.exec(rem);
+    if (modMatch && modMatch[1] && CLIKE_MODIFIERS.has(modMatch[1])) {
+      rem = rem.slice(modMatch[0].length).trimStart();
+      continue;
+    }
+    break;
+  }
+
+  if (rem.length === 0) {
+    // Callable without return type: destructor (`~Foo` / `A::~A`) or constructor (`Foo` inside `Foo` or `Foo::Foo`)
+    const isDestructor = rawName.startsWith("~") || rawName.includes("::~");
+    const isQualifiedCtor =
+      parts.length >= 2 && parts[parts.length - 1] === parts[parts.length - 2];
+    const isInClassCtor = inTypeScope && currentTypeName !== null && rawName === currentTypeName;
+    if (!isDestructor && !isQualifiedCtor && !isInClassCtor) {
+      return null;
+    }
+  } else {
+    if (/[=;{}]|&&|\|\|/.test(rem)) return null;
+    if (!/[A-Za-z_)]/.test(rem)) return null;
+    if (CLIKE_EXCLUDED_NAMES.has(rem)) return null;
+  }
+
+  return { name: rawName, openParenCol: candParenCol };
+}
+
+function extractCLikeSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: CLikeScanState = {
+    inBlockComment: false,
+    rawStringDelim: null,
+    inVerbatimString: false,
+    inPreprocessorCont: false,
+  };
+
+  const namespaceRe =
+    /^\s*(?:inline\s+)?namespace\s+([A-Za-z_][\w:.]*)\s*(\{|;|$)/;
+  const typedefBlockRe =
+    /^\s*typedef\s+(struct|enum|union)(?:\s+([A-Za-z_]\w*))?\s*\{/;
+  const typeRe =
+    /^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|private|protected|internal|file|static|final|abstract|sealed|data|open|export|partial|readonly|unsafe|ref)\s+)*(?:(record)\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)|(enum)\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)|(class|interface|struct|protocol)\s+([A-Za-z_]\w*))/;
+  const bareForwardDeclRe = /^\s*(?:class|struct)\s+[A-Za-z_]\w*\s*;/;
+  const kwFuncRe =
+    /^\s*(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
+
+  const activeContainers: Array<{
+    kind: "namespace" | "type";
+    name: string;
+    endLine: number;
+  }> = [];
+  let bodyEndLine = -1;
+  let pendingTemplateStartLine: number | null = null;
+  let templateAngleDepth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = i + 1;
+    while (
+      activeContainers.length > 0 &&
+      ln > activeContainers[activeContainers.length - 1]!.endLine
+    ) {
+      activeContainers.pop();
+    }
+
+    const wasInSpecial =
+      state.inBlockComment ||
+      state.rawStringDelim !== null ||
+      state.inVerbatimString ||
+      state.inPreprocessorCont;
+    const scan = scanCLikeLine(lines[i]!, state);
+
+    if (wasInSpecial || scan.isPreprocessor) continue;
+    const rawCode = scan.code;
+    const trimmed = rawCode.trim();
+    if (!trimmed) continue;
+
+    // Multi-line `template <...>` parameter list continuation
+    if (templateAngleDepth > 0) {
+      for (let c = 0; c < rawCode.length; c++) {
+        if (rawCode[c] === "<") templateAngleDepth++;
+        else if (rawCode[c] === ">") {
+          templateAngleDepth--;
+          if (templateAngleDepth === 0) {
+            const after = rawCode.slice(c + 1).trim();
+            if (!after) break;
+          }
+        }
+      }
+      if (templateAngleDepth > 0 || trimmed.endsWith(">")) continue;
+    }
+
+    if (ln <= bodyEndLine) continue;
+    if (
+      activeContainers.length > 0 &&
+      ln === activeContainers[activeContainers.length - 1]!.endLine &&
+      trimmed.startsWith("}")
+    ) {
+      continue;
+    }
+
+    let code = rawCode;
+    if (/^\s*template\s*</.test(code)) {
+      const tpl = stripInlineTemplatePrefix(code);
+      if (pendingTemplateStartLine === null) {
+        pendingTemplateStartLine = ln;
+      }
+      if (!tpl.rest.trim()) {
+        // Count unclosed `<` if template parameters span multiple lines
+        if (tpl.rest === "" && !code.includes(">")) {
+          let d = 0;
+          for (const ch of code) {
+            if (ch === "<") d++;
+            else if (ch === ">") d = Math.max(0, d - 1);
+          }
+          templateAngleDepth = d;
+        }
+        continue;
+      }
+      code = tpl.rest;
+    }
+
+    const symStartLine = pendingTemplateStartLine ?? ln;
+    const curDepth = Math.min(2, activeContainers.length);
+    const inTypeScope = activeContainers.some((c) => c.kind === "type");
+    const currentTypeName =
+      [...activeContainers].reverse().find((c) => c.kind === "type")?.name ?? null;
+
+    // 1. C++ / C# namespace (brace-scoped or C# file-scoped `;`)
+    const nm = namespaceRe.exec(code);
+    if (nm && nm[1]) {
+      pendingTemplateStartLine = null;
+      const normalizedNs = nm[1];
+      if (nm[2] === ";") {
+        symbols.push({
+          kind: "namespace",
+          name: normalizedNs,
+          startLine: symStartLine,
+          endLine: ln,
+          depth: curDepth,
+        });
+      } else {
+        const blk = findCLikeBlockEnd(lines, i);
+        symbols.push({
+          kind: "namespace",
+          name: normalizedNs,
+          startLine: symStartLine,
+          endLine: blk.endLine,
+          depth: curDepth,
+        });
+        if (blk.hasBrace && blk.endLine > ln) {
+          activeContainers.push({
+            kind: "namespace",
+            name: normalizedNs,
+            endLine: blk.endLine,
+          });
+        }
+      }
+      continue;
+    }
+
+    // 2. C `typedef struct/enum/union { ... } Alias;`
+    const tdm = typedefBlockRe.exec(code);
+    if (tdm && tdm[1]) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      const aliasMatch = /\}\s*([A-Za-z_]\w*)\s*;/.exec(blk.closeLineCode);
+      const tdName = aliasMatch?.[1] || tdm[2];
+      if (tdName) {
+        symbols.push({
+          kind: tdm[1],
+          name: tdName,
+          startLine: symStartLine,
+          endLine: blk.endLine,
+          depth: curDepth,
+        });
+      }
+      continue;
+    }
+
+    // 3. Skip bare C/C++ forward declarations (`class Foo;`, `struct Bar;`)
+    if (bareForwardDeclRe.test(code)) {
+      pendingTemplateStartLine = null;
+      continue;
+    }
+
+    // 4. `class` / `struct` / `enum` / `interface` / `record` / `protocol`
+    const tm = typeRe.exec(code);
+    const typeKind = tm?.[1] || tm?.[3] || tm?.[5];
+    const typeName = tm?.[2] || tm?.[4] || tm?.[6];
+    if (typeKind && typeName) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      symbols.push({
+        kind: typeKind,
+        name: typeName,
+        startLine: symStartLine,
+        endLine: blk.endLine,
+        depth: curDepth,
+      });
+      if (blk.hasBrace && blk.endLine > ln && typeKind !== "enum") {
+        activeContainers.push({
+          kind: "type",
+          name: typeName,
+          endLine: blk.endLine,
+        });
+      }
+      continue;
+    }
+
+    // 5. Kotlin `fun` / Swift `func`
+    const fm = kwFuncRe.exec(code);
+    if (fm && fm[1]) {
+      pendingTemplateStartLine = null;
+      const blk = findCLikeBlockEnd(lines, i);
+      symbols.push({
+        kind: inTypeScope ? "method" : "function",
+        name: fm[1],
+        startLine: symStartLine,
+        endLine: blk.endLine,
+        depth: curDepth,
+      });
+      if (blk.hasBrace && blk.endLine > ln) {
+        bodyEndLine = blk.endLine;
+      }
+      continue;
+    }
+
+    // 6. C / C++ / C# / Java function, method, constructor, destructor definitions
+    const cm = matchCLikeCallableHeader(code, inTypeScope, currentTypeName);
+    if (cm) {
+      const endLine = findCLikeCallableBodyEnd(lines, i, cm.openParenCol, code);
+      if (endLine !== null) {
+        pendingTemplateStartLine = null;
+        const isMethod = inTypeScope || cm.name.includes("::");
+        symbols.push({
+          kind: isMethod ? "method" : "function",
+          name: cm.name,
+          startLine: symStartLine,
+          endLine,
+          depth: curDepth,
+        });
+        bodyEndLine = Math.max(bodyEndLine, endLine);
+        continue;
+      }
+    }
+
+    if (!trimmed.startsWith("[") && !trimmed.startsWith("@")) {
+      pendingTemplateStartLine = null;
+    }
+  }
+
   return symbols;
+}
+
+interface ShellScanState {
+  inSingleQuote: boolean;
+  inDoubleQuote: boolean;
+  heredocs: Array<{ delim: string; indented: boolean }>;
+}
+
+function scanShellLine(
+  line: string,
+  state: ShellScanState,
+): {
+  code: string;
+  openBrace: number;
+  closeBrace: number;
+  openParen: number;
+  closeParen: number;
+  wasInHeredocOrQuote: boolean;
+} {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+
+  if (state.heredocs.length > 0) {
+    const cur = state.heredocs[0]!;
+    const candidate = cur.indented ? line.trim() : line.trimEnd();
+    if (candidate === cur.delim) {
+      state.heredocs.shift();
+    }
+    return {
+      code,
+      openBrace,
+      closeBrace,
+      openParen,
+      closeParen,
+      wasInHeredocOrQuote: true,
+    };
+  }
+
+  const wasInQuote = state.inSingleQuote || state.inDoubleQuote;
+  let arithDepth = 0;
+  let i = 0;
+
+  while (i < line.length) {
+    const ch = line[i]!;
+    const next = line[i + 1];
+
+    if (state.inSingleQuote) {
+      if (ch === "'") state.inSingleQuote = false;
+      i++;
+      continue;
+    }
+
+    if (state.inDoubleQuote) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') state.inDoubleQuote = false;
+      i++;
+      continue;
+    }
+
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]!))) {
+      break;
+    }
+
+    if (ch === "'") {
+      state.inSingleQuote = true;
+      code += "''";
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      state.inDoubleQuote = true;
+      code += '""';
+      i++;
+      continue;
+    }
+
+    if (ch === "(" && next === "(") {
+      arithDepth++;
+      openParen += 2;
+      code += "((";
+      i += 2;
+      continue;
+    }
+    if (ch === ")" && next === ")" && arithDepth > 0) {
+      arithDepth--;
+      closeParen += 2;
+      code += "))";
+      i += 2;
+      continue;
+    }
+
+    if (arithDepth === 0 && ch === "<" && next === "<" && line[i + 2] !== "<") {
+      const hm = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/.exec(
+        line.slice(i),
+      );
+      const delim = hm?.[2] || hm?.[3] || hm?.[4];
+      if (hm && delim) {
+        state.heredocs.push({ delim, indented: hm[1] === "-" });
+        code += "<<";
+        i += hm[0].length;
+        continue;
+      }
+    }
+
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    i++;
+  }
+
+  return {
+    code,
+    openBrace,
+    closeBrace,
+    openParen,
+    closeParen,
+    wasInHeredocOrQuote: wasInQuote,
+  };
+}
+
+function findShellFunctionEnd(
+  lines: string[],
+  startIdx: number,
+  bodyKind: "{" | "(",
+  openLineIdx: number,
+): number {
+  const state: ShellScanState = {
+    inSingleQuote: false,
+    inDoubleQuote: false,
+    heredocs: [],
+  };
+  let depth = 0;
+  let seenOpen = false;
+  const maxScan = Math.min(lines.length, startIdx + 2000);
+
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanShellLine(lines[i]!, state);
+    if (i < openLineIdx) continue;
+    if (bodyKind === "{") {
+      if (scan.openBrace > 0) seenOpen = true;
+      depth += scan.openBrace - scan.closeBrace;
+    } else {
+      let openP = scan.openParen;
+      let closeP = scan.closeParen;
+      if (i === startIdx && openLineIdx === startIdx) {
+        // Subtract `()` signature parens if present on the header line before `(` body
+        const sigParens = /\(\s*\)/.test(scan.code) ? 1 : 0;
+        openP = Math.max(0, openP - sigParens);
+        closeP = Math.max(0, closeP - sigParens);
+      }
+      if (openP > 0) seenOpen = true;
+      depth += openP - closeP;
+    }
+    if (seenOpen && depth <= 0 && state.heredocs.length === 0) {
+      return i + 1;
+    }
+  }
+
+  return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
 }
 
 function extractShellSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
-  const re = /^(?:function\s+([A-Za-z_][\w-]*)\s*(?:\(\))?|([A-Za-z_][\w-]*)\s*\(\))\s*\{/;
+  const state: ShellScanState = {
+    inSingleQuote: false,
+    inDoubleQuote: false,
+    heredocs: [],
+  };
+  const sameLineFnRe =
+    /^[ \t]*(?:function\s+([A-Za-z_][\w.:-]*)(?:\s*\(\s*\))?|([A-Za-z_][\w.:-]*)\s*\(\s*\))\s*([{(])/;
+  const headerOnlyFnRe =
+    /^[ \t]*(?:function\s+([A-Za-z_][\w.:-]*)(?:\s*\(\s*\))?|([A-Za-z_][\w.:-]*)\s*\(\s*\))\s*$/;
+  const shellReserved = new Set([
+    "if",
+    "for",
+    "while",
+    "until",
+    "case",
+    "select",
+    "function",
+    "time",
+    "coproc",
+  ]);
+
   for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]!);
-    if (!m) continue;
-    const name = m[1] || m[2];
-    if (!name) continue;
-    symbols.push({
-      kind: "function",
-      name,
-      startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "shell"),
-      depth: 0,
-    });
+    const scan = scanShellLine(lines[i]!, state);
+    if (scan.wasInHeredocOrQuote) continue;
+    const code = scan.code;
+    if (!code.trim()) continue;
+
+    const mSame = sameLineFnRe.exec(code);
+    if (mSame) {
+      const fnName = mSame[1] || mSame[2];
+      const opener = mSame[3] as "{" | "(";
+      if (fnName && !shellReserved.has(fnName)) {
+        symbols.push({
+          kind: "function",
+          name: fnName,
+          startLine: i + 1,
+          endLine: findShellFunctionEnd(lines, i, opener, i),
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const mHead = headerOnlyFnRe.exec(code);
+    if (mHead) {
+      const fnName = mHead[1] || mHead[2];
+      if (fnName && !shellReserved.has(fnName)) {
+        for (let k = i + 1; k < Math.min(lines.length, i + 5); k++) {
+          const nextTrim = lines[k]!.trim();
+          if (!nextTrim || nextTrim.startsWith("#")) continue;
+          if (nextTrim.startsWith("{") || nextTrim.startsWith("(")) {
+            const opener = nextTrim[0] as "{" | "(";
+            symbols.push({
+              kind: "function",
+              name: fnName,
+              startLine: i + 1,
+              endLine: findShellFunctionEnd(lines, i, opener, k),
+              depth: 0,
+            });
+          }
+          break;
+        }
+      }
+    }
   }
+
   return symbols;
 }
 
 function extractMarkdownSymbols(lines: string[]): SymbolEntry[] {
   const raw: Array<{ level: number; name: string; startLine: number }> = [];
-  let inFence = false;
+  let fenceChar: "`" | "~" | null = null;
+  let fenceLen = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    if (/^\s*(`{3,}|~{3,})/.test(line)) {
-      inFence = !inFence;
-      continue;
+    const fenceMatch = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenceMatch) {
+      const seq = fenceMatch[1]!;
+      const ch = seq[0] as "`" | "~";
+      const rest = fenceMatch[2] ?? "";
+      if (fenceChar === null) {
+        // CommonMark: backtick fence info strings cannot contain backticks (e.g. inline ```code```)
+        if (ch === "~" || !rest.includes("`")) {
+          fenceChar = ch;
+          fenceLen = seq.length;
+          continue;
+        }
+      } else if (ch === fenceChar && seq.length >= fenceLen && /^[ \t]*$/.test(rest)) {
+        fenceChar = null;
+        fenceLen = 0;
+        continue;
+      }
     }
-    if (inFence) continue;
+    if (fenceChar !== null) continue;
     const m = /^(#{1,4})\s+(.+?)\s*#*$/.exec(line);
     if (m && m[1] && m[2]) {
       raw.push({ level: m[1].length, name: m[2], startLine: i + 1 });
@@ -1384,61 +3033,333 @@ function extractMarkdownSymbols(lines: string[]): SymbolEntry[] {
 function extractJsonYamlSymbols(lines: string[], isJson: boolean): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   if (isJson) {
-    // Detect top-level key indentation dynamically (supports 2-space, 4-space, or tabs)
-    let keyIndent: string | null = null;
+    // Track structural JSON container depth (`{` vs `[`) outside strings so 0-indent,
+    // 2/4-space, and tab-formatted root objects emit exact root keys while root arrays skip element duplicates.
+    const stack: Array<"{" | "["> = [];
+    const activeSymStack: Array<SymbolEntry | null> = [];
+    let inString = false;
+    let escape = false;
+
     for (let i = 0; i < lines.length; i++) {
-      const m = /^([ \t]+)"([^"]+)"\s*:/.exec(lines[i]!);
-      if (m && m[1] && m[2]) {
-        if (keyIndent === null) {
-          keyIndent = m[1];
+      const line = lines[i]!;
+      for (let c = 0; c < line.length; c++) {
+        const ch = line[c]!;
+        if (escape) {
+          escape = false;
+          continue;
         }
-        if (m[1] === keyIndent) {
-          symbols.push({
-            kind: "key",
-            name: m[2],
-            startLine: i + 1,
-            endLine: i + 1,
-            depth: 0,
-          });
+        if (inString) {
+          if (ch === "\\") escape = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        // JSONC comments
+        if (ch === "/" && line[c + 1] === "/") break;
+        if (ch === '"') {
+          if (stack.length === 1 && stack[0] === "{") {
+            let endQuote = c + 1;
+            let strEsc = false;
+            while (endQuote < line.length) {
+              const sc = line[endQuote]!;
+              if (strEsc) strEsc = false;
+              else if (sc === "\\") strEsc = true;
+              else if (sc === '"') break;
+              endQuote++;
+            }
+            if (endQuote < line.length) {
+              const keyName = line.slice(c + 1, endQuote);
+              let colonIdx = endQuote + 1;
+              while (colonIdx < line.length && /\s/.test(line[colonIdx]!)) {
+                colonIdx++;
+              }
+              if (line[colonIdx] === ":") {
+                if (activeSymStack[0]) {
+                  activeSymStack[0].endLine = Math.max(
+                    activeSymStack[0].startLine,
+                    i,
+                  );
+                }
+                const entry: SymbolEntry = {
+                  kind: "key",
+                  name: keyName,
+                  startLine: i + 1,
+                  endLine: i + 1,
+                  depth: 0,
+                };
+                symbols.push(entry);
+                activeSymStack[0] = entry;
+                c = colonIdx;
+                continue;
+              }
+            }
+          }
+          inString = true;
+          continue;
+        }
+        if (ch === "{" || ch === "[") {
+          stack.push(ch);
+          if (stack.length === 1) activeSymStack[0] = null;
+        } else if (ch === "}" || ch === "]") {
+          if (stack.length === 1 && activeSymStack[0]) {
+            activeSymStack[0].endLine = Math.max(
+              activeSymStack[0].startLine,
+              i > activeSymStack[0].startLine - 1 ? i : i + 1,
+            );
+            activeSymStack[0] = null;
+          }
+          stack.pop();
+        } else if (ch === "," && stack.length === 1 && activeSymStack[0]) {
+          activeSymStack[0].endLine = i + 1;
+          activeSymStack[0] = null;
         }
       }
     }
-    for (let idx = 0; idx < symbols.length; idx++) {
-      const cur = symbols[idx]!;
-      const nextStart =
-        idx + 1 < symbols.length ? symbols[idx + 1]!.startLine - 1 : lines.length - 1;
-      let endLine = Math.max(cur.startLine, nextStart);
-      while (endLine > cur.startLine && /^\s*[}\]]?,?\s*$/.test(lines[endLine - 1] ?? "") && idx === symbols.length - 1) {
-        endLine--;
-      }
-      cur.endLine = endLine;
+    if (activeSymStack[0]) {
+      activeSymStack[0].endLine = Math.max(
+        activeSymStack[0].startLine,
+        lines.length,
+      );
     }
     return symbols;
   }
 
-  // YAML top-level keys
-  const re = /^([A-Za-z0-9_.-]+)\s*:/;
+  // YAML outlining with depth-1 section children and block-scalar (`|`, `>`, `|-`, `>+`) skipping
+  const YAML_SECTION_PARENTS = new Set([
+    "jobs",
+    "services",
+    "packages",
+    "paths",
+    "components",
+    "environments",
+    "workflows",
+    "stages",
+    "pipelines",
+    "containers",
+    "volumes",
+    "networks",
+    "resources",
+    "definitions",
+    "schemas",
+    "scripts",
+    "tasks",
+    "targets",
+    "profiles",
+    "spec",
+  ]);
+  const yamlKeyRe =
+    /^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_./{}-]+))\s*:(?:\s*(?:#.*)?$|\s+([\s\S]*))$/;
+  const blockScalarTailRe =
+    /^(?:(?:![^\s]+|&[^\s]+)\s+)*[|>](?:[+-]|\d+[+-]?|[+-]\d+)?(?:\s+#.*|\s*)$/;
+
+  interface YamlRawEntry {
+    lineNum: number;
+    indent: number;
+    keyName: string;
+    hasInlineScalarValue: boolean;
+    isDocBoundary?: boolean;
+  }
+
+  const rawEntries: YamlRawEntry[] = [];
+  let blockScalarBaseIndent: number | null = null;
+  let flowDepth = 0;
+  let multiQuote: '"' | "'" | null = null;
+
   for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]!);
-    if (m && m[1]) {
-      symbols.push({
-        kind: "key",
-        name: m[1],
-        startLine: i + 1,
-        endLine: i + 1,
-        depth: 0,
+    const line = lines[i]!;
+    const trimmed = line.trim();
+
+    let indent = 0;
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] === " ") indent += 1;
+      else if (line[c] === "\t") indent += 2;
+      else break;
+    }
+
+    if (blockScalarBaseIndent !== null) {
+      if (!trimmed) continue;
+      if (indent > blockScalarBaseIndent) continue;
+      blockScalarBaseIndent = null;
+    }
+
+    if (multiQuote !== null) {
+      for (let c = 0; c < line.length; c++) {
+        if (multiQuote === '"' && line[c] === "\\") {
+          c++;
+          continue;
+        }
+        if (multiQuote === "'" && line[c] === "'" && line[c + 1] === "'") {
+          c++;
+          continue;
+        }
+        if (line[c] === multiQuote) {
+          multiQuote = null;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    if (indent === 0 && /^(?:---|\.\.\.)(?:\s+#.*|\s*)$/.test(trimmed)) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent: 0,
+        keyName: "",
+        hasInlineScalarValue: false,
+        isDocBoundary: true,
+      });
+      flowDepth = 0;
+      continue;
+    }
+
+    const wasInFlow = flowDepth > 0;
+    const afterIndent = line.slice(
+      /^[ \t]*/.exec(line)?.[0].length ?? 0,
+    );
+
+    // Check `- |` or `- run: |` sequence block scalars before flow scanning
+    if (!wasInFlow && afterIndent.startsWith("-")) {
+      const seqRest = afterIndent.slice(1).trimStart();
+      if (blockScalarTailRe.test(seqRest)) {
+        blockScalarBaseIndent = indent;
+        continue;
+      }
+      const seqKeyMatch = yamlKeyRe.exec(seqRest);
+      if (seqKeyMatch && blockScalarTailRe.test((seqKeyMatch[4] ?? "").trim())) {
+        blockScalarBaseIndent = indent;
+        continue;
+      }
+    }
+
+    let matchedKey: string | undefined;
+    let inlineTail = "";
+    if (!wasInFlow && !afterIndent.startsWith("-")) {
+      const km = yamlKeyRe.exec(afterIndent);
+      matchedKey = km?.[1] || km?.[2] || km?.[3];
+      inlineTail = (km?.[4] ?? "").trim();
+    }
+
+    if (matchedKey && blockScalarTailRe.test(inlineTail)) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent,
+        keyName: matchedKey,
+        hasInlineScalarValue: true,
+      });
+      blockScalarBaseIndent = indent;
+      continue;
+    }
+
+    // Update flow depth (`{}` / `[]`) and multiline quote state across the line
+    let lineQuote: '"' | "'" | null = null;
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c]!;
+      if (lineQuote) {
+        if (lineQuote === '"' && ch === "\\") {
+          c++;
+          continue;
+        }
+        if (lineQuote === "'" && ch === "'" && line[c + 1] === "'") {
+          c++;
+          continue;
+        }
+        if (ch === lineQuote) lineQuote = null;
+        continue;
+      }
+      if (ch === "#" && (c === 0 || /\s/.test(line[c - 1]!))) break;
+      if (ch === '"' || ch === "'") {
+        lineQuote = ch;
+        continue;
+      }
+      if (ch === "{" || ch === "[") flowDepth++;
+      else if (ch === "}" || ch === "]") flowDepth = Math.max(0, flowDepth - 1);
+    }
+    if (lineQuote !== null) {
+      multiQuote = lineQuote;
+    }
+
+    if (matchedKey) {
+      rawEntries.push({
+        lineNum: i + 1,
+        indent,
+        keyName: matchedKey,
+        hasInlineScalarValue: inlineTail.length > 0 && !inlineTail.startsWith("#"),
       });
     }
   }
-  for (let idx = 0; idx < symbols.length; idx++) {
-    const cur = symbols[idx]!;
-    let endLine =
-      idx + 1 < symbols.length ? symbols[idx + 1]!.startLine - 1 : lines.length;
-    while (endLine > cur.startLine && !(lines[endLine - 1] ?? "").trim()) {
-      endLine--;
+
+  const trimTrailingBlankYamlLine = (startLine: number, rawEndLine: number): number => {
+    let end = rawEndLine;
+    while (end > startLine && !(lines[end - 1] ?? "").trim()) {
+      end--;
     }
-    cur.endLine = Math.max(cur.startLine, endLine);
+    return Math.max(startLine, end);
+  };
+
+  const topIndices: number[] = [];
+  for (let r = 0; r < rawEntries.length; r++) {
+    if (rawEntries[r]!.indent === 0) topIndices.push(r);
   }
+
+  for (let t = 0; t < topIndices.length; t++) {
+    const rawIdx = topIndices[t]!;
+    const entry = rawEntries[rawIdx]!;
+    if (entry.isDocBoundary) continue;
+
+    const nextTopRawIdx = t + 1 < topIndices.length ? topIndices[t + 1]! : -1;
+    const rawBound =
+      nextTopRawIdx >= 0 ? rawEntries[nextTopRawIdx]!.lineNum - 1 : lines.length;
+    const parentEndLine = trimTrailingBlankYamlLine(entry.lineNum, rawBound);
+
+    symbols.push({
+      kind: "key",
+      name: entry.keyName,
+      startLine: entry.lineNum,
+      endLine: parentEndLine,
+      depth: 0,
+    });
+
+    if (!entry.hasInlineScalarValue) {
+      const sliceEnd = nextTopRawIdx >= 0 ? nextTopRawIdx : rawEntries.length;
+      let childIndent = Infinity;
+      for (let k = rawIdx + 1; k < sliceEnd; k++) {
+        const cand = rawEntries[k]!;
+        if (cand.indent > 0 && cand.indent < childIndent) {
+          childIndent = cand.indent;
+        }
+      }
+      if (Number.isFinite(childIndent)) {
+        const children = rawEntries
+          .slice(rawIdx + 1, sliceEnd)
+          .filter((c) => c.indent === childIndent);
+        const parentSpan = parentEndLine - entry.lineNum;
+        const shouldExpandChildren =
+          children.length >= 2 ||
+          (children.length === 1 &&
+            parentSpan >= 3 &&
+            (YAML_SECTION_PARENTS.has(entry.keyName) || parentSpan >= 6));
+
+        if (shouldExpandChildren) {
+          for (let cIdx = 0; cIdx < children.length; cIdx++) {
+            const child = children[cIdx]!;
+            const rawChildEnd =
+              cIdx + 1 < children.length
+                ? children[cIdx + 1]!.lineNum - 1
+                : parentEndLine;
+            symbols.push({
+              kind: "section",
+              name: `${entry.keyName}.${child.keyName}`,
+              startLine: child.lineNum,
+              endLine: trimTrailingBlankYamlLine(child.lineNum, rawChildEnd),
+              depth: 1,
+            });
+          }
+        }
+      }
+    }
+  }
+
   return symbols;
 }
 
@@ -1475,7 +3396,7 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
         const am = atRuleRe.exec(trimmed);
         if (am && am[1]) {
           const endLine = trimmed.includes("{")
-            ? findBraceBlockEnd(lines, i, "c")
+            ? findBraceBlockEnd(lines, i, "css")
             : i + 1;
           const rest = (am[2] ?? "").trim().replace(/\s+/g, " ").slice(0, 56);
           symbols.push({
@@ -1488,7 +3409,7 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
         } else {
           const tm = tokenBlockRe.exec(trimmed);
           if (tm && tm[1]) {
-            const endLine = findBraceBlockEnd(lines, i, "c");
+            const endLine = findBraceBlockEnd(lines, i, "css");
             const header = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
             symbols.push({
               kind: "tokens",
@@ -1502,7 +3423,7 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
       }
     }
 
-    const { open, close } = scanBracesOnLine(line, state, "c");
+    const { open, close } = scanBracesOnLine(line, state, "css");
     braceDepth = Math.max(0, braceDepth + open - close);
   }
 
@@ -1531,7 +3452,7 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
       ) {
         const sel = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
         if (sel) {
-          const endLine = findBraceBlockEnd(lines, i, "c");
+          const endLine = findBraceBlockEnd(lines, i, "css");
           symbols.push({
             kind: "rule",
             name: sel,
@@ -1542,10 +3463,1233 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
           lastAddedLine = i;
         }
       }
-      const { open, close } = scanBracesOnLine(line, fallbackState, "c");
+      const { open, close } = scanBracesOnLine(line, fallbackState, "css");
       d = Math.max(0, d + open - close);
     }
     symbols.sort((a, b) => a.startLine - b.startLine);
+  }
+
+  return symbols;
+}
+
+function stripSqlCommentsForHeader(raw: string): string {
+  let out = "";
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  while (i < raw.length) {
+    const ch = raw[i]!;
+    const next = raw[i + 1];
+    if (inSingle) {
+      out += ch;
+      if (ch === "'" && next === "'") {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      out += ch;
+      if (ch === '"' && next === '"') {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      i++;
+      continue;
+    }
+    if (inBacktick) {
+      out += ch;
+      if (ch === "`" && next === "`") {
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (ch === "`") inBacktick = false;
+      i++;
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      while (i < raw.length && raw[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    if (ch === "'") inSingle = true;
+    else if (ch === '"') inDouble = true;
+    else if (ch === "`") inBacktick = true;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function extractSqlQualifiedName(rest: string): string | null {
+  const parts: string[] = [];
+  let i = 0;
+  const len = rest.length;
+
+  while (i < len && parts.length < 3) {
+    while (i < len && /\s/.test(rest[i]!)) i++;
+    if (i >= len) break;
+    const ch = rest[i]!;
+    if (ch === '"') {
+      i++;
+      let buf = "";
+      while (i < len) {
+        if (rest[i] === '"' && rest[i + 1] === '"') {
+          buf += '"';
+          i += 2;
+          continue;
+        }
+        if (rest[i] === '"') {
+          i++;
+          break;
+        }
+        buf += rest[i]!;
+        i++;
+      }
+      if (!buf) break;
+      parts.push(buf);
+    } else if (ch === "`") {
+      i++;
+      let buf = "";
+      while (i < len) {
+        if (rest[i] === "`" && rest[i + 1] === "`") {
+          buf += "`";
+          i += 2;
+          continue;
+        }
+        if (rest[i] === "`") {
+          i++;
+          break;
+        }
+        buf += rest[i]!;
+        i++;
+      }
+      if (!buf) break;
+      parts.push(buf);
+    } else if (ch === "[") {
+      i++;
+      const start = i;
+      while (i < len && rest[i] !== "]") i++;
+      const buf = rest.slice(start, i).trim();
+      if (i < len && rest[i] === "]") i++;
+      if (!buf) break;
+      parts.push(buf);
+    } else if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
+      i++;
+      while (i < len && /[\w$]/.test(rest[i]!)) i++;
+      parts.push(rest.slice(start, i));
+    } else {
+      break;
+    }
+
+    let k = i;
+    while (k < len && /\s/.test(rest[k]!)) k++;
+    if (rest[k] === ".") {
+      i = k + 1;
+    } else {
+      break;
+    }
+  }
+
+  return parts.length > 0 ? parts.join(".") : null;
+}
+
+function parseSqlDdlHeader(rawHeader: string): { kind: string; name: string } | null {
+  const cleaned = stripSqlCommentsForHeader(rawHeader).replace(/\s+/g, " ").trimStart();
+  const createMatch =
+    /^CREATE\s+(?:(?:OR\s+REPLACE|GLOBAL|LOCAL|TEMP(?:ORARY)?|UNLOGGED|EXTERNAL|VIRTUAL|MATERIALIZED|UNIQUE|FULLTEXT|SPATIAL|CLUSTERED|NONCLUSTERED|TRANSIENT|SECURE)\s+)*(TABLE|VIEW|INDEX|FUNCTION|PROCEDURE|TRIGGER|TYPE|SCHEMA|SEQUENCE)\b\s*(.*)$/i.exec(
+      cleaned,
+    );
+  if (createMatch && createMatch[1]) {
+    const kind = createMatch[1].toLowerCase();
+    let rest = (createMatch[2] ?? "").trimStart();
+    for (let pass = 0; pass < 3; pass++) {
+      const nextRest = rest
+        .replace(/^CONCURRENTLY\b\s*/i, "")
+        .replace(/^IF\s+NOT\s+EXISTS\b\s*/i, "")
+        .replace(kind === "schema" ? /^AUTHORIZATION\b\s*/i : /^$/, "");
+      if (nextRest === rest) break;
+      rest = nextRest;
+    }
+    if (kind === "index" && /^ON\b\s+/i.test(rest)) {
+      const tbl = extractSqlQualifiedName(rest.replace(/^ON\b\s+/i, ""));
+      return tbl ? { kind, name: `on ${tbl}` } : null;
+    }
+    const name = extractSqlQualifiedName(rest);
+    return name ? { kind, name } : null;
+  }
+
+  const alterMatch = /^ALTER\s+(?:FOREIGN\s+)?TABLE\b\s*(.*)$/i.exec(cleaned);
+  if (alterMatch) {
+    let rest = (alterMatch[1] ?? "").trimStart();
+    for (let pass = 0; pass < 2; pass++) {
+      const nextRest = rest
+        .replace(/^IF\s+EXISTS\b\s*/i, "")
+        .replace(/^ONLY\b\s*/i, "");
+      if (nextRest === rest) break;
+      rest = nextRest;
+    }
+    const name = extractSqlQualifiedName(rest);
+    return name ? { kind: "alter", name } : null;
+  }
+
+  return null;
+}
+
+function extractSqlSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  let inBlockComment = false;
+  let dollarTag: string | null = null;
+  let inSingleQuote = false;
+  let singleQuoteBackslash = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  let parenDepth = 0;
+  let beginDepth = 0;
+  let caseDepth = 0;
+  let atStatementStart = true;
+  let activeSym: SymbolEntry | null = null;
+  let lastCodeLine = 1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    let col = 0;
+    let seenCodeOnLine = false;
+
+    while (col < line.length) {
+      const ch = line[col]!;
+      const next = line[col + 1];
+
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          col += 2;
+        } else {
+          col++;
+        }
+        continue;
+      }
+
+      if (dollarTag !== null) {
+        if (ch === "$" && line.startsWith(dollarTag, col)) {
+          col += dollarTag.length;
+          dollarTag = null;
+          lastCodeLine = i + 1;
+          seenCodeOnLine = true;
+        } else {
+          col++;
+        }
+        continue;
+      }
+
+      if (inSingleQuote) {
+        if (singleQuoteBackslash && ch === "\\") {
+          col += 2;
+          continue;
+        }
+        if (ch === "'" && next === "'") {
+          col += 2;
+          continue;
+        }
+        if (ch === "'") {
+          inSingleQuote = false;
+          singleQuoteBackslash = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (inDoubleQuote) {
+        if (ch === '"' && next === '"') {
+          col += 2;
+          continue;
+        }
+        if (ch === '"') {
+          inDoubleQuote = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (inBacktick) {
+        if (ch === "`" && next === "`") {
+          col += 2;
+          continue;
+        }
+        if (ch === "`") {
+          inBacktick = false;
+          lastCodeLine = i + 1;
+        }
+        col++;
+        continue;
+      }
+
+      if (/\s/.test(ch)) {
+        col++;
+        continue;
+      }
+
+      if (ch === "-" && next === "-") {
+        break;
+      }
+
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        col += 2;
+        continue;
+      }
+
+      // psql meta-commands (e.g. \connect, \set) at line/statement start do not require ';'
+      if (!seenCodeOnLine && atStatementStart && ch === "\\") {
+        break;
+      }
+
+      // T-SQL GO batch separator on its own line
+      if (
+        !seenCodeOnLine &&
+        parenDepth === 0 &&
+        beginDepth === 0 &&
+        /^GO\b\s*(?:--.*)?$/i.test(line.slice(col))
+      ) {
+        if (activeSym) {
+          activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+          activeSym = null;
+        }
+        atStatementStart = true;
+        break;
+      }
+
+      if (
+        atStatementStart ||
+        (!seenCodeOnLine &&
+          parenDepth === 0 &&
+          beginDepth === 0 &&
+          /^(?:CREATE|ALTER)\b/i.test(line.slice(col)))
+      ) {
+        const headerWindow = [
+          line.slice(col),
+          lines[i + 1] ?? "",
+          lines[i + 2] ?? "",
+          lines[i + 3] ?? "",
+        ].join("\n");
+        const ddl = parseSqlDdlHeader(headerWindow);
+        if (ddl) {
+          if (activeSym) {
+            activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+          }
+          activeSym = {
+            kind: ddl.kind,
+            name: ddl.name,
+            startLine: i + 1,
+            endLine: i + 1,
+            depth: 0,
+          };
+          symbols.push(activeSym);
+          parenDepth = 0;
+          beginDepth = 0;
+          caseDepth = 0;
+          atStatementStart = false;
+        } else if (atStatementStart) {
+          atStatementStart = false;
+        }
+      }
+
+      seenCodeOnLine = true;
+      lastCodeLine = i + 1;
+
+      if (ch === "$") {
+        const dm = /^\$(?:[A-Za-z_]\w*)?\$/.exec(line.slice(col));
+        if (dm) {
+          dollarTag = dm[0];
+          col += dm[0].length;
+          continue;
+        }
+      }
+
+      if (
+        (ch === "E" || ch === "e") &&
+        next === "'" &&
+        (col === 0 || !/[\w$]/.test(line[col - 1]!))
+      ) {
+        inSingleQuote = true;
+        singleQuoteBackslash = true;
+        col += 2;
+        continue;
+      }
+
+      if (ch === "'") {
+        inSingleQuote = true;
+        singleQuoteBackslash = false;
+        col++;
+        continue;
+      }
+
+      if (ch === '"') {
+        inDoubleQuote = true;
+        col++;
+        continue;
+      }
+
+      if (ch === "`") {
+        inBacktick = true;
+        col++;
+        continue;
+      }
+
+      if (ch === "(") {
+        parenDepth++;
+        col++;
+        continue;
+      }
+      if (ch === ")") {
+        parenDepth = Math.max(0, parenDepth - 1);
+        col++;
+        continue;
+      }
+
+      if (
+        activeSym &&
+        (activeSym.kind === "function" ||
+          activeSym.kind === "procedure" ||
+          activeSym.kind === "trigger") &&
+        /[A-Za-z_]/.test(ch) &&
+        (col === 0 || !/[\w$]/.test(line[col - 1]!))
+      ) {
+        const wordMatch = /^[A-Za-z_]\w*/.exec(line.slice(col));
+        if (wordMatch) {
+          const upper = wordMatch[0].toUpperCase();
+          const afterWord = line.slice(col + wordMatch[0].length);
+          if (upper === "BEGIN" && !/^\s*(?:TRANSACTION\b|WORK\b)?\s*;/.test(afterWord)) {
+            beginDepth++;
+          } else if (upper === "CASE" && parenDepth === 0) {
+            caseDepth++;
+          } else if (upper === "END") {
+            if (/^\s+CASE\b/i.test(afterWord)) {
+              caseDepth = Math.max(0, caseDepth - 1);
+            } else if (!/^\s+(?:IF|LOOP|WHILE|REPEAT)\b/i.test(afterWord)) {
+              if (caseDepth > 0 && !/^\s*;/.test(afterWord)) {
+                caseDepth--;
+              } else {
+                beginDepth = Math.max(0, beginDepth - 1);
+              }
+            }
+          }
+          col += wordMatch[0].length;
+          continue;
+        }
+      }
+
+      if (ch === ";" && parenDepth === 0 && beginDepth === 0) {
+        if (activeSym) {
+          activeSym.endLine = i + 1;
+          activeSym = null;
+        }
+        caseDepth = 0;
+        atStatementStart = true;
+        col++;
+        continue;
+      }
+
+      col++;
+    }
+  }
+
+  if (activeSym) {
+    activeSym.endLine = Math.max(activeSym.startLine, lastCodeLine);
+  }
+
+  return symbols;
+}
+
+function hasProtoOpenBraceSoon(lines: string[], lineIdx: number, restAfterName: string): boolean {
+  const stripInlineComments = (s: string) =>
+    s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/.*$/, "").trim();
+  const tail = stripInlineComments(restAfterName);
+  if (tail.startsWith("{")) return true;
+  if (tail.length > 0) return false;
+  for (let k = lineIdx + 1; k < Math.min(lines.length, lineIdx + 4); k++) {
+    const nextTrim = stripInlineComments(lines[k] ?? "");
+    if (!nextTrim) continue;
+    return nextTrim.startsWith("{");
+  }
+  return false;
+}
+
+function extractProtoSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0,
+  };
+  let braceDepth = 0;
+
+  const pkgRe = /^\s*package\s+([A-Za-z_][\w.]*)\s*;/;
+  const blockDeclRe = /^\s*(message|service|enum|oneof|extend)\s+(\.?[A-Za-z_][\w.]*)(.*)$/;
+  const rpcRe = /^\s*rpc\s+([A-Za-z_]\w*)\s*\(/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const wasInComment = state.inBlockComment;
+    const depthBeforeLine = braceDepth;
+    const { open, close } = scanBracesOnLine(line, state, "c");
+    braceDepth = Math.max(0, braceDepth + open - close);
+
+    if (wasInComment) continue;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
+      continue;
+    }
+
+    if (depthBeforeLine === 0) {
+      const pm = pkgRe.exec(line);
+      if (pm && pm[1]) {
+        symbols.push({
+          kind: "package",
+          name: pm[1],
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const bm = blockDeclRe.exec(line);
+    if (bm && bm[1] && bm[2] && hasProtoOpenBraceSoon(lines, i, bm[3] ?? "")) {
+      symbols.push({
+        kind: bm[1],
+        name: bm[2],
+        startLine: i + 1,
+        endLine: findBraceBlockEnd(lines, i, "c"),
+        depth: Math.min(2, depthBeforeLine),
+      });
+      continue;
+    }
+
+    const rm = rpcRe.exec(line);
+    if (rm && rm[1] && depthBeforeLine >= 1) {
+      symbols.push({
+        kind: "rpc",
+        name: rm[1],
+        startLine: i + 1,
+        endLine: findBraceBlockEnd(lines, i, "c"),
+        depth: Math.min(2, depthBeforeLine),
+      });
+    }
+  }
+
+  return symbols;
+}
+
+interface GraphqlScanState {
+  inBlockString: boolean;
+}
+
+function scanGraphqlLine(
+  line: string,
+  state: GraphqlScanState,
+): {
+  code: string;
+  openBrace: number;
+  closeBrace: number;
+  openParen: number;
+  closeParen: number;
+  lastTokenChar: string;
+} {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  let lastTokenChar = "";
+  let inSingleLineStr = false;
+  let i = 0;
+
+  while (i < line.length) {
+    if (state.inBlockString) {
+      if (line[i] === "\\" && line.startsWith('"""', i + 1)) {
+        i += 4;
+        continue;
+      }
+      if (line.startsWith('"""', i)) {
+        state.inBlockString = false;
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    if (inSingleLineStr) {
+      if (line[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (line[i] === '"') {
+        inSingleLineStr = false;
+        lastTokenChar = '"';
+      }
+      i++;
+      continue;
+    }
+
+    if (line[i] === "#") break;
+
+    if (line.startsWith('"""', i)) {
+      state.inBlockString = true;
+      code += " ";
+      i += 3;
+      continue;
+    }
+
+    if (line[i] === '"') {
+      inSingleLineStr = true;
+      code += '""';
+      i++;
+      continue;
+    }
+
+    const ch = line[i]!;
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    if (!/\s/.test(ch)) lastTokenChar = ch;
+    i++;
+  }
+
+  return { code, openBrace, closeBrace, openParen, closeParen, lastTokenChar };
+}
+
+function findGraphqlDefinitionEnd(
+  lines: string[],
+  startIdx: number,
+  expectsBraceBlock: boolean,
+): number {
+  const state: GraphqlScanState = { inBlockString: false };
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let seenBrace = false;
+  let endLineIdx = startIdx;
+  let prevLastChar = "";
+  const maxScan = Math.min(lines.length, startIdx + 2000);
+
+  const topDefStartRe =
+    /^(?:extend\s+)?(?:type|input|interface|enum|union|scalar|directive|schema|fragment|query|mutation|subscription)\b/;
+
+  for (let i = startIdx; i < maxScan; i++) {
+    const wasInBlockStr = state.inBlockString;
+    const scan = scanGraphqlLine(lines[i]!, state);
+    const trimmedCode = scan.code.trim();
+
+    if (i > startIdx && !seenBrace && parenDepth === 0 && !wasInBlockStr && !state.inBlockString) {
+      if (!trimmedCode) {
+        if (!expectsBraceBlock && prevLastChar !== "=" && prevLastChar !== "|") {
+          return endLineIdx + 1;
+        }
+        continue;
+      }
+      if (topDefStartRe.test(trimmedCode)) {
+        return endLineIdx + 1;
+      }
+      if (
+        !expectsBraceBlock &&
+        prevLastChar !== "=" &&
+        prevLastChar !== "|" &&
+        !trimmedCode.startsWith("|") &&
+        !trimmedCode.startsWith("@") &&
+        !trimmedCode.startsWith("=") &&
+        !/^(?:on|repeatable)\b/.test(trimmedCode)
+      ) {
+        return endLineIdx + 1;
+      }
+    }
+
+    if (scan.openBrace > 0) seenBrace = true;
+    braceDepth += scan.openBrace - scan.closeBrace;
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (trimmedCode || wasInBlockStr || state.inBlockString) {
+      endLineIdx = i;
+    }
+    if (scan.lastTokenChar) {
+      prevLastChar = scan.lastTokenChar;
+    }
+
+    if (seenBrace && braceDepth <= 0 && parenDepth <= 0) {
+      return i + 1;
+    }
+  }
+
+  return endLineIdx + 1;
+}
+
+function extractGraphqlSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: GraphqlScanState = { inBlockString: false };
+  let braceDepth = 0;
+  let parenDepth = 0;
+
+  const namedTypeRe =
+    /^(?:extend\s+)?(type|input|interface|enum|union|scalar)\s+([A-Za-z_]\w*)\b/;
+  const directiveRe = /^directive\s+(@[A-Za-z_]\w*)\b/;
+  const schemaRe = /^(?:extend\s+)?schema\b(?:\s*@|\s*\{|\s*$)/;
+  const fragmentRe = /^fragment\s+([A-Za-z_]\w*)\s+on\s+[A-Za-z_]\w*/;
+  const opRe = /^(query|mutation|subscription)\b(?:\s+([A-Za-z_]\w*))?\s*(?:[\({@]|$)/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const wasInBlockString = state.inBlockString;
+    const braceBefore = braceDepth;
+    const parenBefore = parenDepth;
+    const scan = scanGraphqlLine(lines[i]!, state);
+
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (wasInBlockString || braceBefore > 0 || parenBefore > 0) continue;
+    const code = scan.code.trim();
+    if (!code) continue;
+
+    const tm = namedTypeRe.exec(code);
+    if (tm && tm[1] && tm[2]) {
+      const kind = tm[1];
+      const expectsBrace = kind !== "union" && kind !== "scalar";
+      symbols.push({
+        kind,
+        name: tm[2],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, expectsBrace),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const dm = directiveRe.exec(code);
+    if (dm && dm[1]) {
+      symbols.push({
+        kind: "directive",
+        name: dm[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, false),
+        depth: 0,
+      });
+      continue;
+    }
+
+    if (schemaRe.test(code)) {
+      symbols.push({
+        kind: "schema",
+        name: "schema",
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const fm = fragmentRe.exec(code);
+    if (fm && fm[1]) {
+      symbols.push({
+        kind: "fragment",
+        name: fm[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const om = opRe.exec(code);
+    if (om && om[1]) {
+      symbols.push({
+        kind: om[1],
+        name: om[2] || om[1],
+        startLine: i + 1,
+        endLine: findGraphqlDefinitionEnd(lines, i, true),
+        depth: 0,
+      });
+    }
+  }
+
+  return symbols;
+}
+
+interface HclScanState {
+  inBlockComment: boolean;
+  inString: boolean;
+  interpBraceStack: number[];
+  heredoc: { delim: string; indented: boolean } | null;
+}
+
+function scanHclLine(
+  line: string,
+  state: HclScanState,
+): {
+  code: string;
+  openBrace: number;
+  closeBrace: number;
+  openBracket: number;
+  closeBracket: number;
+  openParen: number;
+  closeParen: number;
+  lastCodeChar: string;
+} {
+  let code = "";
+  let openBrace = 0;
+  let closeBrace = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  let openParen = 0;
+  let closeParen = 0;
+  let lastCodeChar = "";
+
+  if (state.heredoc) {
+    const check = state.heredoc.indented ? line.trim() : line.trimEnd();
+    if (check === state.heredoc.delim) {
+      state.heredoc = null;
+      lastCodeChar = check[check.length - 1] ?? "";
+    }
+    return {
+      code,
+      openBrace,
+      closeBrace,
+      openBracket,
+      closeBracket,
+      openParen,
+      closeParen,
+      lastCodeChar,
+    };
+  }
+
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i]!;
+    const next = line[i + 1];
+
+    if (state.inBlockComment) {
+      if (ch === "*" && next === "/") {
+        state.inBlockComment = false;
+        i += 2;
+      } else {
+        i++;
+      }
+      continue;
+    }
+
+    if (state.inString) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "$" && next === "{") {
+        state.inString = false;
+        state.interpBraceStack.push(0);
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        state.inString = false;
+        lastCodeChar = '"';
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "#" || (ch === "/" && next === "/")) {
+      break;
+    }
+
+    if (ch === "/" && next === "*") {
+      state.inBlockComment = true;
+      code += " ";
+      i += 2;
+      continue;
+    }
+
+    if (ch === '"') {
+      state.inString = true;
+      if (state.interpBraceStack.length === 0) {
+        let endQ = i + 1;
+        while (endQ < line.length) {
+          if (line[endQ] === "\\") {
+            endQ += 2;
+            continue;
+          }
+          if (line[endQ] === "$" && line[endQ + 1] === "{") break;
+          if (line[endQ] === '"') break;
+          endQ++;
+        }
+        if (endQ < line.length && line[endQ] === '"') {
+          code += line.slice(i, endQ + 1);
+          state.inString = false;
+          lastCodeChar = '"';
+          i = endQ + 1;
+          continue;
+        }
+      }
+      code += '""';
+      i++;
+      continue;
+    }
+
+    if (state.interpBraceStack.length > 0) {
+      if (ch === "{") {
+        state.interpBraceStack[state.interpBraceStack.length - 1]! += 1;
+      } else if (ch === "}") {
+        const top = state.interpBraceStack[state.interpBraceStack.length - 1]!;
+        if (top === 0) {
+          state.interpBraceStack.pop();
+          state.inString = true;
+        } else {
+          state.interpBraceStack[state.interpBraceStack.length - 1] = top - 1;
+        }
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "<" && next === "<") {
+      const hm = /^<<(-?)([A-Za-z_]\w*)/.exec(line.slice(i));
+      if (hm && hm[2]) {
+        state.heredoc = { delim: hm[2], indented: hm[1] === "-" };
+        code += "<<";
+        lastCodeChar = "<";
+        i += hm[0].length;
+        continue;
+      }
+    }
+
+    code += ch;
+    if (ch === "{") openBrace++;
+    else if (ch === "}") closeBrace++;
+    else if (ch === "[") openBracket++;
+    else if (ch === "]") closeBracket++;
+    else if (ch === "(") openParen++;
+    else if (ch === ")") closeParen++;
+    if (!/\s/.test(ch)) lastCodeChar = ch;
+    i++;
+  }
+
+  return {
+    code,
+    openBrace,
+    closeBrace,
+    openBracket,
+    closeBracket,
+    openParen,
+    closeParen,
+    lastCodeChar,
+  };
+}
+
+function findHclEndLine(
+  lines: string[],
+  startIdx: number,
+  isAssignment: boolean,
+): number {
+  const state: HclScanState = {
+    inBlockComment: false,
+    inString: false,
+    interpBraceStack: [],
+    heredoc: null,
+  };
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let seenOpenBrace = false;
+  const maxScan = Math.min(lines.length, startIdx + 2000);
+
+  for (let i = startIdx; i < maxScan; i++) {
+    const scan = scanHclLine(lines[i]!, state);
+    if (scan.openBrace > 0) seenOpenBrace = true;
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    bracketDepth = Math.max(0, bracketDepth + scan.openBracket - scan.closeBracket);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (isAssignment) {
+      if (i === startIdx && scan.lastCodeChar === "=") {
+        continue;
+      }
+      if (
+        braceDepth === 0 &&
+        bracketDepth === 0 &&
+        parenDepth === 0 &&
+        !state.heredoc &&
+        !state.inBlockComment &&
+        !state.inString &&
+        state.interpBraceStack.length === 0
+      ) {
+        return i + 1;
+      }
+    } else if (
+      seenOpenBrace &&
+      braceDepth === 0 &&
+      bracketDepth === 0 &&
+      parenDepth === 0 &&
+      !state.heredoc
+    ) {
+      return i + 1;
+    }
+  }
+
+  return Math.min(lines.length, maxScan);
+}
+
+function extractTerraformSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: HclScanState = {
+    inBlockComment: false,
+    inString: false,
+    interpBraceStack: [],
+    heredoc: null,
+  };
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  const twoLabelRe =
+    /^(resource|data)\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*\{/;
+  const oneLabelRe =
+    /^(variable|output|module|provider|check)\s+(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*\{/;
+  const zeroLabelRe = /^(locals|terraform|moved|import)\s*\{/;
+  const assignRe = /^([A-Za-z_][\w-]*)\s*=(?!=)/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const wasInComment = state.inBlockComment;
+    const wasInHeredoc = state.heredoc !== null;
+    const wasInString = state.inString || state.interpBraceStack.length > 0;
+    const atTop = braceDepth === 0 && bracketDepth === 0 && parenDepth === 0;
+
+    const scan = scanHclLine(lines[i]!, state);
+    braceDepth = Math.max(0, braceDepth + scan.openBrace - scan.closeBrace);
+    bracketDepth = Math.max(0, bracketDepth + scan.openBracket - scan.closeBracket);
+    parenDepth = Math.max(0, parenDepth + scan.openParen - scan.closeParen);
+
+    if (!atTop || wasInComment || wasInHeredoc || wasInString) continue;
+    const code = scan.code.trim();
+    if (!code) continue;
+
+    const m2 = twoLabelRe.exec(code);
+    if (m2 && m2[1]) {
+      const typeName = m2[2] || m2[3];
+      const localName = m2[4] || m2[5];
+      if (typeName && localName) {
+        symbols.push({
+          kind: m2[1],
+          name: `${typeName}.${localName}`,
+          startLine: i + 1,
+          endLine: findHclEndLine(lines, i, false),
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const m1 = oneLabelRe.exec(code);
+    if (m1 && m1[1]) {
+      const label = m1[2] || m1[3];
+      if (label) {
+        symbols.push({
+          kind: m1[1],
+          name: label,
+          startLine: i + 1,
+          endLine: findHclEndLine(lines, i, false),
+          depth: 0,
+        });
+        continue;
+      }
+    }
+
+    const m0 = zeroLabelRe.exec(code);
+    if (m0 && m0[1]) {
+      symbols.push({
+        kind: m0[1],
+        name: m0[1],
+        startLine: i + 1,
+        endLine: findHclEndLine(lines, i, false),
+        depth: 0,
+      });
+      continue;
+    }
+
+    const ma = assignRe.exec(code);
+    if (ma && ma[1]) {
+      symbols.push({
+        kind: "key",
+        name: ma[1],
+        startLine: i + 1,
+        endLine: findHclEndLine(lines, i, true),
+        depth: 0,
+      });
+    }
+  }
+
+  return symbols;
+}
+
+function extractDockerfileSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const stageEntries: SymbolEntry[] = [];
+  let escapeChar = "\\";
+
+  // Check optional Dockerfile parser directive `# escape=\` or `# escape=\`` at top of file
+  for (let i = 0; i < Math.min(lines.length, 5); i++) {
+    const trimmed = lines[i]!.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("#")) break;
+    const escMatch = /^#\s*escape\s*=\s*([\\`])\s*$/i.exec(trimmed);
+    if (escMatch && escMatch[1]) {
+      escapeChar = escMatch[1];
+      break;
+    }
+  }
+
+  let i = 0;
+  let activeStage: SymbolEntry | null = null;
+
+  while (i < lines.length) {
+    const trimmed = lines[i]!.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      i++;
+      continue;
+    }
+
+    const startIdx = i;
+    const parts: string[] = [];
+    let endIdx = i;
+    let heredocDelim: { delim: string; indented: boolean } | null = null;
+
+    while (endIdx < lines.length) {
+      const cur = lines[endIdx]!;
+      const curTrim = cur.trim();
+      if (endIdx > startIdx && curTrim.startsWith("#")) {
+        endIdx++;
+        continue;
+      }
+      const rtrimmed = cur.trimEnd();
+      const hasCont =
+        rtrimmed.length > 0 &&
+        rtrimmed[rtrimmed.length - 1] === escapeChar &&
+        (rtrimmed.length < 2 || rtrimmed[rtrimmed.length - 2] !== escapeChar);
+      const cleanPart = hasCont ? rtrimmed.slice(0, -1).trim() : curTrim;
+      if (cleanPart) parts.push(cleanPart);
+
+      if (!heredocDelim) {
+        const hm = /<<(-?)(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))/.exec(cleanPart);
+        if (hm) {
+          const delim = hm[2] || hm[3] || hm[4];
+          if (delim) {
+            heredocDelim = { delim, indented: hm[1] === "-" };
+          }
+        }
+      }
+
+      if (hasCont) {
+        endIdx++;
+        continue;
+      }
+      break;
+    }
+
+    if (heredocDelim) {
+      endIdx++;
+      while (endIdx < lines.length) {
+        const hdLine = heredocDelim.indented
+          ? lines[endIdx]!.trim()
+          : lines[endIdx]!.trimEnd();
+        if (hdLine === heredocDelim.delim) break;
+        endIdx++;
+      }
+    }
+
+    const joined = parts.join(" ").replace(/\s+/g, " ").trim();
+    const instrMatch = /^([A-Za-z]+)\s+(.*)$/.exec(joined);
+    if (instrMatch && instrMatch[1]) {
+      const kw = instrMatch[1].toUpperCase();
+      let rest = instrMatch[2]!.trim();
+
+      if (kw === "FROM") {
+        while (rest.startsWith("--")) {
+          const sp = rest.search(/\s/);
+          if (sp < 0) break;
+          rest = rest.slice(sp).trimStart();
+        }
+        const fromMatch = /^(\S+)(?:\s+AS\s+([A-Za-z0-9_.-]+))?/i.exec(rest);
+        const image = fromMatch?.[1] ?? rest;
+        const alias = fromMatch?.[2];
+        const stageName = alias ? `${image} AS ${alias}` : image;
+        const stageSym: SymbolEntry = {
+          kind: "stage",
+          name: sliceSafeChars(stageName, 64),
+          startLine: startIdx + 1,
+          endLine: Math.min(lines.length, endIdx + 1),
+          depth: 0,
+        };
+        symbols.push(stageSym);
+        stageEntries.push(stageSym);
+        activeStage = stageSym;
+      } else if (kw === "ARG") {
+        const argNames = rest
+          .split(/\s+/)
+          .map((tok) => tok.split("=")[0]?.trim() ?? "")
+          .filter((n) => /^[A-Za-z_]\w*$/.test(n));
+        const label = argNames.length > 0 ? argNames.join(", ") : sliceSafeChars(rest, 48);
+        if (label) {
+          symbols.push({
+            kind: "arg",
+            name: label,
+            startLine: startIdx + 1,
+            endLine: Math.min(lines.length, endIdx + 1),
+            depth: activeStage ? 1 : 0,
+          });
+        }
+      } else if (kw === "ENTRYPOINT" || kw === "CMD") {
+        symbols.push({
+          kind: kw.toLowerCase(),
+          name: sliceSafeChars(rest, 60),
+          startLine: startIdx + 1,
+          endLine: Math.min(lines.length, endIdx + 1),
+          depth: activeStage ? 1 : 0,
+        });
+      }
+    }
+
+    i = Math.max(startIdx + 1, endIdx + 1);
+  }
+
+  for (let idx = 0; idx < stageEntries.length; idx++) {
+    const stage = stageEntries[idx]!;
+    let bound =
+      idx + 1 < stageEntries.length
+        ? stageEntries[idx + 1]!.startLine - 1
+        : lines.length;
+    while (
+      bound > stage.startLine &&
+      (!(lines[bound - 1] ?? "").trim() || (lines[bound - 1] ?? "").trim().startsWith("#"))
+    ) {
+      bound--;
+    }
+    stage.endLine = Math.max(stage.startLine, bound);
   }
 
   return symbols;
@@ -1885,7 +5029,184 @@ function extractCommentLandmark(inner: string): string | null {
   return cleaned;
 }
 
-type TemplateMode = "html" | "vue" | "svelte";
+type TemplateMode = "html" | "vue" | "svelte" | "astro";
+
+function findRawBlockCloseTag(
+  text: string,
+  contentStart: number,
+  lowerTag: "script" | "style",
+): { index: number; closeEndPos: number } | null {
+  const quickRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+  quickRe.lastIndex = contentStart;
+  if (!quickRe.exec(text)) {
+    return null;
+  }
+
+  const len = text.length;
+  let pos = contentStart;
+  let lineStart = contentStart;
+  while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+
+  let inBlockComment = false;
+  let inLineComment = false;
+  let quote: '"' | "'" | null = null;
+  let inTemplate = false;
+  const templateBraceStack: number[] = [];
+
+  while (pos < len) {
+    const ch = text[pos]!;
+    const next = text[pos + 1];
+
+    if (ch === "\n") {
+      lineStart = pos + 1;
+      if (inLineComment) inLineComment = false;
+      if (quote !== null) quote = null;
+      pos++;
+      continue;
+    }
+
+    if (inLineComment) {
+      pos++;
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        pos += 2;
+      } else {
+        pos++;
+      }
+      continue;
+    }
+
+    if (quote !== null) {
+      if (ch === "\\") {
+        pos += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      pos++;
+      continue;
+    }
+
+    if (inTemplate) {
+      if (ch === "\\") {
+        pos += 2;
+        continue;
+      }
+      if (ch === "`") {
+        inTemplate = false;
+        pos++;
+        continue;
+      }
+      if (ch === "$" && next === "{") {
+        inTemplate = false;
+        templateBraceStack.push(0);
+        pos += 2;
+        continue;
+      }
+      pos++;
+      continue;
+    }
+
+    if (ch === "<" && next === "/" && templateBraceStack.length === 0) {
+      const tagEnd = pos + 2 + lowerTag.length;
+      if (
+        tagEnd < len &&
+        text.slice(pos + 2, tagEnd).toLowerCase() === lowerTag
+      ) {
+        let k = tagEnd;
+        while (k < len && /\s/.test(text[k]!)) k++;
+        if (text[k] === ">") {
+          return { index: pos, closeEndPos: k + 1 };
+        }
+      }
+    }
+
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      pos += 2;
+      continue;
+    }
+
+    if (
+      ch === "/" &&
+      next === "/" &&
+      (lowerTag === "script" || pos === contentStart || text[pos - 1] !== ":")
+    ) {
+      inLineComment = true;
+      pos += 2;
+      continue;
+    }
+
+    if (
+      lowerTag === "script" &&
+      ch === "/" &&
+      next !== "/" &&
+      next !== "*" &&
+      text[pos - 1] !== "<"
+    ) {
+      let lineEnd = text.indexOf("\n", pos);
+      if (lineEnd < 0) lineEnd = len;
+      const lineSlice = text.slice(lineStart, lineEnd);
+      const relIdx = pos - lineStart;
+      if (
+        !isJsxSelfClosingSlash(lineSlice, relIdx) &&
+        isRegexStartContext(lineSlice, relIdx) &&
+        hasClosingRegexSlashOnLine(lineSlice, relIdx)
+      ) {
+        let r = pos + 1;
+        let inClass = false;
+        while (r < lineEnd) {
+          const rc = text[r]!;
+          if (rc === "\\") {
+            r += 2;
+            continue;
+          }
+          if (rc === "[") inClass = true;
+          else if (rc === "]") inClass = false;
+          else if (rc === "/" && !inClass) {
+            pos = r + 1;
+            break;
+          }
+          r++;
+        }
+        continue;
+      }
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      pos++;
+      continue;
+    }
+
+    if (lowerTag === "script" && ch === "`") {
+      inTemplate = true;
+      pos++;
+      continue;
+    }
+
+    if (templateBraceStack.length > 0) {
+      if (ch === "{") {
+        templateBraceStack[templateBraceStack.length - 1]! += 1;
+      } else if (ch === "}") {
+        const top = templateBraceStack[templateBraceStack.length - 1]!;
+        if (top === 0) {
+          templateBraceStack.pop();
+          inTemplate = true;
+        } else {
+          templateBraceStack[templateBraceStack.length - 1] = top - 1;
+        }
+      }
+    }
+
+    pos++;
+  }
+
+  return null;
+}
 
 function extractTemplateSymbols(
   rawLines: string[],
@@ -2297,12 +5618,10 @@ function extractTemplateSymbols(
       }
 
       const noCloseLatch = lowerTag === "script" ? noCloseScript : noCloseStyle;
-      let closeMatch: RegExpExecArray | null = null;
+      let closeInfo: { index: number; closeEndPos: number } | null = null;
       if (!noCloseLatch) {
-        const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
-        closeRe.lastIndex = gtPos + 1;
-        closeMatch = closeRe.exec(text);
-        if (!closeMatch) {
+        closeInfo = findRawBlockCloseTag(text, gtPos + 1, lowerTag);
+        if (!closeInfo) {
           if (lowerTag === "script") noCloseScript = true;
           else noCloseStyle = true;
         }
@@ -2312,9 +5631,9 @@ function extractTemplateSymbols(
       let endLine: number;
       let nextPos: number;
 
-      if (closeMatch) {
-        closeStart = closeMatch.index;
-        const closeEndPos = closeMatch.index + closeMatch[0].length;
+      if (closeInfo) {
+        closeStart = closeInfo.index;
+        const closeEndPos = closeInfo.closeEndPos;
         endLine = Math.max(startLine, offsetToLineIdx(closeEndPos - 1) + 1);
         nextPos = closeEndPos;
       } else if (lowerTag === "script" && parsed.attrs.has("src")) {
@@ -2484,8 +5803,89 @@ function extractSfcSymbols(lines: string[], mode: "vue" | "svelte"): SymbolEntry
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 
+function extractAstroSymbols(rawLines: string[]): SymbolEntry[] {
+  if (rawLines.length === 0) return [];
+  const lines =
+    rawLines[0]!.startsWith("\uFEFF")
+      ? [rawLines[0]!.slice(1), ...rawLines.slice(1)]
+      : rawLines;
+
+  let firstNonEmpty = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) {
+      firstNonEmpty = i;
+      break;
+    }
+  }
+
+  if (firstNonEmpty >= 0 && /^---\s*$/.test(lines[firstNonEmpty]!)) {
+    const fmState: ScanState = {
+      inBlockComment: false,
+      templateExprStack: [],
+      inBacktick: false,
+    };
+    let closeFence = -1;
+    for (let k = firstNonEmpty + 1; k < lines.length; k++) {
+      const wasInComment = fmState.inBlockComment;
+      const wasInBacktick = fmState.inBacktick || fmState.templateExprStack.length > 0;
+      scanBracesOnLine(lines[k]!, fmState, "js");
+      if (!wasInComment && !wasInBacktick && /^---\s*$/.test(lines[k]!)) {
+        closeFence = k;
+        break;
+      }
+    }
+
+    if (closeFence > firstNonEmpty) {
+      const symbols: SymbolEntry[] = [
+        {
+          kind: "frontmatter",
+          name: "---",
+          startLine: firstNonEmpty + 1,
+          endLine: closeFence + 1,
+          depth: 0,
+        },
+      ];
+
+      const fmInner = lines.slice(firstNonEmpty + 1, closeFence);
+      if (fmInner.some((l) => l.trim().length > 0)) {
+        const dedented = dedentBlockLines(fmInner);
+        const baseOffset = firstNonEmpty + 1;
+        for (const s of extractTsJsSymbols(dedented)) {
+          const childStart = s.startLine + baseOffset;
+          const childEnd = Math.max(childStart, s.endLine + baseOffset);
+          symbols.push({
+            kind: s.kind,
+            name: s.name,
+            startLine: childStart,
+            endLine: childEnd,
+            depth: Math.min(MAX_HTML_DEPTH, 1 + s.depth),
+          });
+        }
+      }
+
+      const bodyLines = lines.map((l, idx) => (idx <= closeFence ? "" : l));
+      symbols.push(...extractTemplateSymbols(bodyLines, "astro"));
+      return symbols;
+    }
+  }
+
+  return extractTemplateSymbols(lines, "astro");
+}
+
 function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry[] {
+  const base = path.basename(filePath).toLowerCase();
   const ext = path.extname(filePath).toLowerCase();
+
+  if (
+    base === "dockerfile" ||
+    base.startsWith("dockerfile.") ||
+    base === "containerfile" ||
+    base.startsWith("containerfile.") ||
+    ext === ".dockerfile" ||
+    ext === ".containerfile"
+  ) {
+    return extractDockerfileSymbols(lines);
+  }
 
   switch (ext) {
     case ".ts":
@@ -2504,6 +5904,8 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
       return extractSfcSymbols(lines, "vue");
     case ".svelte":
       return extractSfcSymbols(lines, "svelte");
+    case ".astro":
+      return extractAstroSymbols(lines);
     case ".css":
     case ".scss":
     case ".less":
@@ -2526,8 +5928,11 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".c":
     case ".cc":
     case ".cpp":
+    case ".cxx":
     case ".h":
+    case ".hh":
     case ".hpp":
+    case ".hxx":
       return extractCLikeSymbols(lines);
     case ".sh":
     case ".bash":
@@ -2541,6 +5946,18 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".sql":
+      return extractSqlSymbols(lines);
+    case ".proto":
+      return extractProtoSymbols(lines);
+    case ".graphql":
+    case ".gql":
+    case ".graphqls":
+      return extractGraphqlSymbols(lines);
+    case ".tf":
+    case ".tfvars":
+    case ".hcl":
+      return extractTerraformSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }

@@ -1271,4 +1271,964 @@ describe("read_slices", () => {
     assert.match(encRes.text, /be\.rc\nERROR: UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 BE\]/);
     assert.match(encRes.text, /u32\.txt\nERROR: Binary file cannot be read as text:/);
   });
+
+  it("accurately outlines TS non-null division, nested generics & arrow methods, 4-backtick Markdown fences, Rust raw strings, 0-indent JSON, and quoted YAML keys", () => {
+    // 1. TS postfix non-null assertion `arr[0]! / 2` before `{` must NOT enter regex mode and truncate endLine
+    const tsNonNull = extractSymbols(
+      "weights.ts",
+      [
+        "export function computeWeights(arr: number[]) {",
+        "  if (arr[0]! / 2 > 1) {",
+        "    return arr[0]!;",
+        "  }",
+        "  const extra = 42;",
+        "  return extra;",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsNonNull.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:computeWeights:1-7"],
+    );
+
+    // 2. TS nested generics (`Record<string, unknown>`), ES `#private` / `*generator` methods, and class arrow properties
+    const tsGenerics = extractSymbols(
+      "service.ts",
+      [
+        "export type Handler<T = Record<string, unknown>> = {",
+        "  handle(input: T): void;",
+        "};",
+        "export class EventService {",
+        "  async fetchAll<T = Array<string>>(url: string): Promise<T> {",
+        "    return url as unknown as T;",
+        "  }",
+        "  private onMessage = async (payload: string) => {",
+        "    return payload.trim();",
+        "  };",
+        "  #flushQueue() {",
+        "    return true;",
+        "  }",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsGenerics.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "type:Handler:1-3",
+        "class:EventService:4-14",
+        "method:fetchAll:5-7",
+        "method:onMessage:8-10",
+        "method:#flushQueue:11-13",
+      ],
+    );
+
+    // 3. CommonMark 4-backtick outer fence containing 3-backtick inner fence
+    const mdNested = extractSymbols(
+      "GUIDE.md",
+      [
+        "# Overview",
+        "````markdown",
+        "```bash",
+        "# Fake Heading Inside Nested Code Fence",
+        "```",
+        "````",
+        "## Real Section After Example",
+        "Body line",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      mdNested.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["h1:Overview:1-8", "h2:Real Section After Example:7-8"],
+    );
+
+    // 4. Rust multiline raw string r#"..."# with unbalanced `{` and fake `fn`
+    const rsRaw = extractSymbols(
+      "shader.rs",
+      [
+        "pub fn build_shader() -> &'static str {",
+        '    let wgsl = r#"',
+        "fn vertex_main() {",
+        '    "#;',
+        "    wgsl",
+        "}",
+        "pub fn after_shader() {}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      rsRaw.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["fn:build_shader:1-6", "fn:after_shader:7-7"],
+    );
+
+    // 5. GitHub Actions YAML quoted `"on":` + 0-indent JSON root keys + array-root JSON
+    const ymlCi = extractSymbols(
+      "ci.yml",
+      [
+        "name: CI",
+        '"on":',
+        "  push:",
+        "    branches: [main, dev]",
+        "jobs:",
+        "  verify:",
+        "    runs-on: ubuntu-latest",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      ymlCi.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["key:name:1-1", "key:on:2-4", "key:jobs:5-7"],
+    );
+
+    const zeroIndentJson = extractSymbols(
+      "package.json",
+      '{\n"name": "pkg",\n"scripts": {\n  "build": "tsc"\n}\n}',
+    );
+    assert.deepEqual(
+      zeroIndentJson.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["key:name:2-2", "key:scripts:3-5"],
+    );
+    assert.deepEqual(extractSymbols("items.json", '[\n  { "id": 1 },\n  { "id": 2 }\n]'), []);
+  });
+
+  it("extracts SQL (.sql) DDL symbol outlines across comments, quoted/schema names, and $$ bodies", () => {
+    const sqlDoc = [
+      "-- Initial database migration", // 1
+      "/* Block comment with fake statement:", // 2
+      "   CREATE TABLE should_ignore (id int);", // 3
+      "*/", // 4
+      "BEGIN;", // 5
+      "", // 6
+      "CREATE SCHEMA IF NOT EXISTS analytics;", // 7
+      "", // 8
+      "CREATE SEQUENCE IF NOT EXISTS public.user_id_seq", // 9
+      "  START WITH 1000;", // 10
+      "", // 11
+      "CREATE TYPE public.account_status AS ENUM (", // 12
+      "  'pending',", // 13
+      "  'active;verified'", // 14
+      ");", // 15
+      "", // 16
+      "CREATE TEMP TABLE IF NOT EXISTS \"public\".\"users\" (", // 17
+      "  id BIGINT PRIMARY KEY DEFAULT nextval('public.user_id_seq'), -- inline ; comment", // 18
+      "  email TEXT NOT NULL,", // 19
+      "  status public.account_status DEFAULT 'pending'", // 20
+      ");", // 21
+      "", // 22
+      "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email", // 23
+      "  ON public.users (email);", // 24
+      "", // 25
+      "CREATE MATERIALIZED VIEW `analytics`.`active_users` AS", // 26
+      "SELECT id, email", // 27
+      "FROM public.users", // 28
+      "WHERE status = 'active;verified';", // 29
+      "", // 30
+      "CREATE OR REPLACE FUNCTION public.normalize_email(raw_email TEXT)", // 31
+      "RETURNS TEXT", // 32
+      "LANGUAGE plpgsql", // 33
+      "AS $$", // 34
+      "DECLARE", // 35
+      "  cleaned TEXT := lower(trim(raw_email));", // 36
+      "BEGIN", // 37
+      "  IF cleaned = '' THEN", // 38
+      "    RETURN NULL;", // 39
+      "  END IF;", // 40
+      "  RETURN cleaned;", // 41
+      "END;", // 42
+      "$$;", // 43
+      "", // 44
+      "CREATE PROCEDURE analytics.refresh_views()", // 45
+      "LANGUAGE plpgsql AS $proc$", // 46
+      "BEGIN", // 47
+      "  REFRESH MATERIALIZED VIEW analytics.active_users;", // 48
+      "END;", // 49
+      "$proc$;", // 50
+      "", // 51
+      "CREATE TRIGGER trg_users_normalize", // 52
+      "  BEFORE INSERT ON public.users", // 53
+      "  FOR EACH ROW EXECUTE FUNCTION public.normalize_email();", // 54
+      "", // 55
+      "ALTER TABLE IF EXISTS ONLY \"public\".\"users\"", // 56
+      "  ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW();", // 57
+      "", // 58
+      "COMMIT;", // 59
+    ].join("\n");
+
+    const syms = extractSymbols("001_init.sql", sqlDoc);
+    assert.deepEqual(
+      syms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "schema:analytics:7-7",
+        "sequence:public.user_id_seq:9-10",
+        "type:public.account_status:12-15",
+        "table:public.users:17-21",
+        "index:idx_users_email:23-24",
+        "view:analytics.active_users:26-29",
+        "function:public.normalize_email:31-43",
+        "procedure:analytics.refresh_views:45-50",
+        "trigger:trg_users_normalize:52-54",
+        "alter:public.users:56-57",
+      ],
+    );
+
+    // SQLite / MySQL BEGIN ... END; compound trigger without $$
+    const sqliteTrigger = [
+      "CREATE TRIGGER audit_log_insert AFTER INSERT ON users",
+      "BEGIN",
+      "  INSERT INTO audit_log(user_id) VALUES (NEW.id);",
+      "  UPDATE counters SET total = total + 1;",
+      "END;",
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("trigger.sql", sqliteTrigger).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["trigger:audit_log_insert:1-5"],
+    );
+  });
+
+  it("extracts Protocol Buffers (.proto) and GraphQL (.graphql/.gql) schema outlines", () => {
+    const protoDoc = [
+      'syntax = "proto3";', // 1
+      "package acme.orders.v1;", // 2
+      "", // 3
+      "/* message FakeCommented { string id = 1; } */", // 4
+      "message Order {", // 5
+      "  enum Status {", // 6
+      "    STATUS_UNSPECIFIED = 0;", // 7
+      "    STATUS_PAID = 1;", // 8
+      "  }", // 9
+      "  oneof payment {", // 10
+      "    string card_token = 2;", // 11
+      "    string bank_iban = 3;", // 12
+      "  }", // 13
+      "  string message = 4; // field named message, not a declaration", // 14
+      "}", // 15
+      "", // 16
+      "extend google.protobuf.FieldOptions {", // 17
+      "  bool redacted = 50001;", // 18
+      "}", // 19
+      "", // 20
+      "service OrderService {", // 21
+      "  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);", // 22
+      "  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {", // 23
+      "    option (google.api.http) = {", // 24
+      '      post: "/v1/orders"', // 25
+      "    };", // 26
+      "  }", // 27
+      "}", // 28
+    ].join("\n");
+
+    const protoSyms = extractSymbols("orders.proto", protoDoc);
+    assert.deepEqual(
+      protoSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "package:acme.orders.v1:2-2:d0",
+        "message:Order:5-15:d0",
+        "enum:Status:6-9:d1",
+        "oneof:payment:10-13:d1",
+        "extend:google.protobuf.FieldOptions:17-19:d0",
+        "service:OrderService:21-28:d0",
+        "rpc:GetOrder:22-22:d1",
+        "rpc:CreateOrder:23-27:d1",
+      ],
+    );
+
+    const gqlDoc = [
+      '"""', // 1
+      "Schema docs with fake type inside block string:", // 2
+      "type FakeDocType { id: ID! }", // 3
+      '"""', // 4
+      "# Single-line comment: type IgnoredComment { id: ID! }", // 5
+      "scalar DateTime", // 6
+      "", // 7
+      "directive @auth(", // 8
+      "  requires: Role = ADMIN", // 9
+      ") repeatable on OBJECT | FIELD_DEFINITION", // 10
+      "", // 11
+      "enum Role {", // 12
+      "  ADMIN", // 13
+      "  USER", // 14
+      "}", // 15
+      "", // 16
+      "interface Node {", // 17
+      "  id: ID!", // 18
+      "}", // 19
+      "", // 20
+      "type User implements Node @auth(requires: USER) {", // 21
+      '  """Field description containing { unbalanced brace"""', // 22
+      "  id: ID! # inline comment { brace", // 23
+      "  createdAt: DateTime!", // 24
+      "}", // 25
+      "", // 26
+      "input CreateUserInput {", // 27
+      "  email: String!", // 28
+      "}", // 29
+      "", // 30
+      "union SearchResult =", // 31
+      "  | User", // 32
+      "  | Node", // 33
+      "", // 34
+      "schema {", // 35
+      "  query: Query", // 36
+      "  mutation: Mutation", // 37
+      "}", // 38
+      "", // 39
+      "fragment UserFields on User {", // 40
+      "  id", // 41
+      "}", // 42
+      "", // 43
+      "query GetUser($id: ID!) {", // 44
+      "  user(id: $id) { ...UserFields }", // 45
+      "}", // 46
+      "", // 47
+      "mutation CreateUser($input: CreateUserInput!) {", // 48
+      "  createUser(input: $input) { id }", // 49
+      "}", // 50
+      "", // 51
+      "subscription OnUserCreated {", // 52
+      "  userCreated { id }", // 53
+      "}", // 54
+    ].join("\n");
+
+    const gqlSyms = extractSymbols("schema.graphql", gqlDoc);
+    assert.deepEqual(extractSymbols("ops.gql", gqlDoc), gqlSyms);
+    assert.deepEqual(
+      gqlSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "scalar:DateTime:6-6",
+        "directive:@auth:8-10",
+        "enum:Role:12-15",
+        "interface:Node:17-19",
+        "type:User:21-25",
+        "input:CreateUserInput:27-29",
+        "union:SearchResult:31-33",
+        "schema:schema:35-38",
+        "fragment:UserFields:40-42",
+        "query:GetUser:44-46",
+        "mutation:CreateUser:48-50",
+        "subscription:OnUserCreated:52-54",
+      ],
+    );
+  });
+
+  it("extracts Terraform/HCL (.tf/.tfvars) and multi-stage Dockerfile/Containerfile outlines", () => {
+    const tfDoc = [
+      "terraform {", // 1
+      '  required_version = ">= 1.6.0"', // 2
+      "}", // 3
+      "", // 4
+      'provider "aws" {', // 5
+      '  region = var.region', // 6
+      "}", // 7
+      "", // 8
+      'variable "region" {', // 9
+      "  type = string", // 10
+      "}", // 11
+      "", // 12
+      "locals {", // 13
+      '  common_tags = { env = "prod" }', // 14
+      "}", // 15
+      "", // 16
+      'data "aws_ami" "ubuntu" {', // 17
+      "  most_recent = true", // 18
+      "}", // 19
+      "", // 20
+      'module "vpc" {', // 21
+      '  source = "./modules/vpc"', // 22
+      "}", // 23
+      "", // 24
+      'resource "aws_instance" "web" {', // 25
+      "  ami = data.aws_ami.ubuntu.id", // 26
+      "  user_data = <<-EOF", // 27
+      "    #!/bin/bash", // 28
+      '    echo "{ unbalanced brace inside heredoc"', // 29
+      '    resource "fake" "ignored" {', // 30
+      "  EOF", // 31
+      "}", // 32
+      "", // 33
+      'output "instance_id" {', // 34
+      "  value = aws_instance.web.id", // 35
+      "}", // 36
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("main.tf", tfDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "terraform:terraform:1-3",
+        "provider:aws:5-7",
+        "variable:region:9-11",
+        "locals:locals:13-15",
+        "data:aws_ami.ubuntu:17-19",
+        "module:vpc:21-23",
+        "resource:aws_instance.web:25-32",
+        "output:instance_id:34-36",
+      ],
+    );
+
+    const tfvarsDoc = [
+      'region = "us-west-2"', // 1
+      "subnets = [", // 2
+      '  "10.0.1.0/24",', // 3
+      '  "10.0.2.0/24",', // 4
+      "]", // 5
+      "tags = {", // 6
+      '  owner = "platform"', // 7
+      "}", // 8
+      "bootstrap = <<EOF", // 9
+      "echo 'hello { world'", // 10
+      "EOF", // 11
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("prod.tfvars", tfvarsDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "key:region:1-1",
+        "key:subnets:2-5",
+        "key:tags:6-8",
+        "key:bootstrap:9-11",
+      ],
+    );
+
+    const dockerDoc = [
+      "# syntax=docker/dockerfile:1", // 1
+      "ARG NODE_VERSION=22", // 2
+      "", // 3
+      "FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine AS builder", // 4
+      "WORKDIR /app", // 5
+      "ARG NPM_TOKEN", // 6
+      "RUN <<EOF", // 7
+      "FROM fake_inside_heredoc", // 8
+      "CMD ['ignored']", // 9
+      "EOF", // 10
+      "RUN npm ci && \\", // 11
+      "    npm run build", // 12
+      "", // 13
+      "# Runtime stage", // 14
+      "FROM node:${NODE_VERSION}-slim AS runner", // 15
+      "WORKDIR /app", // 16
+      "COPY --from=builder /app/dist ./dist", // 17
+      'ENTRYPOINT ["node", "dist/mcp-server.mjs"]', // 18
+      'CMD ["--stdio"]', // 19
+    ].join("\n");
+
+    const dockerSyms = extractSymbols("Dockerfile.prod", dockerDoc);
+    assert.deepEqual(extractSymbols("app.dockerfile", dockerDoc), dockerSyms);
+    assert.deepEqual(extractSymbols("Containerfile", dockerDoc), dockerSyms);
+    assert.deepEqual(
+      dockerSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "arg:NODE_VERSION:2-2:d0",
+        "stage:node:${NODE_VERSION}-alpine AS builder:4-12:d0",
+        "arg:NPM_TOKEN:6-6:d1",
+        "stage:node:${NODE_VERSION}-slim AS runner:15-19:d0",
+        'entrypoint:["node", "dist/mcp-server.mjs"]:18-18:d1',
+        'cmd:["--stdio"]:19-19:d1',
+      ],
+    );
+  });
+
+  it("extracts C/C++ (.c/.h/.cpp/.hpp/.cc/.cxx) and C# (.cs) outlines across #define macros, templates, and control flow", () => {
+    const cppDoc = [
+      "#pragma once", // 1
+      "#define DECLARE_FAKE_TYPE(Name) \\", // 2
+      "  class Name { \\", // 3
+      "    void fake() {} \\", // 4
+      "  }", // 5
+      "", // 6
+      "class ForwardOnly;", // 7 (forward decl skipped)
+      "", // 8
+      "namespace engine::core {", // 9
+      "enum class State : int {", // 10
+      "  Idle = 0,", // 11
+      "  Running = 1,", // 12
+      "};", // 13
+      "", // 14
+      "template <typename T>", // 15
+      "class RingBuffer {", // 16
+      "public:", // 17
+      "  explicit RingBuffer(size_t cap) : cap_{cap} {", // 18
+      "    if (cap == 0) {", // 19
+      "      cap_ = 1;", // 20
+      "    }", // 21
+      "  }", // 22
+      "", // 23
+      "  ~RingBuffer() noexcept {", // 24
+      "    clear();", // 25
+      "  }", // 26
+      "", // 27
+      "  bool push(const T& item) {", // 28
+      "    for (size_t i = 0; i < cap_; ++i) {", // 29
+      '      const char* raw = R"(unbalanced { in C++ raw string)";', // 30
+      "      (void)raw;", // 31
+      "    }", // 32
+      "    return true;", // 33
+      "  }", // 34
+      "private:", // 35
+      "  size_t cap_;", // 36
+      "};", // 37
+      "}", // 38
+      "", // 39
+      "template <typename T>", // 40
+      "constexpr T clamp_value(T v, T lo, T hi) {", // 41
+      "  while (false) {}", // 42
+      "  return v < lo ? lo : (v > hi ? hi : v);", // 43
+      "}", // 44
+    ].join("\n");
+
+    const cppSyms = extractSymbols("ring_buffer.hpp", cppDoc);
+    assert.deepEqual(extractSymbols("ring_buffer.cxx", cppDoc), cppSyms);
+    assert.deepEqual(
+      cppSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "namespace:engine::core:9-38:d0",
+        "enum:State:10-13:d1",
+        "class:RingBuffer:15-37:d1",
+        "method:RingBuffer:18-22:d2",
+        "method:~RingBuffer:24-26:d2",
+        "method:push:28-34:d2",
+        "function:clamp_value:40-44:d0",
+      ],
+    );
+
+    const cHeaderDoc = [
+      "#ifndef STORAGE_H", // 1
+      "#define STORAGE_H", // 2
+      "typedef struct {", // 3
+      "  int max_conns;", // 4
+      "} storage_opts_t;", // 5
+      "int storage_open(const storage_opts_t *opts);", // 6 (prototype skipped)
+      "static inline int storage_is_valid(const storage_opts_t *opts) {", // 7
+      "  switch (opts ? opts->max_conns : 0) {", // 8
+      "    case 0: return 0;", // 9
+      "    default: return 1;", // 10
+      "  }", // 11
+      "}", // 12
+      "#endif", // 13
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("storage.h", cHeaderDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["struct:storage_opts_t:3-5", "function:storage_is_valid:7-12"],
+    );
+
+    const csDoc = [
+      "namespace Acme.Billing {", // 1
+      "    public interface IBiller {", // 2
+      "        Task<bool> ChargeAsync(decimal amount);", // 3
+      "    }", // 4
+      "", // 5
+      "    public sealed record InvoiceDto(Guid Id, decimal Total);", // 6
+      "", // 7
+      "    public class StripeBiller : IBiller {", // 8
+      "        public StripeBiller(HttpClient client) {", // 9
+      '            var dir = @"C:\\temp\\";', // 10 (verbatim trailing backslash!)
+      "        }", // 11
+      "", // 12
+      "        public async Task<bool> ChargeAsync(decimal amount) {", // 13
+      "            try {", // 14
+      "                if (amount <= 0) {", // 15
+      "                    return false;", // 16
+      "                }", // 17
+      "            } catch (Exception) {", // 18
+      "                return false;", // 19
+      "            }", // 20
+      "            return true;", // 21
+      "        }", // 22
+      "", // 23
+      "        public string FormatAmount(decimal amount) => amount.ToString();", // 24
+      "    }", // 25
+      "}", // 26
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("StripeBiller.cs", csDoc).map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "namespace:Acme.Billing:1-26:d0",
+        "interface:IBiller:2-4:d1",
+        "record:InvoiceDto:6-6:d1",
+        "class:StripeBiller:8-25:d1",
+        "method:StripeBiller:9-11:d2",
+        "method:ChargeAsync:13-22:d2",
+        "method:FormatAmount:24-24:d2",
+      ],
+    );
+  });
+
+  it("outlines TS/JS component/store/context wrappers and export default blocks with true multi-line endLine", () => {
+    const reactAndStoreDoc = [
+      "export const ThemeContext = createContext<ThemeState>({", // 1
+      '  mode: "dark",', // 2
+      "});", // 3
+      "", // 4
+      "export const PrimaryButton = React.memo(", // 5
+      "  forwardRef<", // 6
+      "    HTMLButtonElement,", // 7
+      "    { label: string; onClick?: (ev: MouseEvent) => void }", // 8
+      "  >(function PrimaryButton(props, ref) {", // 9
+      "    return <button ref={ref}>{props.label}</button>;", // 10
+      "  }),", // 11
+      ");", // 12
+      "", // 13
+      "export const SearchInput = React.forwardRef<HTMLInputElement, InputProps>((props, ref) => {", // 14
+      "  return <input ref={ref} {...props} />;", // 15
+      "});", // 16
+      "", // 17
+      "export const VueWidget = defineComponent({", // 18
+      '  name: "VueWidget",', // 19
+      "  setup() {", // 20
+      "    return {};", // 21
+      "  },", // 22
+      "});", // 23
+      "", // 24
+      'export const useCartStore = defineStore("cart", () => {', // 25
+      "  const items: string[] = [];", // 26
+      "  return { items };", // 27
+      "});", // 28
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("components.tsx", reactAndStoreDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      [
+        "const:ThemeContext:1-3",
+        "component:PrimaryButton:5-12",
+        "component:SearchInput:14-16",
+        "component:VueWidget:18-23",
+        "const:useCartStore:25-28",
+      ],
+    );
+
+    const viteConfigDoc = [
+      'import { defineConfig } from "vite";', // 1
+      "", // 2
+      "export default defineConfig({", // 3
+      "  server: {", // 4
+      "    port: 5173,", // 5
+      "  },", // 6
+      "});", // 7
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("vite.config.ts", viteConfigDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["export:default:3-7"],
+    );
+
+    const objDefaultDoc = [
+      "export default {", // 1
+      "  reactStrictMode: true,", // 2
+      "  experimental: { typedRoutes: true },", // 3
+      "} satisfies NextConfig;", // 4
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("next.config.ts", objDefaultDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["export:default:1-4"],
+    );
+
+    const fnDefaultDoc = [
+      "export default async function (req: Request) {", // 1
+      '  return new Response("ok");', // 2
+      "}", // 3
+    ].join("\n");
+    assert.deepEqual(
+      extractSymbols("route.ts", fnDefaultDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      ["function:default:1-3"],
+    );
+  });
+
+  it("ignores </script> and </style> inside literals/comments in SFCs and outlines .astro components", () => {
+    const vueLiteralClose = [
+      '<script setup lang="ts">', // 1
+      'const fakeStr = "</script>";', // 2
+      "const fakeTpl = `<script>${1 + 1}</script>`;", // 3
+      "// line comment mentioning </script>", // 4
+      "/* block comment mentioning </script> */", // 5
+      "function renderEmbed() {", // 6
+      "  return fakeStr + fakeTpl;", // 7
+      "}", // 8
+      "</script>", // 9
+      "", // 10
+      "<template>", // 11
+      '  <main><section id="embed-root"><EmbedModal /></section></main>', // 12
+      "</template>", // 13
+      "", // 14
+      '<style scoped lang="scss">', // 15
+      "/* comment with </style> */", // 16
+      "// scss comment with </style>", // 17
+      '.embed::after { content: "</style>"; background: url(https://example.com/a.svg); }', // 18
+      "@media (max-width: 768px) {", // 19
+      "  .embed { display: block; }", // 20
+      "}", // 21
+      "</style>", // 22
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("Embed.vue", vueLiteralClose).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        'script:<script setup lang="ts">:1-9:d0',
+        "function:renderEmbed:6-8:d1",
+        "template:<template>:11-13:d0",
+        "block:<main>:12-12:d1",
+        "block:<section #embed-root>:12-12:d2",
+        "component:<EmbedModal>:12-12:d2",
+        'style:<style scoped lang="scss">:15-22:d0',
+        "@media:(max-width: 768px):19-21:d1",
+      ],
+    );
+
+    const astroDoc = [
+      "---", // 1
+      "export interface Props {", // 2
+      "  title: string;", // 3
+      "}", // 4
+      "const rule = `", // 5
+      "---", // 6 (inside template literal — must NOT close frontmatter!)
+      "`;", // 7
+      "function buildHeading(title: string) {", // 8
+      "  return title.toUpperCase();", // 9
+      "}", // 10
+      "---", // 11
+      "", // 12
+      "<main>", // 13
+      '  <section id="hero">', // 14
+      "    <SearchModal />", // 15
+      "  </section>", // 16
+      "</main>", // 17
+      "", // 18
+      "<script>", // 19
+      '  const ignore = "</script>";', // 20
+      "  function hydrateHero() {", // 21
+      "    return ignore;", // 22
+      "  }", // 23
+      "</script>", // 24
+      "", // 25
+      "<style>", // 26
+      "  :root { --hero-gap: 1rem; }", // 27
+      "</style>", // 28
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("Hero.astro", astroDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "frontmatter:---:1-11:d0",
+        "interface:Props:2-4:d1",
+        "function:buildHeading:8-10:d1",
+        "block:<main>:13-17:d0",
+        "block:<section #hero>:14-16:d1",
+        "component:<SearchModal>:15-15:d2",
+        "script:<script>:19-24:d0",
+        "function:hydrateHero:21-23:d1",
+        "style:<style>:26-28:d0",
+        "tokens::root:27-27:d1",
+      ],
+    );
+  });
+
+  it("extracts YAML depth-1 section children while skipping literal/folded block scalars", () => {
+    const ghaDoc = [
+      "name: Release", // 1
+      '"on":', // 2
+      "  push:", // 3
+      "    branches: [main]", // 4
+      "", // 5
+      "jobs:", // 6
+      "  build:", // 7
+      "    runs-on: ubuntu-latest", // 8
+      "    steps:", // 9
+      "      - name: Run suite", // 10
+      "        run: |", // 11
+      '          echo "key: val"', // 12 (inside `|` — must NOT become a YAML symbol!)
+      "          fake_sibling:", // 13
+      "            nested: 1", // 14
+      "  deploy:", // 15
+      "    needs: build", // 16
+      "    steps:", // 17
+      "      - run: >-", // 18
+      '          echo "another_key: ignored"', // 19
+      "", // 20
+      "notes: |-", // 21
+      "  fake_section:", // 22
+      "    item: true", // 23
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("release.yml", ghaDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "key:name:1-1:d0",
+        "key:on:2-4:d0",
+        "key:jobs:6-19:d0",
+        "section:jobs.build:7-14:d1",
+        "section:jobs.deploy:15-19:d1",
+        "key:notes:21-23:d0",
+      ],
+    );
+
+    const openApiDoc = [
+      "openapi: 3.1.0", // 1
+      "paths:", // 2
+      "  /v1/users:", // 3
+      "    get:", // 4
+      "      summary: List users", // 5
+      "  /v1/users/{id}:", // 6
+      "    delete:", // 7
+      "      summary: Delete user", // 8
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("openapi.yaml", openApiDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "key:openapi:1-1:d0",
+        "key:paths:2-8:d0",
+        "section:paths./v1/users:3-5:d1",
+        "section:paths./v1/users/{id}:6-8:d1",
+      ],
+    );
+  });
+
+  it("supports Python PEP 695 type aliases, match blocks, decorator-aware methods, and triple-quoted f-string docstrings", () => {
+    const pyDoc = [
+      "type Scalar = int | float | str", // 1
+      "", // 2
+      "type Matrix[T: (int, float)] = (", // 3
+      "    list[list[T]]", // 4
+      ")", // 5
+      "", // 6
+      'type = "not_a_type_alias"', // 7 (soft-keyword assignment ignored)
+      'match = "not_a_match_stmt"', // 8 (soft-keyword assignment ignored)
+      "", // 9
+      "class Repository[T]:", // 10
+      '    """', // 11
+      "    Docstring example that must be ignored:", // 12
+      "    def fake_in_docstring():", // 13
+      "        pass", // 14
+      '    """', // 15
+      "", // 16
+      "    @classmethod", // 17
+      '    def create(cls, prefix: str) -> "Repository[T]":', // 18
+      '        msg = f"""{prefix.strip(\'"""\')}', // 19
+      "def fake_in_triple_fstring():", // 20
+      '    pass"""', // 21
+      "        _ = msg", // 22
+      "        return cls()", // 23
+      "", // 24
+      "    @staticmethod", // 25
+      "    def normalize_key(key: str) -> str:", // 26
+      "        return key.strip().lower()", // 27
+      "", // 28
+      "    @abstractmethod", // 29
+      "    async def fetch(self, action: str) -> T | None:", // 30
+      "        match action:", // 31
+      '            case "get":', // 32
+      "                return None", // 33
+      "            case _:", // 34
+      "                return None", // 35
+      "", // 36
+      "match sys_mode:", // 37
+      '    case "cli":', // 38
+      "        pass", // 39
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("repo.py", pyDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`,
+      ),
+      [
+        "type:Scalar:1-1:d0",
+        "type:Matrix:3-5:d0",
+        "class:Repository:10-35:d0",
+        "method:create:17-23:d1",
+        "method:normalize_key:25-27:d1",
+        "method:fetch:29-35:d1",
+        "match:action:31-35:d2",
+        "match:sys_mode:37-39:d0",
+      ],
+    );
+  });
+
+  it("supports Go receiver method labels, grouped type (...) blocks, and Shell (.sh/.bash/.zsh) heredoc-safe outlines", () => {
+    const goDoc = [
+      "package transport", // 1
+      "", // 2
+      "type (", // 3
+      "  // Config holds transport options", // 4
+      "  Config struct {", // 5
+      "    Addr string", // 6
+      "    Inner struct {", // 7
+      "      Timeout int", // 8
+      "    }", // 9
+      "  }", // 10
+      "", // 11
+      "  Codec interface {", // 12
+      "    Encode(v any) ([]byte, error)", // 13
+      "  }", // 14
+      "", // 15
+      "  Middleware func(", // 16
+      "    next Codec,", // 17
+      "  ) Codec", // 18
+      ")", // 19
+      "", // 20
+      "func (c *Config) Validate() error {", // 21
+      "  return nil", // 22
+      "}", // 23
+      "", // 24
+      "func (*Config) Reset() {}", // 25
+    ].join("\n");
+
+    assert.deepEqual(
+      extractSymbols("transport.go", goDoc).map(
+        (s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`,
+      ),
+      [
+        "struct:Config:5-10",
+        "interface:Codec:12-14",
+        "type:Middleware:16-18",
+        "method:Config.Validate:21-23",
+        "method:Config.Reset:25-25",
+      ],
+    );
+
+    const shDoc = [
+      "#!/usr/bin/env bash", // 1
+      "# fake_comment_fn() { echo nope; }", // 2
+      "", // 3
+      "function log::info {", // 4
+      '  echo "[INFO] $*"', // 5
+      "}", // 6
+      "", // 7
+      "write_template()", // 8
+      "{", // 9
+      "  local mask=$(( 1 << shift_bits ))", // 10 (arithmetic << must NOT open heredoc!)
+      "  cat <<- 'EOF' > /tmp/out.sh", // 11
+      "fake_in_heredoc() {", // 12
+      '  echo "{ unbalanced brace in heredoc"', // 13
+      "}", // 14
+      "  EOF", // 15
+      "}", // 16
+      "", // 17
+      "cleanup_all() {", // 18
+      "  rm -f /tmp/out.sh", // 19
+      "}", // 20
+    ].join("\n");
+
+    const shSyms = extractSymbols("deploy.sh", shDoc);
+    assert.deepEqual(extractSymbols("deploy.bash", shSyms.length ? shDoc : ""), shSyms);
+    assert.deepEqual(extractSymbols("deploy.zsh", shDoc), shSyms);
+    assert.deepEqual(
+      shSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "function:log::info:4-6",
+        "function:write_template:8-16",
+        "function:cleanup_all:18-20",
+      ],
+    );
+  });
 });
