@@ -1,3 +1,72 @@
+import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+/** Default number of rotated spill files kept on disk. */
+export const DEFAULT_SPILL_KEEP = 20;
+/** Environment variable overriding the spill directory. */
+export const SPILL_DIR_ENV = "AGY_FAST_SPILL_DIR";
+
+/**
+ * Write the full raw text to a rotated local spill file. Returns the spill
+ * file path, or null if writing fails. Never throws into the caller.
+ */
+export function writeSpillFile(text: string, keep = DEFAULT_SPILL_KEEP): string | null {
+  try {
+    const dir =
+      process.env[SPILL_DIR_ENV] ||
+      path.join(os.tmpdir(), "agy-fast-spill");
+    mkdirSync(dir, { recursive: true });
+    const stamp = Date.now();
+    let file = path.join(dir, `spill-${stamp}.txt`);
+    let n = 0;
+    while (existsSyncSafe(file)) {
+      n += 1;
+      file = path.join(dir, `spill-${stamp}-${n}.txt`);
+    }
+    writeFileSync(file, text, "utf8");
+    rotateSpillFiles(dir, keep);
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+function existsSyncSafe(file: string): boolean {
+  try {
+    return readdirSync(path.dirname(file)).includes(path.basename(file));
+  } catch {
+    return false;
+  }
+}
+
+function rotateSpillFiles(dir: string, keep: number): void {
+  if (!Number.isFinite(keep) || keep <= 0) return;
+  try {
+    const files = readdirSync(dir)
+      .filter((f) => f.startsWith("spill-") && f.endsWith(".txt"))
+      .map((f) => {
+        try {
+          return { f, m: statSync(path.join(dir, f)).mtimeMs };
+        } catch {
+          return { f, m: 0 };
+        }
+      })
+      .sort((a, b) => a.m - b.m)
+      .map((e) => e.f);
+    const limit = Math.trunc(keep);
+    for (const stale of files.slice(0, Math.max(0, files.length - limit))) {
+      try {
+        unlinkSync(path.join(dir, stale));
+      } catch {
+        // ignore rotation failures
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 // Matches standard ANSI CSI / OSC escape sequences
 const ANSI_REGEX =
   // eslint-disable-next-line no-control-regex
@@ -127,6 +196,7 @@ export function sliceUtf8BytesTail(text: string, maxBytes: number): string {
 export function truncateHeadTailWithByteNotice(
   text: string,
   maxBytes: number,
+  options?: { spill?: boolean },
 ): string {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
@@ -134,17 +204,23 @@ export function truncateHeadTailWithByteNotice(
   const totalBytes = Buffer.byteLength(text, "utf8");
   if (totalBytes <= limit) return text;
 
+  const spill = options?.spill !== false;
+  const spillPath = spill ? writeSpillFile(text) : null;
+  const spillHint = spillPath
+    ? `\n... [full output saved to: ${spillPath}; use batch_search or ranged read_file to inspect omitted sections]`
+    : "";
+
   if (limit < 120) {
-    return truncateWithByteNotice(text, limit);
+    return truncateWithByteNotice(text, limit, { spill: false, spillHint });
   }
 
   const maxMarkerBytes = Buffer.byteLength(
-    `\n... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes] ...\n`,
+    `\n... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes]${spillHint}\n`,
     "utf8",
   );
   const contentBytes = limit - maxMarkerBytes;
   if (contentBytes < 40) {
-    return truncateWithByteNotice(text, limit);
+    return truncateWithByteNotice(text, limit, { spill: false, spillHint });
   }
 
   const headBudget = Math.max(16, Math.floor(contentBytes * 0.38));
@@ -171,19 +247,32 @@ export function truncateHeadTailWithByteNotice(
   const headBytes = Buffer.byteLength(head, "utf8");
   const tailBytes = Buffer.byteLength(tail, "utf8");
   const omittedBytes = Math.max(1, totalBytes - headBytes - tailBytes);
-  const marker = `\n... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes] ...\n`;
+  const marker = `\n... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes]${spillHint} ...\n`;
   const result = `${head}${marker}${tail}`;
   return Buffer.byteLength(result, "utf8") <= limit
     ? result
-    : truncateWithByteNotice(result, limit);
+    : truncateWithByteNotice(text, limit, { spill: false, spillHint });
 }
 
-export function truncateWithByteNotice(text: string, maxBytes: number): string {
+export function truncateWithByteNotice(
+  text: string,
+  maxBytes: number,
+  options?: { spill?: boolean; spillHint?: string },
+): string {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
   if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
   if (totalBytes <= limit) return text;
+
+  const spillHint = options?.spillHint;
+  const spillPath =
+    spillHint === undefined && options?.spill !== false
+      ? writeSpillFile(text)
+      : null;
+  const hint = spillHint ?? (spillPath
+    ? `\n... [full output saved to: ${spillPath}; use batch_search or ranged read_file to inspect omitted sections]`
+    : "");
 
   if (limit < 56) {
     if (limit <= 3) return sliceUtf8Bytes(text, limit);
@@ -191,7 +280,7 @@ export function truncateWithByteNotice(text: string, maxBytes: number): string {
   }
 
   const maxNoticeBytes = Buffer.byteLength(
-    `\n... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
+    `\n... [truncated: showed ${totalBytes} of ${totalBytes} bytes]${hint}`,
     "utf8",
   );
   const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
@@ -204,7 +293,7 @@ export function truncateWithByteNotice(text: string, maxBytes: number): string {
     slice = slice.slice(0, lastNewline);
   }
   const shownBytes = Buffer.byteLength(slice, "utf8");
-  const result = `${slice}\n... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
+  const result = `${slice}\n... [truncated: showed ${shownBytes} of ${totalBytes} bytes]${hint}`;
   return Buffer.byteLength(result, "utf8") <= limit
     ? result
     : sliceUtf8Bytes(result, limit);
