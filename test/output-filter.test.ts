@@ -9,7 +9,13 @@ import {
   formatExitFailureLabel,
   normalizeTerminalOutput,
   prepareCompactCommandOutput,
+  truncateHeadTailWithByteNotice,
+  truncateWithByteNotice,
+  writeSpillFile,
 } from "../src/utils/output-filter.js";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 describe("output-filter", () => {
   it("computeWaterFillBudgets allocates exact water-filling shares across edge cases", () => {
@@ -646,5 +652,88 @@ describe("output-filter", () => {
       timedOut: false,
     });
     assert.equal(unknownEmpty.bodyText, "Exited with code unknown");
+  });
+});
+
+
+describe("output-filter spill", () => {
+  const bigText = ("x".repeat(60) + "\n").repeat(200); // ~12 KB
+
+  function makeSpillDir(): string {
+    return mkdtempSync(path.join(os.tmpdir(), "agy-fast-spill-test-"));
+  }
+
+  it("truncateWithByteNotice writes a spill file only when truncation occurs", () => {
+    const dir = makeSpillDir();
+    try {
+      process.env.AGY_FAST_SPILL_DIR = dir;
+      const truncated = truncateWithByteNotice(bigText, 500);
+      assert.ok(truncated.includes("[truncated:"));
+      assert.ok(truncated.includes("full output saved to:"));
+      const files = readdirSync(dir).filter((f) => f.startsWith("spill-"));
+      assert.equal(files.length, 1);
+      const spillPath = path.join(dir, files[0]!);
+      assert.ok(truncated.includes(spillPath));
+      assert.equal(readFileSync(spillPath, "utf8"), bigText);
+
+      // No truncation -> no spill writes
+      const before = readdirSync(dir).length;
+      const inline = truncateWithByteNotice(bigText.slice(0, 100), 500);
+      assert.equal(inline, bigText.slice(0, 100));
+      assert.equal(readdirSync(dir).length, before);
+    } finally {
+      delete process.env.AGY_FAST_SPILL_DIR;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("truncateHeadTailWithByteNotice spills the full original text and hints recovery", () => {
+    const dir = makeSpillDir();
+    try {
+      process.env.AGY_FAST_SPILL_DIR = dir;
+      const truncated = truncateHeadTailWithByteNotice(bigText, 8800);
+      assert.ok(truncated.length <= 8800);
+      assert.ok(truncated.includes("full output saved to:"));
+      assert.ok(truncated.includes("batch_search or ranged read_file"));
+      const files = readdirSync(dir).filter((f) => f.startsWith("spill-"));
+      assert.equal(files.length, 1);
+      // Only one spill write even though head-tail may fall back internally
+      const truncatedSmall = truncateHeadTailWithByteNotice(bigText, 100);
+      // Hint may not fit under a tiny cap, but the spill write still happens
+      assert.ok(truncatedSmall.length <= 100);
+      assert.equal(
+        readdirSync(dir).filter((f) => f.startsWith("spill-")).length,
+        2,
+      );
+      assert.equal(
+        readFileSync(path.join(dir, files[0]!), "utf8"),
+        bigText,
+      );
+    } finally {
+      delete process.env.AGY_FAST_SPILL_DIR;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writeSpillFile rotates and keeps only the most recent N files", () => {
+    const dir = makeSpillDir();
+    try {
+      process.env.AGY_FAST_SPILL_DIR = dir;
+      for (let i = 0; i < 25; i++) {
+        const p = writeSpillFile(`payload-${i}`);
+        assert.ok(p !== null);
+      }
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith("spill-") && f.endsWith(".txt"))
+        .sort();
+      assert.equal(files.length, 20);
+      // Spill payloads stay byte-identical
+      const last = writeSpillFile("final-payload");
+      assert.ok(last);
+      assert.equal(readFileSync(last, "utf8"), "final-payload");
+    } finally {
+      delete process.env.AGY_FAST_SPILL_DIR;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

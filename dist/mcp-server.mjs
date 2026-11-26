@@ -3,8 +3,8 @@
 
 // src/mcp-server.ts
 import fs6 from "node:fs";
-import os4 from "node:os";
-import path7 from "node:path";
+import os5 from "node:os";
+import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/protocol/mcp.ts
@@ -1292,10 +1292,60 @@ async function isRipgrepAvailable() {
 
 // src/utils/host-compat.ts
 import fs from "node:fs";
-import os2 from "node:os";
-import path2 from "node:path";
+import os3 from "node:os";
+import path3 from "node:path";
 
 // src/utils/output-filter.ts
+import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
+var DEFAULT_SPILL_KEEP = 20;
+var SPILL_DIR_ENV = "AGY_FAST_SPILL_DIR";
+function writeSpillFile(text, keep = DEFAULT_SPILL_KEEP) {
+  try {
+    const dir = process.env[SPILL_DIR_ENV] || path2.join(os2.tmpdir(), "agy-fast-spill");
+    mkdirSync(dir, { recursive: true });
+    const stamp = Date.now();
+    let file = path2.join(dir, `spill-${stamp}.txt`);
+    let n = 0;
+    while (existsSyncSafe(file)) {
+      n += 1;
+      file = path2.join(dir, `spill-${stamp}-${n}.txt`);
+    }
+    writeFileSync(file, text, "utf8");
+    rotateSpillFiles(dir, keep);
+    return file;
+  } catch {
+    return null;
+  }
+}
+function existsSyncSafe(file) {
+  try {
+    return readdirSync(path2.dirname(file)).includes(path2.basename(file));
+  } catch {
+    return false;
+  }
+}
+function rotateSpillFiles(dir, keep) {
+  if (!Number.isFinite(keep) || keep <= 0) return;
+  try {
+    const files = readdirSync(dir).filter((f) => f.startsWith("spill-") && f.endsWith(".txt")).map((f) => {
+      try {
+        return { f, m: statSync(path2.join(dir, f)).mtimeMs };
+      } catch {
+        return { f, m: 0 };
+      }
+    }).sort((a, b) => a.m - b.m).map((e) => e.f);
+    const limit = Math.trunc(keep);
+    for (const stale of files.slice(0, Math.max(0, files.length - limit))) {
+      try {
+        unlinkSync(path2.join(dir, stale));
+      } catch {
+      }
+    }
+  } catch {
+  }
+}
 var ANSI_REGEX = (
   // eslint-disable-next-line no-control-regex
   /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|[@-Z\\-_])/g
@@ -1388,24 +1438,28 @@ function sliceUtf8BytesTail(text, maxBytes) {
   }
   return text.slice(startIndex);
 }
-function truncateHeadTailWithByteNotice(text, maxBytes) {
+function truncateHeadTailWithByteNotice(text, maxBytes, options) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
   if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
   if (totalBytes <= limit) return text;
+  const spill = options?.spill !== false;
+  const spillPath = spill ? writeSpillFile(text) : null;
+  const spillHint = spillPath ? `
+... [full output saved to: ${spillPath}; use batch_search or ranged read_file to inspect omitted sections]` : "";
   if (limit < 120) {
-    return truncateWithByteNotice(text, limit);
+    return truncateWithByteNotice(text, limit, { spill: false, spillHint });
   }
   const maxMarkerBytes = Buffer.byteLength(
     `
-... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes] ...
+... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes]${spillHint}
 `,
     "utf8"
   );
   const contentBytes = limit - maxMarkerBytes;
   if (contentBytes < 40) {
-    return truncateWithByteNotice(text, limit);
+    return truncateWithByteNotice(text, limit, { spill: false, spillHint });
   }
   const headBudget = Math.max(16, Math.floor(contentBytes * 0.38));
   const tailBudget = Math.max(24, contentBytes - headBudget);
@@ -1423,24 +1477,28 @@ function truncateHeadTailWithByteNotice(text, maxBytes) {
   const tailBytes = Buffer.byteLength(tail, "utf8");
   const omittedBytes = Math.max(1, totalBytes - headBytes - tailBytes);
   const marker = `
-... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes] ...
+... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes]${spillHint} ...
 `;
   const result = `${head}${marker}${tail}`;
-  return Buffer.byteLength(result, "utf8") <= limit ? result : truncateWithByteNotice(result, limit);
+  return Buffer.byteLength(result, "utf8") <= limit ? result : truncateWithByteNotice(text, limit, { spill: false, spillHint });
 }
-function truncateWithByteNotice(text, maxBytes) {
+function truncateWithByteNotice(text, maxBytes, options) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
   if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
   if (totalBytes <= limit) return text;
+  const spillHint = options?.spillHint;
+  const spillPath = spillHint === void 0 && options?.spill !== false ? writeSpillFile(text) : null;
+  const hint = spillHint ?? (spillPath ? `
+... [full output saved to: ${spillPath}; use batch_search or ranged read_file to inspect omitted sections]` : "");
   if (limit < 56) {
     if (limit <= 3) return sliceUtf8Bytes(text, limit);
     return `${sliceUtf8Bytes(text, limit - 3)}...`;
   }
   const maxNoticeBytes = Buffer.byteLength(
     `
-... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
+... [truncated: showed ${totalBytes} of ${totalBytes} bytes]${hint}`,
     "utf8"
   );
   const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
@@ -1454,7 +1512,7 @@ function truncateWithByteNotice(text, maxBytes) {
   }
   const shownBytes = Buffer.byteLength(slice, "utf8");
   const result = `${slice}
-... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
+... [truncated: showed ${shownBytes} of ${totalBytes} bytes]${hint}`;
   return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
 }
 function sliceSafeChars(text, maxChars) {
@@ -2510,9 +2568,9 @@ function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
-  return path2.join(cacheDir, "config.json");
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+  const cacheDir = custom ? path3.resolve(custom) : path3.join(home, ".gemini", "cache", "agy-fast");
+  return path3.join(cacheDir, "config.json");
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
@@ -2526,7 +2584,7 @@ function readSavedEditsFormatSync(env = process.env) {
 
 // src/tools/apply-edits.ts
 import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
+import path5 from "node:path";
 
 // src/utils/arg-validation.ts
 function isPlainObject(value) {
@@ -2602,8 +2660,8 @@ function formatCorruptedArrayError(options) {
 
 // src/utils/fs-utils.ts
 import { promises as fs2 } from "node:fs";
-import os3 from "node:os";
-import path3 from "node:path";
+import os4 from "node:os";
+import path4 from "node:path";
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   ".git",
   ".hg",
@@ -2631,19 +2689,19 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   "vendor"
 ]);
 function expandHome(inputPath) {
-  if (inputPath === "~") return os3.homedir();
+  if (inputPath === "~") return os4.homedir();
   if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path3.join(os3.homedir(), inputPath.slice(2));
+    return path4.join(os4.homedir(), inputPath.slice(2));
   }
   return inputPath;
 }
 function resolvePath(inputPath, baseDir) {
   const expanded = expandHome(inputPath.trim());
-  const root = baseDir ? path3.resolve(expandHome(baseDir)) : process.cwd();
-  return path3.resolve(root, expanded);
+  const root = baseDir ? path4.resolve(expandHome(baseDir)) : process.cwd();
+  return path4.resolve(root, expanded);
 }
 function toPosixPath(p) {
-  return p.split(path3.sep).join("/");
+  return p.split(path4.sep).join("/");
 }
 function isLikelyBinary(buf) {
   const limit = Math.min(buf.length, 8192);
@@ -2890,7 +2948,7 @@ async function walkFiles(rootDir, options = {}) {
       const relPosix = relDir ? `${relDir}/${name}` : name;
       if (entry.isDirectory()) {
         if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: path3.join(dir, name), rel: relPosix });
+        subdirs.push({ abs: path4.join(dir, name), rel: relPosix });
       } else if (entry.isFile()) {
         if (fileFilter && !fileFilter(relPosix)) continue;
         localFiles.push(relPosix);
@@ -3369,15 +3427,15 @@ async function canonicalizeTargetPath(absPath) {
     const trailingSegments = [];
     let current = absPath;
     while (true) {
-      const parent = path4.dirname(current);
+      const parent = path5.dirname(current);
       if (parent === current) {
         return absPath;
       }
-      trailingSegments.push(path4.basename(current));
+      trailingSegments.push(path5.basename(current));
       current = parent;
       try {
         const realAncestor = await fs3.realpath(current);
-        return path4.join(realAncestor, ...trailingSegments.reverse());
+        return path5.join(realAncestor, ...trailingSegments.reverse());
       } catch {
       }
     }
@@ -3385,7 +3443,7 @@ async function canonicalizeTargetPath(absPath) {
 }
 async function findMissingAncestorDirs(dir) {
   const missing = [];
-  let current = path4.resolve(dir);
+  let current = path5.resolve(dir);
   while (true) {
     try {
       await fs3.lstat(current);
@@ -3395,7 +3453,7 @@ async function findMissingAncestorDirs(dir) {
         break;
       }
       missing.push(current);
-      const parent = path4.dirname(current);
+      const parent = path5.dirname(current);
       if (parent === current) break;
       current = parent;
     }
@@ -3410,7 +3468,7 @@ async function commitPlannedWrites(plans) {
     for (const plan of plans) {
       if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
-      const dir = path4.dirname(target);
+      const dir = path5.dirname(target);
       const missingDirs = await findMissingAncestorDirs(dir);
       for (let i = missingDirs.length - 1; i >= 0; i--) {
         const d = missingDirs[i];
@@ -3420,7 +3478,7 @@ async function commitPlannedWrites(plans) {
         }
       }
       await fs3.mkdir(dir, { recursive: true });
-      const tmpPath = path4.join(
+      const tmpPath = path5.join(
         dir,
         `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
       );
@@ -3771,7 +3829,7 @@ async function runApplyEdits(input) {
     }
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
-    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
     if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
       errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
       continue;
@@ -4091,7 +4149,7 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 
 // src/tools/batch-search.ts
 import { promises as fs4 } from "node:fs";
-import path5 from "node:path";
+import path6 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -4575,7 +4633,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path6.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
@@ -4597,7 +4655,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path6.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
@@ -4629,10 +4687,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const relNative = path5.relative(baseCwd, searchRoot);
+  const relNative = path6.relative(baseCwd, searchRoot);
   const relRoot = toPosixPath(relNative);
-  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path5.isAbsolute(relRoot);
-  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path5.sep}-` : relNative : searchRoot;
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path6.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path6.sep}-` : relNative : searchRoot;
   const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
   const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
@@ -4745,9 +4803,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, path5.resolve(baseCwd, rawFile));
-    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path5.sep}`) && !path5.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
+    const rel = path6.relative(baseCwd, path6.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path6.sep}`) && !path6.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path6.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -4981,7 +5039,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
+    const relPosix = toPosixPath(path6.relative(baseCwd, searchRoot)) || path6.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
@@ -5004,12 +5062,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       fileFilter: globMatchesFile
     });
     discoveryTruncated = walked.truncated;
-    const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const rootRel = toPosixPath(path6.relative(baseCwd, searchRoot));
     const useFastPrefix = Boolean(
-      rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
+      rootRel === "" || !rootRel.startsWith("..") && !path6.isAbsolute(rootRel)
     );
     targetFiles = walked.files.map((rel) => {
-      const abs = path5.join(searchRoot, rel);
+      const abs = path6.join(searchRoot, rel);
       const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
       return { abs, rel: displayRel };
     });
@@ -5206,13 +5264,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path6.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs4.lstat(path6.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -5249,8 +5307,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
-    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    const base = path5.basename(searchRoot);
+    const rel = toPosixPath(path6.relative(baseCwd, searchRoot)) || path6.basename(searchRoot);
+    const base = path6.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -5301,7 +5359,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
+  return toPosixPath(path6.relative(baseCwd, path6.resolve(baseCwd, file))) || path6.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
@@ -5309,7 +5367,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchesType = fileTypeMatcher(query.fileType);
   const maxResults = clampInt(query.maxResults, 1, 200, 30);
   const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path6.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
   const footer = walked.truncated || totalMatched > maxResults ? `
@@ -5911,7 +5969,7 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path6.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd);
       return { header, text: `${header}
 ${out}` };
@@ -6102,7 +6160,7 @@ function clampInt(val, min, max, fallback = min) {
 }
 
 // src/tools/read-slices.ts
-import path6 from "node:path";
+import path7 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -8120,7 +8178,7 @@ function extractSfcSymbols(lines, mode) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path7.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -8542,7 +8600,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path7.relative(baseCwd, absPath)) || path7.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -8583,7 +8641,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path7.relative(baseCwd, absPath)) || path7.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -9928,12 +9986,12 @@ function shouldCliExitNonZero(tool, result) {
 
 // src/mcp-server.ts
 var SERVER_VERSION = "0.3.1";
-var DEFAULT_PLUGIN_ROOT = path7.resolve(
-  path7.dirname(fileURLToPath2(import.meta.url)),
+var DEFAULT_PLUGIN_ROOT = path8.resolve(
+  path8.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
 function canonicalizeDir(dirPath) {
-  const resolved = path7.resolve(dirPath);
+  const resolved = path8.resolve(dirPath);
   try {
     return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
   } catch {
@@ -9944,8 +10002,8 @@ function isSameOrSubdir(candidate, root) {
   const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
   const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path7.relative(normRoot, normCandidate);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
+  const rel = path8.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path8.sep}`) && !path8.isAbsolute(rel);
 }
 function isInstalledPluginPath(dirPath) {
   const posix = dirPath.replace(/\\/g, "/");
@@ -9959,15 +10017,15 @@ function isSameDir(a, b) {
 }
 function detectNonWorkspaceCwd(env, currentCwd) {
   const canonCwd = canonicalizeDir(currentCwd);
-  if (path7.parse(canonCwd).root === canonCwd) {
+  if (path8.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
+  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path8.isAbsolute(p);
   const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
   const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
   if (homes.length === 0 && env === process.env) {
     try {
-      const osHome = os4.homedir();
+      const osHome = os5.homedir();
       if (isFullAbsPath(osHome)) homes.push(osHome);
     } catch {
     }
@@ -9991,7 +10049,7 @@ function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
   }
   const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
   if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs6.existsSync(path8.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path8.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -10107,11 +10165,11 @@ function createAgyFastServer(options = {}) {
         value: { ...args, cwd: void 0 }
       };
     }
-    if (!path7.isAbsolute(rawCwd) && !isHomePath) {
+    if (!path8.isAbsolute(rawCwd) && !isHomePath) {
       if (defaultCwd) {
         return {
           ok: true,
-          value: { ...args, cwd: path7.resolve(defaultCwd, rawCwd) }
+          value: { ...args, cwd: path8.resolve(defaultCwd, rawCwd) }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -10153,7 +10211,7 @@ function createAgyFastServer(options = {}) {
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
       const trimmed = rawCwd.trim();
       const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path7.isAbsolute(trimmed) && !isHome;
+      return !path8.isAbsolute(trimmed) && !isHome;
     },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
