@@ -220,6 +220,11 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | Edit ≥2 hunks/files in one turn, or edit + verify | **`apply_edits`** | Atomic or `bestEffort` multi-file edits + optional inline `verify` |
 | Run ≥2 independent build, lint, test, or diagnostic commands | **`run_checks`** | Concurrent execution with head-tail folded error-focused output |
 
+> [!NOTE]
+> **Antigravity eager loading:** Antigravity is the first-class plugin target — `agy-fast` ships its `hooks.json` hooks, `rules/AGENTS.md` rules, installer, and zero-latency auto-updater for it. Under eager loading, the host injects a required `toolSummary` argument into every `mcp_agy-fast_fast_*` call (see [`rules/AGENTS.md` Quick Schemas](rules/AGENTS.md)); this injection is an Antigravity eager-loading behavior — it does not apply to lazy `call_mcp_tool` calls or standalone MCP hosts. Include it (a short summary of what the call does) or the first call fails with `missing property 'toolSummary'`.
+>
+> **Standard MCP hosts (Codex, Claude Code, etc.):** mount the same server via the `agy-fast-mcp` bin or `node <plugin-dir>/scripts/install.mjs mcp` — no manual wiring of `dist/mcp-server.mjs` — optionally passing `--tools` (tool subset) and/or `--schema-compat=minimal` (strict JSON Schema subset hosts; runtime validation stays unchanged).
+
 ### 1. `batch_search` — Concurrent Code, Path & Read-Only Git Search
 - **Up to 20 mixed queries per call:** `text`, `regex`, `glob`, `fuzzy`, and read-only `git` (`status`, `diff`, `log`, `show`, `branch`, `rev-parse`, `ls-files`, `blame`, `shortlog`, `describe`, `tag --list`, `remote -v`), including cross-repo lookups via per-query `path`.
 - **Precision controls:** Filter by `fileType` (e.g., `typescript`, `python`, `gdscript`) or `glob`, switch `outputMode` (`content` | `files_with_matches` | `count`), enable cross-line `multiline: true` (where `count` reports occurrences per file), use `type: "fuzzy"` for case-insensitive path matching, or pass `sortBy: "mtime"` on `glob` queries for newest-first results.
