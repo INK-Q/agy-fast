@@ -144,17 +144,18 @@ function getLineWindowOffsets(
 
   const totalLines = lineStarts.length;
   const sLine = startLine !== undefined ? Math.trunc(startLine) : 1;
-  const eLine =
-    endLine !== undefined ? Math.min(totalLines, Math.trunc(endLine)) : totalLines;
+  const requestedEnd = endLine !== undefined ? Math.trunc(endLine) : undefined;
 
-  if (sLine > totalLines) {
-    return { windowStart: text.length, windowEnd: text.length };
+  if (requestedEnd !== undefined && requestedEnd < sLine) {
+    throw new Error(`Invalid line range: startLine (${sLine}) > endLine (${requestedEnd}). Correct the line bounds for this path.`);
   }
-  if (eLine < sLine) {
-    throw new Error(`Invalid line range: startLine (${sLine}) > endLine (${eLine})`);
+  if (startLine !== undefined && sLine > totalLines) {
+    const unit = totalLines === 1 ? "line" : "lines";
+    throw new Error(`startLine ${sLine} exceeds file length (${totalLines} ${unit}). Check 'path' and refresh the line bounds.`);
   }
 
-  const windowStart = lineStarts[sLine - 1]!;
+  const eLine = Math.min(totalLines, requestedEnd ?? totalLines);
+  const windowStart = lineStarts[sLine - 1] ?? text.length;
   const windowEnd =
     eLine < totalLines ? lineStarts[eLine]! : text.length;
   return { windowStart, windowEnd };
@@ -167,10 +168,12 @@ function formatNearbyLines(
   startLine?: number,
   endLine?: number,
 ): string {
-  const lines = text.split("\n");
   if (startLine === undefined && endLine === undefined) return "";
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
   const from = Math.max(1, (startLine ?? endLine ?? 1) - 2);
   const rawTo = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
+  if (from > rawTo) return "";
   const truncated = rawTo - from + 1 > MAX_NEARBY_LINES;
   const to = truncated ? from + MAX_NEARBY_LINES - 1 : rawTo;
   const snippet: string[] = [];
@@ -365,6 +368,8 @@ function planHunksForContent(
   displayPath: string,
 ): { newNormalized: string; appliedMatches: number; spans: MatchSpan[]; errors: string[] } {
   const lineStarts = computeLineStarts(normalizedContent);
+  // Drop the EOF marker from the editable line range.
+  if (lineStarts.at(-1) === normalizedContent.length) lineStarts.pop();
   const spans: MatchSpan[] = [];
   const errors: string[] = [];
 
@@ -418,7 +423,7 @@ function planHunksForContent(
       const rangeNote = hasRange
         ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}`
         : "";
-      let hint = "";
+      let hint = " Re-read the file and copy the exact current target, including whitespace, or correct 'path'.";
       if (hasRange) {
         // Check if exact target exists outside the provided line window (line drift)
         const globalOffsets: number[] = [];
@@ -436,21 +441,30 @@ function planHunksForContent(
           const hitLines = globalOffsets
             .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length))
             .join(", ");
-          hint = ` Exact match found outside range at ${hitLines} — adjust startLine/endLine or omit them.`;
+          let action = "choose bounds covering the intended matches.";
+          if (globalOffsets.length === 1 && !hunk.replaceAll) {
+            const start = globalOffsets[0]!;
+            const firstLine = offsetToLine(lineStarts, start);
+            const lastLine = offsetToLine(lineStarts, start + normTarget.length - 1);
+            action = `use startLine: ${firstLine}, endLine: ${lastLine} or omit both bounds.`;
+          } else if (!hunk.replaceAll) {
+            action = "narrow the bounds to one match or include more surrounding text.";
+          }
+          hint = ` Exact match found outside range at ${hitLines} — check 'path', then ${action}`;
         } else {
           const effStart = hunk.startLine ?? 1;
           const effEnd = hunk.endLine ?? lineStarts.length;
           if (effEnd - effStart + 1 > MAX_NEARBY_LINES - 4) {
-            hint =
+            hint +=
               findClosestRegionSnippet(normalizedContent, normTarget, effStart, effEnd) ||
               findClosestRegionSnippet(normalizedContent, normTarget) ||
               formatNearbyLines(normalizedContent, effStart, effEnd);
           } else {
-            hint = formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
+            hint += formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
           }
         }
       } else {
-        hint = findClosestRegionSnippet(normalizedContent, normTarget);
+        hint += findClosestRegionSnippet(normalizedContent, normTarget);
       }
       errors.push(
         `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${hint}`,
@@ -464,7 +478,7 @@ function planHunksForContent(
         .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length, ""))
         .join(", ");
       errors.push(
-        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.`,
+        `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Narrow the line bounds or include more surrounding text. Set replaceAll: true only if every match in scope should change.`,
       );
       continue;
     }
@@ -490,7 +504,7 @@ function planHunksForContent(
     if (curr.start < prev.end) {
       const line = offsetToLine(lineStarts, curr.start);
       errors.push(
-        `${displayPath}: hunk #${prev.hunkIndex + 1} and hunk #${curr.hunkIndex + 1} overlap near line ${line}.`,
+        `${displayPath}: hunk #${prev.hunkIndex + 1} and hunk #${curr.hunkIndex + 1} overlap near line ${line}. Combine them into one hunk using the current file text as the target.`,
       );
     }
   }
@@ -832,7 +846,7 @@ function corruptedEditsError(items: CorruptedItem[]): { text: string; isError: b
       toolName: "apply_edits",
       items,
       fallbackAdvice:
-        "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
+        "fall back to built-in edit_file / write_file for this batch only. Use apply_edits again for the next batch.",
     }),
     isError: true,
   };
@@ -1011,8 +1025,8 @@ function formatBestEffortPartialResult(params: {
 }): string {
   const { partialHeader, errors, summaryLines, noOpCount, dryRun, verifySkipped, maxBytes } = params;
   const failedHeading = dryRun
-    ? "Failed (fix only these):"
-    : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
+    ? "Failed (correct these files and retry the full dry run):"
+    : "Failed (retry all intended edits for these failed files; skip applied files):";
   const failedFull = `${failedHeading}\n- ${errors.join("\n- ")}`;
   const appliedFull = `Applied:\n${summaryLines.join("\n")}`;
   const verifyNote = verifySkipped
@@ -2019,9 +2033,10 @@ export async function runApplyEdits(
   const bestEffort = Boolean(input.bestEffort);
 
   if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
-    const prefix = bestEffort
+    const heading = bestEffort
       ? "Edit aborted (0 files modified):"
       : "Atomic edit aborted (0 files modified):";
+    const prefix = `${heading}\nRetry the full corrected batch.`;
     const hasSchemaTypeError = errors.some(
       (e) =>
         e.includes("'target' must be") ||

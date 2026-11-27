@@ -383,13 +383,13 @@ function buildApplyEditsToolDefinition(
         },
       };
 
-  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files per file, gives closest lines, skips verify on failure. dryRun validates only. verify cmd in cwd after writes (60s/4000 chars, ${MCP_CALL_BUDGET_SEC}s max). diff adds +-2-line diff. 8800B UTF-8 max. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+  const baseDesc = "Atomic multi-file edits. One edits entry per file with its hunks. Copy exact current target text. Omit line bounds for a unique target. Bounds are 1-based. bestEffort is atomic per file. dryRun validates only. verify runs after success. diff shows +-2 lines. Absolute cwd if no roots/list. 8800B UTF-8 max.";
 
   return {
     name: "apply_edits",
     description: preferStringEdits
       ? baseDesc
-      : `${baseDesc} Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
+      : `${baseDesc} Use create XOR hunks. overwrite replaces files. replaceAll covers matches in scope.`,
     inputSchema: {
       type: "object",
       properties: {
