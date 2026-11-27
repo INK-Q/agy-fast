@@ -1461,6 +1461,7 @@ function splitLongFlag(raw: string, valueFlags: ReadonlySet<string>): {
 const CLI_CHECK_VALUE_FLAGS = new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--output-mode",
   "--concurrency",
@@ -1578,6 +1579,7 @@ const CLI_SEARCH_VALUE_FLAGS = new Set([
   ...CLI_SEARCH_QUERY_FLAGS,
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--type",
   "--path",
@@ -1594,6 +1596,7 @@ const CLI_SEARCH_VALUE_FLAGS = new Set([
 const CLI_EDIT_VALUE_FLAGS = new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--verify",
   "--verify-timeout",
@@ -1603,12 +1606,13 @@ const CLI_EDIT_VALUE_FLAGS = new Set([
 const CLI_SLICE_VALUE_FLAGS = new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--outline",
   "-o",
 ]);
 
-const CLI_OUTLINE_VALUE_FLAGS = new Set(["--cwd", "--max-chars", "--json"]);
+const CLI_OUTLINE_VALUE_FLAGS = new Set(["--cwd", "--max-chars", "--from-file", "--json"]);
 
 function countCliLogicalOps(
   inv: AgyFastCliInvocation,

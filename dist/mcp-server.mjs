@@ -2,6 +2,9 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
+// src/cli-runner.ts
+import { promises as fs5 } from "node:fs";
+
 // src/tools/apply-edits.ts
 import { isUtf8 } from "node:buffer";
 import { promises as fs2 } from "node:fs";
@@ -9421,12 +9424,14 @@ function formatCliUsage() {
     "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
     "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
-    "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "                          [--context <0..10>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
-    "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
+    "  check   | run_checks    <cmd...> [--compact|--full] [--output-mode compact|full] [--concurrency <N>] [--timeout <sec>]",
+    "  edit    | apply_edits   [--from-file <path>] [--best-effort] [--dry-run] [--diff] [--verify <cmd>]",
+    "                          [--verify-timeout <sec>] [--max-verify-chars <N>] (JSON via --from-file, --json, or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
+    "  --from-file <path>      Read tool arguments JSON from file (avoids shell escaping for multi-line edits)",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
     "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
     "  --cwd <dir>             Override working directory (defaults to shell CWD)",
@@ -9505,9 +9510,14 @@ async function readStdinText(stream, explicitStdin) {
           if (typeof stream.pause === "function") {
             stream.pause();
           }
+          const maybeUnref = stream.unref;
+          if (typeof maybeUnref === "function") {
+            maybeUnref.call(stream);
+          }
           finish("");
         }
       }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
+      firstByteTimer.unref?.();
     }
     stream.on("data", onData);
     stream.on("end", onEnd);
@@ -9518,9 +9528,10 @@ async function readStdinText(stream, explicitStdin) {
   });
 }
 function parseJsonPayload(rawText, tool) {
+  const cleaned = rawText.replace(/^\uFEFF/, "");
   let parsed;
   try {
-    parsed = JSON.parse(rawText);
+    parsed = JSON.parse(cleaned);
   } catch (err) {
     throw new Error(
       `Invalid JSON input for '${tool}': ${err instanceof Error ? err.message : String(err)}`
@@ -9549,6 +9560,30 @@ function parseJsonPayload(rawText, tool) {
   }
   throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
 }
+async function readJsonPayloadFromFile(rawFilePath, baseDir, tool) {
+  const absPath = resolvePath(rawFilePath, baseDir);
+  let st;
+  try {
+    st = await fs5.stat(absPath);
+  } catch (err) {
+    throw new Error(
+      `Cannot read --from-file '${rawFilePath}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (!st.isFile()) {
+    throw new Error(`--from-file path is not a regular file: '${rawFilePath}'`);
+  }
+  if (st.size > MAX_CLI_STDIN_BYTES) {
+    throw new Error(
+      `--from-file '${rawFilePath}' exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`
+    );
+  }
+  const raw = (await fs5.readFile(absPath, "utf8")).replace(/^\uFEFF/, "").trim();
+  if (!raw) {
+    throw new Error(`--from-file '${rawFilePath}' is empty`);
+  }
+  return parseJsonPayload(raw, tool);
+}
 function applySearchModifiers(q, mods) {
   return {
     ...q,
@@ -9573,6 +9608,7 @@ var SEARCH_QUERY_TYPES = /* @__PURE__ */ new Set([
 var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--text",
   "--regex",
@@ -9607,6 +9643,8 @@ function parseToolFlags(tool, rawArgs) {
   };
   let pendingMods = {};
   let pendingType;
+  let dashDashType;
+  let dashDashMods = {};
   const pushScopedQuery = (base, explicitType) => {
     const idx = opts.searchQueries.length;
     opts.searchQueries.push(applySearchModifiers(base, pendingMods));
@@ -9621,8 +9659,14 @@ function parseToolFlags(tool, rawArgs) {
     const rawArg = rawArgs[i];
     if (afterDoubleDash) {
       if (tool === "batch_search") {
-        const explicit = pendingType !== void 0;
-        pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+        const explicit = dashDashType !== void 0;
+        const idx = opts.searchQueries.length;
+        opts.searchQueries.push(
+          applySearchModifiers({ type: dashDashType ?? "text", pattern: rawArg }, dashDashMods)
+        );
+        if (!explicit) {
+          opts.implicitTypeQueryIndices.add(idx);
+        }
       } else {
         opts.positionals.push(rawArg);
       }
@@ -9630,6 +9674,10 @@ function parseToolFlags(tool, rawArgs) {
     }
     if (rawArg === "--") {
       afterDoubleDash = true;
+      dashDashType = pendingType;
+      dashDashMods = pendingMods;
+      pendingType = void 0;
+      pendingMods = {};
       continue;
     }
     let arg = rawArg;
@@ -9665,6 +9713,14 @@ function parseToolFlags(tool, rawArgs) {
     }
     if (arg === "--max-chars") {
       opts.maxChars = parseIntFlag(arg, consumeValue());
+      continue;
+    }
+    if (arg === "--from-file") {
+      const filePath = consumeValue();
+      if (!filePath.trim()) {
+        throw new Error("Missing file path after --from-file");
+      }
+      opts.fromFile = filePath;
       continue;
     }
     if (arg === "--json") {
@@ -9724,7 +9780,7 @@ function parseToolFlags(tool, rawArgs) {
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = consumeValue();
+        const mode = consumeValue().trim().toLowerCase();
         if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
           throw new Error(`Invalid --output-mode: ${mode}`);
         }
@@ -9732,7 +9788,7 @@ function parseToolFlags(tool, rawArgs) {
         continue;
       }
       if (arg === "--sort-by") {
-        const sortBy = consumeValue();
+        const sortBy = consumeValue().trim().toLowerCase();
         if (sortBy !== "path" && sortBy !== "mtime") {
           throw new Error(`Invalid --sort-by: ${sortBy}`);
         }
@@ -9770,7 +9826,7 @@ function parseToolFlags(tool, rawArgs) {
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = consumeValue();
+        const mode = consumeValue().trim().toLowerCase();
         if (mode !== "compact" && mode !== "full") {
           throw new Error(`Invalid --output-mode for check: ${mode}`);
         }
@@ -9858,15 +9914,43 @@ async function runAgyFastCli(argv, io = {}) {
 `);
     return 0;
   }
-  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  if (opts.cwd !== void 0 && !opts.cwd.trim()) {
+    stderr.write("Error: '--cwd' must be a non-empty directory path.\n");
+    return 1;
+  }
+  const explicitJsonSources = [
+    opts.jsonRaw !== void 0,
+    opts.fromFile !== void 0,
+    opts.explicitStdin
+  ].filter(Boolean).length;
+  if (explicitJsonSources > 1) {
+    stderr.write("Error: options '--from-file', '--json', and '--stdin' cannot be combined.\n");
+    return 1;
+  }
+  const hasConflictingShorthand = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0 || opts.trailingSearchType !== void 0 || Object.keys(opts.trailingSearchMods).length > 0;
+  if (explicitJsonSources > 0 && hasConflictingShorthand) {
+    stderr.write(
+      "Error: cannot combine '--from-file'/'--json'/'--stdin' with positional arguments or query modifiers.\n"
+    );
+    return 1;
+  }
   let jsonInput = null;
   try {
-    if (opts.jsonRaw !== void 0) {
+    if (opts.fromFile !== void 0) {
+      jsonInput = await readJsonPayloadFromFile(
+        opts.fromFile,
+        opts.cwd ?? defaultCwd,
+        tool
+      );
+    } else if (opts.jsonRaw !== void 0) {
       jsonInput = parseJsonPayload(opts.jsonRaw, tool);
-    } else if (opts.explicitStdin || !hasShorthandArgs) {
+    } else if (opts.explicitStdin || !hasConflictingShorthand) {
       const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
       if (stdinText) {
         jsonInput = parseJsonPayload(stdinText, tool);
+      } else if (opts.explicitStdin) {
+        stderr.write("Error: '--stdin' was specified but stdin is empty.\n");
+        return 1;
       }
     }
   } catch (err) {
@@ -9874,8 +9958,19 @@ async function runAgyFastCli(argv, io = {}) {
 `);
     return 1;
   }
+  let effectiveCwd;
+  if (opts.cwd !== void 0) {
+    effectiveCwd = opts.cwd;
+  } else if (jsonInput && Object.prototype.hasOwnProperty.call(jsonInput, "cwd") && jsonInput.cwd !== void 0) {
+    if (typeof jsonInput.cwd !== "string" || !jsonInput.cwd.trim()) {
+      stderr.write("Error: 'cwd' in JSON input must be a non-empty string.\n");
+      return 1;
+    }
+    effectiveCwd = jsonInput.cwd;
+  } else {
+    effectiveCwd = defaultCwd;
+  }
   let result;
-  const effectiveCwd = opts.cwd ?? (typeof jsonInput?.cwd === "string" ? jsonInput.cwd : defaultCwd);
   if (tool === "batch_search") {
     let payload;
     if (jsonInput) {
@@ -9954,7 +10049,7 @@ async function runAgyFastCli(argv, io = {}) {
   } else if (tool === "apply_edits") {
     if (!jsonInput) {
       stderr.write(
-        `Error: 'edit' requires JSON input via --json or stdin (e.g. {"edits":[...],"bestEffort":true}).
+        `Error: 'edit' requires JSON input via --from-file <path.json>, --json, or stdin (e.g. {"edits":[...],"bestEffort":true}).
 `
       );
       return 1;
@@ -10006,13 +10101,34 @@ async function runAgyFastCli(argv, io = {}) {
   return shouldCliExitNonZero(tool, result) ? 1 : 0;
 }
 function shouldCliExitNonZero(tool, result) {
-  return result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
-    result.text
-  ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+  if (result.isError) return true;
+  if (tool === "run_checks") {
+    return /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
+      result.text
+    );
+  }
+  if (tool === "apply_edits") {
+    return /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+  }
+  if (tool === "quick_outline" || tool === "read_slices") {
+    const hasHealthySection = /^## (?:Outline|Slice): .+ \(\d+ lines\)$/m.test(result.text);
+    const hasErrorSection = /^## (?:Outline|Slice): [^\n]*\nERROR: /m.test(result.text);
+    return hasErrorSection && !hasHealthySection;
+  }
+  if (tool === "batch_search") {
+    const sections = result.text.split(/(?=(?:^|\n)## Query \d+ \[)/).map((s) => s.replace(/^\n+/, "")).filter((s) => /^## Query \d+ \[/.test(s));
+    if (sections.length === 0) return false;
+    return sections.every(
+      (sec) => /^## Query \d+ \[(?:text|regex|glob|fuzzy)\] [^\n]*\nERROR: /.test(sec) || /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|git (?:query timed out|execution error:|exited with code )|Flag '|Mutating |Invalid |Unsupported |fatal:|error:)/.test(
+        sec
+      )
+    );
+  }
+  return false;
 }
 
 // src/mcp-server-core.ts
-import fs7 from "node:fs";
+import fs8 from "node:fs";
 import os4 from "node:os";
 import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
@@ -10658,7 +10774,7 @@ ${serialized}`);
 };
 
 // src/utils/host-compat.ts
-import fs5 from "node:fs";
+import fs6 from "node:fs";
 import os3 from "node:os";
 import path6 from "node:path";
 var HOST_COMPAT_RULES = [
@@ -10935,7 +11051,7 @@ function getConfigPath(env = process.env) {
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
-    const raw = fs5.readFileSync(getConfigPath(env), "utf8");
+    const raw = fs6.readFileSync(getConfigPath(env), "utf8");
     const parsed = JSON.parse(raw);
     return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
   } catch {
@@ -10944,7 +11060,7 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/utils/session-workspace.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import path7 from "node:path";
 
 // src/utils/snapshot.ts
@@ -10989,7 +11105,7 @@ function isFullAbsolutePath(dirPath) {
 function canonicalizeDirSync(dirPath) {
   const resolved = path7.resolve(dirPath);
   try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+    return typeof fs7.realpathSync.native === "function" ? fs7.realpathSync.native(resolved) : fs7.realpathSync(resolved);
   } catch {
     return resolved;
   }
@@ -11020,7 +11136,7 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
         if (!allowLinkedDevCheckout) {
           return trimmedEnvRoot;
         }
-        const isDevCheckout = fs6.existsSync(
+        const isDevCheckout = fs7.existsSync(
           path7.join(canonEnvRoot, "src", "mcp-server.ts")
         );
         if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
@@ -11032,7 +11148,7 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
   const resolvedScriptRoot = path7.resolve(scriptPluginRoot);
   const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
   if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs7.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs7.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -11430,7 +11546,7 @@ function createAgyFastServer(options = {}) {
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs7.statSync(candidate).isDirectory()) {
+          if (fs8.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }

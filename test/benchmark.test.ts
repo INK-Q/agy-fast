@@ -2636,4 +2636,52 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(out.sessions, 4);
     assert.equal(out.totalOutputTokens, 100);
   });
+
+  it("tracks --cli --from-file invocations accurately without counting the file path as a positional command or file", () => {
+    const cliFromFileSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-27T01:00:00Z",
+          output_tokens: 180,
+          tool_calls: [
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node dist/mcp-server.mjs --cli edit --best-effort --from-file .tmp/edits.json --verify 'npm run typecheck'",
+              },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node dist/mcp-server.mjs --cli check --compact --from-file .tmp/checks.json",
+              },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node dist/mcp-server.mjs --cli outline --from-file=.tmp/files.json",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({ step_index: 2, type: "GENERIC", status: "DONE", created_at: "2026-11-27T01:00:01Z", content: "Applied edits" }),
+        JSON.stringify({ step_index: 3, type: "GENERIC", status: "DONE", created_at: "2026-11-27T01:00:02Z", content: "Checks: 2/2 passed" }),
+        JSON.stringify({ step_index: 4, type: "GENERIC", status: "DONE", created_at: "2026-11-27T01:00:03Z", content: "## Outline: src/a.ts (10 lines)" }),
+      ].join("\n"),
+    );
+
+    const bm = analyzeTranscriptSessions([cliFromFileSteps]);
+    assert.equal(bm.agyCliCalls, 3);
+    assert.equal(bm.agyFastToolCalls.apply_edits, 1);
+    assert.equal(bm.agyFastToolCalls.run_checks, 1);
+    assert.equal(bm.agyFastToolCalls.quick_outline, 1);
+    assert.equal(bm.runChecksSingleCommandCalls, 0);
+    assert.equal(bm.runChecksFullModeCalls, 0);
+    assert.equal(bm.agyFastLogicalOps, 4); // edit (1 + verify 1) + check (1 fallback) + outline (1 fallback)
+  });
 });

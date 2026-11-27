@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
 import {
   runBatchSearch,
@@ -11,6 +12,7 @@ import {
   type ReadSlicesInput,
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
+import { resolvePath } from "./utils/fs-utils.js";
 
 export type CliCanonicalTool =
   | "batch_search"
@@ -63,12 +65,14 @@ export function formatCliUsage(): string {
     "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
     "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
-    "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "                          [--context <0..10>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
-    "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
+    "  check   | run_checks    <cmd...> [--compact|--full] [--output-mode compact|full] [--concurrency <N>] [--timeout <sec>]",
+    "  edit    | apply_edits   [--from-file <path>] [--best-effort] [--dry-run] [--diff] [--verify <cmd>]",
+    "                          [--verify-timeout <sec>] [--max-verify-chars <N>] (JSON via --from-file, --json, or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
+    "  --from-file <path>      Read tool arguments JSON from file (avoids shell escaping for multi-line edits)",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
     "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
     "  --cwd <dir>             Override working directory (defaults to shell CWD)",
@@ -159,9 +163,14 @@ async function readStdinText(
           if (typeof (stream as { pause?: () => void }).pause === "function") {
             (stream as { pause: () => void }).pause();
           }
+          const maybeUnref = (stream as unknown as { unref?: () => void }).unref;
+          if (typeof maybeUnref === "function") {
+            maybeUnref.call(stream);
+          }
           finish("");
         }
       }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
+      firstByteTimer.unref?.();
     }
 
     stream.on("data", onData);
@@ -177,9 +186,10 @@ function parseJsonPayload(
   rawText: string,
   tool: CliCanonicalTool,
 ): Record<string, unknown> {
+  const cleaned = rawText.replace(/^\uFEFF/, "");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(rawText);
+    parsed = JSON.parse(cleaned);
   } catch (err) {
     throw new Error(
       `Invalid JSON input for '${tool}': ${err instanceof Error ? err.message : String(err)}`,
@@ -207,6 +217,35 @@ function parseJsonPayload(
     return { ...(parsed as Record<string, unknown>) };
   }
   throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
+}
+
+async function readJsonPayloadFromFile(
+  rawFilePath: string,
+  baseDir: string,
+  tool: CliCanonicalTool,
+): Promise<Record<string, unknown>> {
+  const absPath = resolvePath(rawFilePath, baseDir);
+  let st;
+  try {
+    st = await fs.stat(absPath);
+  } catch (err) {
+    throw new Error(
+      `Cannot read --from-file '${rawFilePath}': ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!st.isFile()) {
+    throw new Error(`--from-file path is not a regular file: '${rawFilePath}'`);
+  }
+  if (st.size > MAX_CLI_STDIN_BYTES) {
+    throw new Error(
+      `--from-file '${rawFilePath}' exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`,
+    );
+  }
+  const raw = (await fs.readFile(absPath, "utf8")).replace(/^\uFEFF/, "").trim();
+  if (!raw) {
+    throw new Error(`--from-file '${rawFilePath}' is empty`);
+  }
+  return parseJsonPayload(raw, tool);
 }
 
 interface SearchQueryModifiers {
@@ -262,6 +301,7 @@ const SEARCH_QUERY_TYPES = new Set<SearchQuery["type"]>([
 const VALUE_LONG_FLAGS = new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--text",
   "--regex",
@@ -289,6 +329,7 @@ interface ParsedCliOptions {
   showHelp: boolean;
   cwd?: string;
   maxChars?: number;
+  fromFile?: string;
   jsonRaw?: string;
   explicitStdin: boolean;
   positionals: string[];
@@ -324,6 +365,8 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
   };
   let pendingMods: SearchQueryModifiers = {};
   let pendingType: SearchQuery["type"] | undefined;
+  let dashDashType: SearchQuery["type"] | undefined;
+  let dashDashMods: SearchQueryModifiers = {};
   const pushScopedQuery = (base: SearchQuery, explicitType: boolean) => {
     const idx = opts.searchQueries.length;
     opts.searchQueries.push(applySearchModifiers(base, pendingMods));
@@ -339,8 +382,14 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     const rawArg = rawArgs[i]!;
     if (afterDoubleDash) {
       if (tool === "batch_search") {
-        const explicit = pendingType !== undefined;
-        pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+        const explicit = dashDashType !== undefined;
+        const idx = opts.searchQueries.length;
+        opts.searchQueries.push(
+          applySearchModifiers({ type: dashDashType ?? "text", pattern: rawArg }, dashDashMods),
+        );
+        if (!explicit) {
+          opts.implicitTypeQueryIndices.add(idx);
+        }
       } else {
         opts.positionals.push(rawArg);
       }
@@ -348,6 +397,10 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     }
     if (rawArg === "--") {
       afterDoubleDash = true;
+      dashDashType = pendingType;
+      dashDashMods = pendingMods;
+      pendingType = undefined;
+      pendingMods = {};
       continue;
     }
 
@@ -386,6 +439,14 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     }
     if (arg === "--max-chars") {
       opts.maxChars = parseIntFlag(arg, consumeValue());
+      continue;
+    }
+    if (arg === "--from-file") {
+      const filePath = consumeValue();
+      if (!filePath.trim()) {
+        throw new Error("Missing file path after --from-file");
+      }
+      opts.fromFile = filePath;
       continue;
     }
     if (arg === "--json") {
@@ -446,7 +507,7 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = consumeValue();
+        const mode = consumeValue().trim().toLowerCase();
         if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
           throw new Error(`Invalid --output-mode: ${mode}`);
         }
@@ -454,7 +515,7 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         continue;
       }
       if (arg === "--sort-by") {
-        const sortBy = consumeValue();
+        const sortBy = consumeValue().trim().toLowerCase();
         if (sortBy !== "path" && sortBy !== "mtime") {
           throw new Error(`Invalid --sort-by: ${sortBy}`);
         }
@@ -492,7 +553,7 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = consumeValue();
+        const mode = consumeValue().trim().toLowerCase();
         if (mode !== "compact" && mode !== "full") {
           throw new Error(`Invalid --output-mode for check: ${mode}`);
         }
@@ -587,19 +648,51 @@ export async function runAgyFastCli(
     return 0;
   }
 
-  const hasShorthandArgs =
+  if (opts.cwd !== undefined && !opts.cwd.trim()) {
+    stderr.write("Error: '--cwd' must be a non-empty directory path.\n");
+    return 1;
+  }
+
+  const explicitJsonSources = [
+    opts.jsonRaw !== undefined,
+    opts.fromFile !== undefined,
+    opts.explicitStdin,
+  ].filter(Boolean).length;
+  if (explicitJsonSources > 1) {
+    stderr.write("Error: options '--from-file', '--json', and '--stdin' cannot be combined.\n");
+    return 1;
+  }
+
+  const hasConflictingShorthand =
     opts.positionals.length > 0 ||
     opts.searchQueries.length > 0 ||
-    opts.outlineFiles.length > 0;
+    opts.outlineFiles.length > 0 ||
+    opts.trailingSearchType !== undefined ||
+    Object.keys(opts.trailingSearchMods).length > 0;
+  if (explicitJsonSources > 0 && hasConflictingShorthand) {
+    stderr.write(
+      "Error: cannot combine '--from-file'/'--json'/'--stdin' with positional arguments or query modifiers.\n",
+    );
+    return 1;
+  }
 
   let jsonInput: Record<string, unknown> | null = null;
   try {
-    if (opts.jsonRaw !== undefined) {
+    if (opts.fromFile !== undefined) {
+      jsonInput = await readJsonPayloadFromFile(
+        opts.fromFile,
+        opts.cwd ?? defaultCwd,
+        tool,
+      );
+    } else if (opts.jsonRaw !== undefined) {
       jsonInput = parseJsonPayload(opts.jsonRaw, tool);
-    } else if (opts.explicitStdin || !hasShorthandArgs) {
+    } else if (opts.explicitStdin || !hasConflictingShorthand) {
       const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
       if (stdinText) {
         jsonInput = parseJsonPayload(stdinText, tool);
+      } else if (opts.explicitStdin) {
+        stderr.write("Error: '--stdin' was specified but stdin is empty.\n");
+        return 1;
       }
     }
   } catch (err) {
@@ -607,8 +700,24 @@ export async function runAgyFastCli(
     return 1;
   }
 
+  let effectiveCwd: string;
+  if (opts.cwd !== undefined) {
+    effectiveCwd = opts.cwd;
+  } else if (
+    jsonInput &&
+    Object.prototype.hasOwnProperty.call(jsonInput, "cwd") &&
+    jsonInput.cwd !== undefined
+  ) {
+    if (typeof jsonInput.cwd !== "string" || !jsonInput.cwd.trim()) {
+      stderr.write("Error: 'cwd' in JSON input must be a non-empty string.\n");
+      return 1;
+    }
+    effectiveCwd = jsonInput.cwd;
+  } else {
+    effectiveCwd = defaultCwd;
+  }
+
   let result: { text: string; isError: boolean };
-  const effectiveCwd = opts.cwd ?? (typeof jsonInput?.cwd === "string" ? jsonInput.cwd : defaultCwd);
 
   if (tool === "batch_search") {
     let payload: BatchSearchInput;
@@ -690,7 +799,7 @@ export async function runAgyFastCli(
   } else if (tool === "apply_edits") {
     if (!jsonInput) {
       stderr.write(
-        "Error: 'edit' requires JSON input via --json or stdin (e.g. {\"edits\":[...],\"bestEffort\":true}).\n",
+        "Error: 'edit' requires JSON input via --from-file <path.json>, --json, or stdin (e.g. {\"edits\":[...],\"bestEffort\":true}).\n",
       );
       return 1;
     }
@@ -752,13 +861,33 @@ export function shouldCliExitNonZero(
   tool: CliCanonicalTool,
   result: { text: string; isError: boolean },
 ): boolean {
-  return (
-    result.isError ||
-    (tool === "run_checks" &&
-      /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
-        result.text,
-      )) ||
-    (tool === "apply_edits" &&
-      /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text))
-  );
+  if (result.isError) return true;
+  if (tool === "run_checks") {
+    return /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
+      result.text,
+    );
+  }
+  if (tool === "apply_edits") {
+    return /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+  }
+  if (tool === "quick_outline" || tool === "read_slices") {
+    const hasHealthySection = /^## (?:Outline|Slice): .+ \(\d+ lines\)$/m.test(result.text);
+    const hasErrorSection = /^## (?:Outline|Slice): [^\n]*\nERROR: /m.test(result.text);
+    return hasErrorSection && !hasHealthySection;
+  }
+  if (tool === "batch_search") {
+    const sections = result.text
+      .split(/(?=(?:^|\n)## Query \d+ \[)/)
+      .map((s) => s.replace(/^\n+/, ""))
+      .filter((s) => /^## Query \d+ \[/.test(s));
+    if (sections.length === 0) return false;
+    return sections.every(
+      (sec) =>
+        /^## Query \d+ \[(?:text|regex|glob|fuzzy)\] [^\n]*\nERROR: /.test(sec) ||
+        /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|git (?:query timed out|execution error:|exited with code )|Flag '|Mutating |Invalid |Unsupported |fatal:|error:)/.test(
+          sec,
+        ),
+    );
+  }
+  return false;
 }
