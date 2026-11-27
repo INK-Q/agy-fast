@@ -572,5 +572,15 @@ describe("agy-fast --cli direct runner", () => {
       }),
       true,
     );
+
+    // Open real OS stdin pipe with no args or EOF still exits cleanly after the 500ms guard
+    const startedOpenPipeAt = Date.now();
+    const openPipeSearch = await runCliSubprocess(["search"], {
+      cwd: tmpDir,
+      closeStdin: false,
+    });
+    assert.equal(openPipeSearch.code, 1);
+    assert.match(openPipeSearch.stderr, /requires at least one query/);
+    assert.ok(Date.now() - startedOpenPipeAt < 3000);
   });
 });

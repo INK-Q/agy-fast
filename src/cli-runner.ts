@@ -158,6 +158,8 @@ async function readStdinText(
     };
 
     if (!explicitStdin) {
+      // Keep the 500ms grace timer ref'd so non-handle streams (e.g. PassThrough) stay alive
+      // until the timeout fires, then pause + unref any underlying OS stdin pipe.
       firstByteTimer = setTimeout(() => {
         if (totalBytes === 0) {
           if (typeof (stream as { pause?: () => void }).pause === "function") {
@@ -170,7 +172,6 @@ async function readStdinText(
           finish("");
         }
       }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
-      firstByteTimer.unref?.();
     }
 
     stream.on("data", onData);

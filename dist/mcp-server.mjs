@@ -9517,7 +9517,6 @@ async function readStdinText(stream, explicitStdin) {
           finish("");
         }
       }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
-      firstByteTimer.unref?.();
     }
     stream.on("data", onData);
     stream.on("end", onEnd);
