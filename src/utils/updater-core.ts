@@ -166,7 +166,12 @@ function canonicalizePathForStateKey(
   let canonical = resolved;
   while (true) {
     try {
-      const real = realpathSync(cur);
+      // Match fs.promises.realpath (libuv binding.realpath) so Windows 8.3 short paths
+      // expand identically across updater-core and scripts/install.mjs.
+      const real =
+        typeof realpathSync.native === "function"
+          ? realpathSync.native(cur)
+          : realpathSync(cur);
       canonical = tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
       break;
     } catch (err) {

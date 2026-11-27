@@ -369,7 +369,7 @@ function canonicalizePathForStateKey(targetPath, platform = process.platform) {
   let canonical = resolved;
   while (true) {
     try {
-      const real = realpathSync(cur);
+      const real = typeof realpathSync.native === "function" ? realpathSync.native(cur) : realpathSync(cur);
       canonical = tail.length > 0 ? path2.join(real, ...tail.reverse()) : real;
       break;
     } catch (err) {
