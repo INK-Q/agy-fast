@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
 import {
   runBatchSearch,
@@ -11,6 +12,7 @@ import {
   type ReadSlicesInput,
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
+import { resolvePath } from "./utils/fs-utils.js";
 
 export type CliCanonicalTool =
   | "batch_search"
@@ -66,9 +68,10 @@ export function formatCliUsage(): string {
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --from-file, --json, or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
+    "  --from-file <path.json> Read tool arguments JSON object (or shorthand array) from a UTF-8 file",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
     "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
     "  --cwd <dir>             Override working directory (defaults to shell CWD)",
@@ -263,6 +266,7 @@ const VALUE_LONG_FLAGS = new Set([
   "--cwd",
   "--max-chars",
   "--json",
+  "--from-file",
   "--text",
   "--regex",
   "--glob",
@@ -290,6 +294,7 @@ interface ParsedCliOptions {
   cwd?: string;
   maxChars?: number;
   jsonRaw?: string;
+  fromFile?: string;
   explicitStdin: boolean;
   positionals: string[];
   // search flags
@@ -390,6 +395,10 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     }
     if (arg === "--json") {
       opts.jsonRaw = consumeValue();
+      continue;
+    }
+    if (arg === "--from-file") {
+      opts.fromFile = consumeValue();
       continue;
     }
     if (arg === "--stdin") {
@@ -594,7 +603,43 @@ export async function runAgyFastCli(
 
   let jsonInput: Record<string, unknown> | null = null;
   try {
-    if (opts.jsonRaw !== undefined) {
+    if (
+      opts.fromFile !== undefined &&
+      (opts.jsonRaw !== undefined || opts.explicitStdin)
+    ) {
+      throw new Error(
+        "Cannot combine --from-file with --json or --stdin in the same command.",
+      );
+    }
+    if (opts.fromFile !== undefined) {
+      const trimmedPath = opts.fromFile.trim();
+      if (!trimmedPath) {
+        throw new Error("Missing file path after --from-file");
+      }
+      const baseDir = opts.cwd ? resolvePath(opts.cwd, defaultCwd) : defaultCwd;
+      const resolvedPath = resolvePath(trimmedPath, baseDir);
+      let fileText: string;
+      try {
+        const stat = await fs.stat(resolvedPath);
+        if (!stat.isFile()) {
+          throw new Error(`'${opts.fromFile}' is not a regular file`);
+        }
+        if (stat.size > MAX_CLI_STDIN_BYTES) {
+          throw new Error(
+            `JSON file '${opts.fromFile}' exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`,
+          );
+        }
+        fileText = await fs.readFile(resolvedPath, "utf8");
+      } catch (err) {
+        throw new Error(
+          `Failed to read --from-file '${opts.fromFile}': ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (fileText.charCodeAt(0) === 0xfeff) {
+        fileText = fileText.slice(1);
+      }
+      jsonInput = parseJsonPayload(fileText, tool);
+    } else if (opts.jsonRaw !== undefined) {
       jsonInput = parseJsonPayload(opts.jsonRaw, tool);
     } else if (opts.explicitStdin || !hasShorthandArgs) {
       const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
@@ -690,7 +735,7 @@ export async function runAgyFastCli(
   } else if (tool === "apply_edits") {
     if (!jsonInput) {
       stderr.write(
-        "Error: 'edit' requires JSON input via --json or stdin (e.g. {\"edits\":[...],\"bestEffort\":true}).\n",
+        "Error: 'edit' requires JSON input via --from-file <path.json>, --json, or stdin (e.g. {\"edits\":[...],\"bestEffort\":true}).\n",
       );
       return 1;
     }

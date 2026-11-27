@@ -394,4 +394,130 @@ describe("agy-fast --cli direct runner", () => {
     assert.equal(badOutlineFlag.code, 1);
     assert.match(badOutlineFlag.stderr, /Unknown option '--pattern=foo' for 'quick_outline'/);
   });
+
+  it("supports --from-file <path.json> (and --from-file=...) for edit and other --cli tools with clean error handling", async () => {
+    const fileDir = path.join(tmpDir, "from-file-case");
+    await fs.mkdir(fileDir, { recursive: true });
+    await fs.writeFile(
+      path.join(fileDir, "target.ts"),
+      "export const count = 1;\nexport const label = 'initial';\n",
+      "utf8",
+    );
+
+    // 1. --cli edit --from-file <path.json> with object payload (including UTF-8 BOM tolerance) + CLI --verify override
+    const editJsonPath = path.join(fileDir, "edits.json");
+    await fs.writeFile(
+      editJsonPath,
+      "\ufeff" +
+        JSON.stringify(
+      {
+        edits: [
+          {
+            path: "from-file-case/target.ts",
+            hunks: [
+              { target: "count = 1", replacement: "count = 2" },
+              { target: "label = 'initial'", replacement: "label = 'updated'" },
+            ],
+          },
+        ],
+      },
+          null,
+          2,
+        ),
+      "utf8",
+    );
+
+    const editFromFileRes = await runCliSubprocess(
+      [
+        "edit",
+        "--best-effort",
+        "--from-file",
+        "from-file-case/edits.json",
+        "--verify",
+        "node -e \"console.log('FROM_FILE_VERIFIED')\"",
+      ],
+      { cwd: tmpDir, closeStdin: false },
+    );
+    assert.equal(editFromFileRes.code, 0, editFromFileRes.stderr);
+    assert.match(editFromFileRes.stdout, /Applied edits to 1 file/);
+    assert.match(editFromFileRes.stdout, /Verify \[PASS/);
+    assert.match(editFromFileRes.stdout, /FROM_FILE_VERIFIED/);
+    const afterFirstEdit = await fs.readFile(path.join(fileDir, "target.ts"), "utf8");
+    assert.match(afterFirstEdit, /count = 2/);
+    assert.match(afterFirstEdit, /label = 'updated'/);
+
+    // 2. Inline --from-file=<path.json> with shorthand array payload and relative --cwd resolution
+    const shorthandJsonPath = path.join(fileDir, "shorthand-edits.json");
+    await fs.writeFile(
+      shorthandJsonPath,
+      JSON.stringify([
+        {
+          path: "target.ts",
+          hunks: [{ target: "count = 2", replacement: "count = 3" }],
+        },
+      ]),
+      "utf8",
+    );
+
+    const inlineFromFileRes = await runCliSubprocess(
+      ["edit", "--cwd", "from-file-case", "--from-file=shorthand-edits.json"],
+      { cwd: tmpDir },
+    );
+    assert.equal(inlineFromFileRes.code, 0, inlineFromFileRes.stderr);
+    assert.match(inlineFromFileRes.stdout, /Applied edits to 1 file/);
+    const afterSecondEdit = await fs.readFile(path.join(fileDir, "target.ts"), "utf8");
+    assert.match(afterSecondEdit, /count = 3/);
+
+    // 3. --from-file works across other --cli commands (e.g. search shorthand array)
+    const searchJsonPath = path.join(fileDir, "queries.json");
+    await fs.writeFile(
+      searchJsonPath,
+      JSON.stringify([{ type: "text", pattern: "count = 3", path: "from-file-case" }]),
+      "utf8",
+    );
+    const searchFromFileRes = await runCliSubprocess(
+      ["search", "--from-file", searchJsonPath],
+      { cwd: tmpDir },
+    );
+    assert.equal(searchFromFileRes.code, 0, searchFromFileRes.stderr);
+    assert.match(searchFromFileRes.stdout, /from-file-case\/target\.ts/);
+
+    // 4. Error handling: missing file, directory path, invalid JSON, and combining --json with --from-file
+    const missingFileRes = await runCliSubprocess(
+      ["edit", "--from-file", "from-file-case/does-not-exist.json"],
+      { cwd: tmpDir },
+    );
+    assert.equal(missingFileRes.code, 1);
+    assert.match(missingFileRes.stderr, /Failed to read --from-file/);
+
+    const dirFileRes = await runCliSubprocess(
+      ["edit", "--from-file", "from-file-case"],
+      { cwd: tmpDir },
+    );
+    assert.equal(dirFileRes.code, 1);
+    assert.match(dirFileRes.stderr, /not a regular file/);
+
+    const badJsonFilePath = path.join(fileDir, "malformed.json");
+    await fs.writeFile(badJsonFilePath, "{bad json", "utf8");
+    const badJsonFileRes = await runCliSubprocess(
+      ["edit", "--from-file", badJsonFilePath],
+      { cwd: tmpDir },
+    );
+    assert.equal(badJsonFileRes.code, 1);
+    assert.match(badJsonFileRes.stderr, /Invalid JSON input for 'apply_edits'/);
+
+    const conflictRes = await runCliSubprocess(
+      ["edit", "--json", "{}", "--from-file", editJsonPath],
+      { cwd: tmpDir },
+    );
+    assert.equal(conflictRes.code, 1);
+    assert.match(conflictRes.stderr, /Cannot combine --from-file with --json or --stdin/);
+
+    const conflictStdinRes = await runCliSubprocess(
+      ["edit", "--stdin", "--from-file", editJsonPath],
+      { cwd: tmpDir, stdin: "{}" },
+    );
+    assert.equal(conflictStdinRes.code, 1);
+    assert.match(conflictStdinRes.stderr, /Cannot combine --from-file with --json or --stdin/);
+  });
 });

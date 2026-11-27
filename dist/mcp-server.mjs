@@ -2,6 +2,9 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
+// src/cli-runner.ts
+import { promises as fs5 } from "node:fs";
+
 // src/tools/apply-edits.ts
 import { isUtf8 } from "node:buffer";
 import { promises as fs2 } from "node:fs";
@@ -9424,9 +9427,10 @@ function formatCliUsage() {
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --from-file, --json, or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
+    "  --from-file <path.json> Read tool arguments JSON object (or shorthand array) from a UTF-8 file",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
     "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
     "  --cwd <dir>             Override working directory (defaults to shell CWD)",
@@ -9574,6 +9578,7 @@ var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
   "--json",
+  "--from-file",
   "--text",
   "--regex",
   "--glob",
@@ -9669,6 +9674,10 @@ function parseToolFlags(tool, rawArgs) {
     }
     if (arg === "--json") {
       opts.jsonRaw = consumeValue();
+      continue;
+    }
+    if (arg === "--from-file") {
+      opts.fromFile = consumeValue();
       continue;
     }
     if (arg === "--stdin") {
@@ -9861,7 +9870,40 @@ async function runAgyFastCli(argv, io = {}) {
   const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
   let jsonInput = null;
   try {
-    if (opts.jsonRaw !== void 0) {
+    if (opts.fromFile !== void 0 && (opts.jsonRaw !== void 0 || opts.explicitStdin)) {
+      throw new Error(
+        "Cannot combine --from-file with --json or --stdin in the same command."
+      );
+    }
+    if (opts.fromFile !== void 0) {
+      const trimmedPath = opts.fromFile.trim();
+      if (!trimmedPath) {
+        throw new Error("Missing file path after --from-file");
+      }
+      const baseDir = opts.cwd ? resolvePath(opts.cwd, defaultCwd) : defaultCwd;
+      const resolvedPath = resolvePath(trimmedPath, baseDir);
+      let fileText;
+      try {
+        const stat = await fs5.stat(resolvedPath);
+        if (!stat.isFile()) {
+          throw new Error(`'${opts.fromFile}' is not a regular file`);
+        }
+        if (stat.size > MAX_CLI_STDIN_BYTES) {
+          throw new Error(
+            `JSON file '${opts.fromFile}' exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`
+          );
+        }
+        fileText = await fs5.readFile(resolvedPath, "utf8");
+      } catch (err) {
+        throw new Error(
+          `Failed to read --from-file '${opts.fromFile}': ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      if (fileText.charCodeAt(0) === 65279) {
+        fileText = fileText.slice(1);
+      }
+      jsonInput = parseJsonPayload(fileText, tool);
+    } else if (opts.jsonRaw !== void 0) {
       jsonInput = parseJsonPayload(opts.jsonRaw, tool);
     } else if (opts.explicitStdin || !hasShorthandArgs) {
       const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
@@ -9954,7 +9996,7 @@ async function runAgyFastCli(argv, io = {}) {
   } else if (tool === "apply_edits") {
     if (!jsonInput) {
       stderr.write(
-        `Error: 'edit' requires JSON input via --json or stdin (e.g. {"edits":[...],"bestEffort":true}).
+        `Error: 'edit' requires JSON input via --from-file <path.json>, --json, or stdin (e.g. {"edits":[...],"bestEffort":true}).
 `
       );
       return 1;
@@ -10012,7 +10054,7 @@ function shouldCliExitNonZero(tool, result) {
 }
 
 // src/mcp-server-core.ts
-import fs7 from "node:fs";
+import fs8 from "node:fs";
 import os4 from "node:os";
 import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
@@ -10658,7 +10700,7 @@ ${serialized}`);
 };
 
 // src/utils/host-compat.ts
-import fs5 from "node:fs";
+import fs6 from "node:fs";
 import os3 from "node:os";
 import path6 from "node:path";
 var HOST_COMPAT_RULES = [
@@ -10935,7 +10977,7 @@ function getConfigPath(env = process.env) {
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
-    const raw = fs5.readFileSync(getConfigPath(env), "utf8");
+    const raw = fs6.readFileSync(getConfigPath(env), "utf8");
     const parsed = JSON.parse(raw);
     return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
   } catch {
@@ -10944,7 +10986,7 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/utils/session-workspace.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import path7 from "node:path";
 
 // src/utils/snapshot.ts
@@ -10989,7 +11031,7 @@ function isFullAbsolutePath(dirPath) {
 function canonicalizeDirSync(dirPath) {
   const resolved = path7.resolve(dirPath);
   try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+    return typeof fs7.realpathSync.native === "function" ? fs7.realpathSync.native(resolved) : fs7.realpathSync(resolved);
   } catch {
     return resolved;
   }
@@ -11020,7 +11062,7 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
         if (!allowLinkedDevCheckout) {
           return trimmedEnvRoot;
         }
-        const isDevCheckout = fs6.existsSync(
+        const isDevCheckout = fs7.existsSync(
           path7.join(canonEnvRoot, "src", "mcp-server.ts")
         );
         if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
@@ -11032,7 +11074,7 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
   const resolvedScriptRoot = path7.resolve(scriptPluginRoot);
   const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
   if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs7.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs7.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -11430,7 +11472,7 @@ function createAgyFastServer(options = {}) {
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs7.statSync(candidate).isDirectory()) {
+          if (fs8.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
