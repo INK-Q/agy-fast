@@ -186,11 +186,12 @@ async function main(): Promise<void> {
       if (settings.mode !== "off") {
         const [currentVersion, state] = await Promise.all([
           readInstalledVersion(pluginDir),
-          readUpdateState(),
+          readUpdateState(process.env, pluginDir),
         ]);
         updateNotice = await consumeSnapshotUpdateNotice(
           pluginDir,
           currentVersion,
+          process.env,
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
           const updaterPath = path.join(pluginDir, "dist", "updater.mjs");
@@ -199,9 +200,13 @@ async function main(): Promise<void> {
             .then(() => true)
             .catch(() => false);
           if (hasUpdater) {
-            await writeUpdateState({
-              lastCheckAttemptAt: new Date().toISOString(),
-            }).catch(() => {});
+            await writeUpdateState(
+              {
+                lastCheckAttemptAt: new Date().toISOString(),
+              },
+              process.env,
+              pluginDir,
+            ).catch(() => {});
             spawnBackgroundUpdateCheck(pluginDir);
           }
         }

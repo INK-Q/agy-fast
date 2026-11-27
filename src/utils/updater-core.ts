@@ -1,5 +1,6 @@
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execBinaryAsync, withNonInteractiveGitEnv } from "./exec-utils.js";
@@ -155,16 +156,73 @@ export function getHomeDir(
   return env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
 }
 
-export function getUpdaterPaths(env: NodeJS.ProcessEnv = process.env): UpdaterPaths {
+function canonicalizePathForStateKey(
+  targetPath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const resolved = path.resolve(targetPath);
+  const tail: string[] = [];
+  let cur = resolved;
+  let canonical = resolved;
+  while (true) {
+    try {
+      const real = realpathSync(cur);
+      canonical = tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        canonical = resolved;
+        break;
+      }
+      const parent = path.dirname(cur);
+      if (parent === cur) {
+        canonical = resolved;
+        break;
+      }
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+  const normalized = path.resolve(canonical);
+  return platform === "win32" || platform === "darwin"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+export function getUpdaterPaths(
+  env: NodeJS.ProcessEnv = process.env,
+  pluginDir?: string,
+): UpdaterPaths {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
   const cacheDir = custom
     ? path.resolve(custom)
     : path.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  let stateDir = cacheDir;
+  if (!custom && pluginDir && pluginDir.trim()) {
+    const defaultGlobalPluginDir = path.join(
+      getHomeDir(env),
+      ".gemini",
+      "config",
+      "plugins",
+      "agy-fast",
+    );
+    const canonPlugin = canonicalizePathForStateKey(pluginDir);
+    const canonDefault = canonicalizePathForStateKey(defaultGlobalPluginDir);
+    if (canonPlugin !== canonDefault) {
+      const installKey = crypto
+        .createHash("sha256")
+        .update(canonPlugin)
+        .digest("hex")
+        .slice(0, 16);
+      stateDir = path.join(cacheDir, "installs", installKey);
+    }
+  }
   return {
     cacheDir,
-    stateFile: path.join(cacheDir, "update-state.json"),
+    stateFile: path.join(stateDir, "update-state.json"),
     configFile: path.join(cacheDir, "config.json"),
-    lockFile: path.join(cacheDir, "update.lock"),
+    lockFile: path.join(stateDir, "update.lock"),
   };
 }
 
@@ -285,16 +343,18 @@ export async function writeUpdaterConfig(
 
 export async function readUpdateState(
   env: NodeJS.ProcessEnv = process.env,
+  pluginDir?: string,
 ): Promise<UpdateState> {
-  const paths = getUpdaterPaths(env);
+  const paths = getUpdaterPaths(env, pluginDir);
   return (await readJsonFile<UpdateState>(paths.stateFile)) ?? {};
 }
 
 export async function writeUpdateState(
   patch: Partial<UpdateState>,
   env: NodeJS.ProcessEnv = process.env,
+  pluginDir?: string,
 ): Promise<UpdateState> {
-  const paths = getUpdaterPaths(env);
+  const paths = getUpdaterPaths(env, pluginDir);
   const existing = (await readJsonFile<UpdateState>(paths.stateFile)) ?? {};
   const merged: UpdateState = { ...existing, ...patch };
   await writeJsonAtomically(paths.stateFile, merged);
@@ -304,6 +364,7 @@ export async function writeUpdateState(
 export async function skipUpdateVersion(
   rawVersion: string,
   env: NodeJS.ProcessEnv = process.env,
+  pluginDir?: string,
 ): Promise<{ version: string; state: UpdateState }> {
   const parsed = parseSemver(rawVersion);
   if (!parsed) {
@@ -318,12 +379,14 @@ export async function skipUpdateVersion(
       notifiedAvailableVersion: version,
     },
     env,
+    pluginDir,
   );
   return { version, state };
 }
 
 export async function clearSkippedVersion(
   env: NodeJS.ProcessEnv = process.env,
+  pluginDir?: string,
 ): Promise<UpdateState> {
   return writeUpdateState(
     {
@@ -331,6 +394,7 @@ export async function clearSkippedVersion(
       notifiedAvailableVersion: undefined,
     },
     env,
+    pluginDir,
   );
 }
 
@@ -442,7 +506,7 @@ export async function consumeSnapshotUpdateNotice(
   currentVersion: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string | null> {
-  const state = await readUpdateState(env);
+  const state = await readUpdateState(env, pluginDir);
 
   // 1. Just auto-updated to currentVersion -> announce once
   if (
@@ -452,7 +516,7 @@ export async function consumeSnapshotUpdateNotice(
     state.lastAppliedFrom !== currentVersion &&
     state.notifiedAppliedVersion !== currentVersion
   ) {
-    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env).catch(
+    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env, pluginDir).catch(
       () => {},
     );
     return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
@@ -478,6 +542,7 @@ export async function consumeSnapshotUpdateNotice(
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
       env,
+      pluginDir,
     ).catch(() => {});
     const ver = state.availableVersion;
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
@@ -498,6 +563,7 @@ export async function consumeSnapshotUpdateNotice(
     await writeUpdateState(
       { notifiedAvailableCommit: state.availableCommit },
       env,
+      pluginDir,
     ).catch(() => {});
     const refLabel = state.availableRef || "main";
     const shortSha = state.availableCommit.slice(0, 7);
@@ -1044,7 +1110,7 @@ export async function runPluginUpdate(
 ): Promise<UpdateRunResult> {
   const env = opts.env ?? process.env;
   const pluginDir = path.resolve(opts.pluginDir);
-  const paths = getUpdaterPaths(env);
+  const paths = getUpdaterPaths(env, pluginDir);
   const settings = await resolveUpdaterSettings(env);
   const repoUrl = opts.repoUrl?.trim() || settings.repoUrl;
   const channel = opts.channel ?? settings.channel;
@@ -1085,7 +1151,7 @@ export async function runPluginUpdate(
       env,
       fetchFn: opts.fetchFn,
     });
-    const prevState = await readUpdateState(env);
+    const prevState = await readUpdateState(env, pluginDir);
 
     const hasNewerSemver =
       remote.version !== null && compareSemver(remote.version, currentVersion) > 0;
@@ -1113,6 +1179,7 @@ export async function runPluginUpdate(
           lastError: undefined,
         },
         env,
+        pluginDir,
       );
       return {
         status: "up-to-date",
@@ -1177,6 +1244,7 @@ export async function runPluginUpdate(
           lastError: undefined,
         },
         env,
+        pluginDir,
       );
 
       return {
@@ -1247,6 +1315,7 @@ export async function runPluginUpdate(
           lastError: undefined,
         },
         env,
+        pluginDir,
       );
       return {
         status: "up-to-date",
@@ -1313,6 +1382,7 @@ export async function runPluginUpdate(
         lastError: undefined,
       },
       env,
+      pluginDir,
     );
 
     return {
@@ -1334,6 +1404,7 @@ export async function runPluginUpdate(
         lastError: errMsg.slice(0, 300),
       },
       env,
+      pluginDir,
     ).catch(() => {});
     return {
       status: "error",

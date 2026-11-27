@@ -7,8 +7,9 @@ import path3 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/utils/updater-core.ts
+import crypto from "node:crypto";
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import os from "node:os";
 import path2 from "node:path";
 
@@ -361,14 +362,58 @@ function getHomeDir(env = process.env, platform = process.platform) {
   }
   return env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
 }
-function getUpdaterPaths(env = process.env) {
+function canonicalizePathForStateKey(targetPath, platform = process.platform) {
+  const resolved = path2.resolve(targetPath);
+  const tail = [];
+  let cur = resolved;
+  let canonical = resolved;
+  while (true) {
+    try {
+      const real = realpathSync(cur);
+      canonical = tail.length > 0 ? path2.join(real, ...tail.reverse()) : real;
+      break;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        canonical = resolved;
+        break;
+      }
+      const parent = path2.dirname(cur);
+      if (parent === cur) {
+        canonical = resolved;
+        break;
+      }
+      tail.push(path2.basename(cur));
+      cur = parent;
+    }
+  }
+  const normalized = path2.resolve(canonical);
+  return platform === "win32" || platform === "darwin" ? normalized.toLowerCase() : normalized;
+}
+function getUpdaterPaths(env = process.env, pluginDir) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
   const cacheDir = custom ? path2.resolve(custom) : path2.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  let stateDir = cacheDir;
+  if (!custom && pluginDir && pluginDir.trim()) {
+    const defaultGlobalPluginDir = path2.join(
+      getHomeDir(env),
+      ".gemini",
+      "config",
+      "plugins",
+      "agy-fast"
+    );
+    const canonPlugin = canonicalizePathForStateKey(pluginDir);
+    const canonDefault = canonicalizePathForStateKey(defaultGlobalPluginDir);
+    if (canonPlugin !== canonDefault) {
+      const installKey = crypto.createHash("sha256").update(canonPlugin).digest("hex").slice(0, 16);
+      stateDir = path2.join(cacheDir, "installs", installKey);
+    }
+  }
   return {
     cacheDir,
-    stateFile: path2.join(cacheDir, "update-state.json"),
+    stateFile: path2.join(stateDir, "update-state.json"),
     configFile: path2.join(cacheDir, "config.json"),
-    lockFile: path2.join(cacheDir, "update.lock")
+    lockFile: path2.join(stateDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -462,18 +507,18 @@ async function readUpdaterConfig(env = process.env) {
   const paths = getUpdaterPaths(env);
   return await readJsonFile(paths.configFile) ?? {};
 }
-async function readUpdateState(env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function readUpdateState(env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   return await readJsonFile(paths.stateFile) ?? {};
 }
-async function writeUpdateState(patch, env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function writeUpdateState(patch, env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   const existing = await readJsonFile(paths.stateFile) ?? {};
   const merged = { ...existing, ...patch };
   await writeJsonAtomically(paths.stateFile, merged);
   return merged;
 }
-async function skipUpdateVersion(rawVersion, env = process.env) {
+async function skipUpdateVersion(rawVersion, env = process.env, pluginDir) {
   const parsed = parseSemver(rawVersion);
   if (!parsed) {
     throw new Error(
@@ -486,17 +531,19 @@ async function skipUpdateVersion(rawVersion, env = process.env) {
       skippedVersion: version,
       notifiedAvailableVersion: version
     },
-    env
+    env,
+    pluginDir
   );
   return { version, state };
 }
-async function clearSkippedVersion(env = process.env) {
+async function clearSkippedVersion(env = process.env, pluginDir) {
   return writeUpdateState(
     {
       skippedVersion: void 0,
       notifiedAvailableVersion: void 0
     },
-    env
+    env,
+    pluginDir
   );
 }
 function parseToolLoadingMode(raw) {
@@ -993,7 +1040,7 @@ async function releaseUpdateLock(lockPath, token) {
 async function runPluginUpdate(opts) {
   const env = opts.env ?? process.env;
   const pluginDir = path2.resolve(opts.pluginDir);
-  const paths = getUpdaterPaths(env);
+  const paths = getUpdaterPaths(env, pluginDir);
   const settings = await resolveUpdaterSettings(env);
   const repoUrl = opts.repoUrl?.trim() || settings.repoUrl;
   const channel = opts.channel ?? settings.channel;
@@ -1029,7 +1076,7 @@ async function runPluginUpdate(opts) {
       env,
       fetchFn: opts.fetchFn
     });
-    const prevState = await readUpdateState(env);
+    const prevState = await readUpdateState(env, pluginDir);
     const hasNewerSemver = remote.version !== null && compareSemver(remote.version, currentVersion) > 0;
     const hasNewerMainCommit = remote.version === null && Boolean(remote.commitSha) && remote.commitSha !== prevState.lastAppliedCommit;
     if (!opts.force && !hasNewerSemver && !hasNewerMainCommit) {
@@ -1048,7 +1095,8 @@ async function runPluginUpdate(opts) {
           ...clearStaleSkip ? { skippedVersion: void 0 } : {},
           lastError: void 0
         },
-        env
+        env,
+        pluginDir
       );
       return {
         status: "up-to-date",
@@ -1083,7 +1131,8 @@ async function runPluginUpdate(opts) {
           ...shouldClearSkip ? { skippedVersion: void 0 } : {},
           lastError: void 0
         },
-        env
+        env,
+        pluginDir
       );
       return {
         status: "available",
@@ -1134,7 +1183,8 @@ async function runPluginUpdate(opts) {
           lastAppliedCommit: remote.commitSha,
           lastError: void 0
         },
-        env
+        env,
+        pluginDir
       );
       return {
         status: "up-to-date",
@@ -1192,7 +1242,8 @@ async function runPluginUpdate(opts) {
         notifiedAppliedVersion: opts.background ? void 0 : stagedCheck.version,
         lastError: void 0
       },
-      env
+      env,
+      pluginDir
     );
     return {
       status: "updated",
@@ -1212,7 +1263,8 @@ async function runPluginUpdate(opts) {
         lastCheckAt: nowIso,
         lastError: errMsg.slice(0, 300)
       },
-      env
+      env,
+      pluginDir
     ).catch(() => {
     });
     return {
@@ -1301,7 +1353,7 @@ function parseCliArgs(argv) {
 async function main() {
   const opts = parseCliArgs(process.argv);
   if (opts.clearSkip) {
-    await clearSkippedVersion();
+    await clearSkippedVersion(process.env, opts.pluginDir);
     const res = {
       status: "cleared-skip",
       message: "Cleared skipped agy-fast version preference."
@@ -1314,7 +1366,11 @@ async function main() {
     return;
   }
   if (opts.skipVersion) {
-    const { version } = await skipUpdateVersion(opts.skipVersion);
+    const { version } = await skipUpdateVersion(
+      opts.skipVersion,
+      process.env,
+      opts.pluginDir
+    );
     const res = {
       status: "skipped-version",
       skippedVersion: version,
