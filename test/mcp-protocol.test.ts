@@ -397,6 +397,9 @@ describe("MCP Stdio Server end-to-end", () => {
           "array-mode apply_edits must not bait strict JSON Schema hosts into sending stringified edits",
         );
       }
+      const runChecksTool = tools.find((t) => t.name === "run_checks")!;
+      assert.match(runChecksTool.description, /1-line pass summary/i);
+      assert.doesNotMatch(runChecksTool.description, /hides pass logs/i);
     }
   });
 

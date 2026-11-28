@@ -701,7 +701,7 @@ export function createAgyFastServer(
     applySchemaCompat({
       name: "run_checks",
       description:
-        `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
+        `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) keeps 1-line pass summary + failures; 'full' keeps all passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
       inputSchema: {
         type: "object",
         properties: {

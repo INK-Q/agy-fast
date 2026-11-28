@@ -80,6 +80,113 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+interface CompactPassEntry {
+  index: number;
+  compactHeader: string;
+  body: string;
+  fullBlock: string;
+}
+
+/**
+ * Shrinks PASS blocks to clean 1-line summaries within char and UTF-8 byte
+ * pools: drops echoed `(`command`)` tags first, then water-fills 1-line bodies.
+ */
+function shrinkPassBlocks(
+  passEntries: CompactPassEntry[],
+  passPoolChars: number,
+  passPoolBytes: number,
+  blocks: string[],
+): { passChars: number; passBytes: number } {
+  const noCmds = passEntries.map((p) => `${p.compactHeader}: ${p.body}`);
+  const totalNoCmdChars = noCmds.reduce((sum, s) => sum + s.length, 0);
+  const totalNoCmdBytes = noCmds.reduce(
+    (sum, s) => sum + Buffer.byteLength(s, "utf8"),
+    0,
+  );
+
+  let passChars = 0;
+  let passBytes = 0;
+
+  if (totalNoCmdChars <= passPoolChars && totalNoCmdBytes <= passPoolBytes) {
+    const cmdOverheadChars = passEntries.map(
+      (p, idx) => p.fullBlock.length - noCmds[idx]!.length,
+    );
+    const cmdOverheadBytes = passEntries.map(
+      (p, idx) =>
+        Buffer.byteLength(p.fullBlock, "utf8") -
+        Buffer.byteLength(noCmds[idx]!, "utf8"),
+    );
+    const extraCharShares = computeWaterFillBudgets(
+      cmdOverheadChars,
+      passPoolChars - totalNoCmdChars,
+    );
+    const extraByteShares = computeWaterFillBudgets(
+      cmdOverheadBytes,
+      passPoolBytes - totalNoCmdBytes,
+    );
+    for (let idx = 0; idx < passEntries.length; idx++) {
+      const p = passEntries[idx]!;
+      const keepFull =
+        cmdOverheadChars[idx]! <= (extraCharShares[idx] ?? 0) &&
+        cmdOverheadBytes[idx]! <= (extraByteShares[idx] ?? 0);
+      const chosen = keepFull ? p.fullBlock : noCmds[idx]!;
+      blocks[p.index] = chosen;
+      passChars += chosen.length;
+      passBytes += Buffer.byteLength(chosen, "utf8");
+    }
+    return { passChars, passBytes };
+  }
+
+  const passCharShares = computeWaterFillBudgets(
+    noCmds.map((s) => s.length),
+    passPoolChars,
+  );
+  const passByteShares = computeWaterFillBudgets(
+    noCmds.map((s) => Buffer.byteLength(s, "utf8")),
+    passPoolBytes,
+  );
+
+  for (let idx = 0; idx < passEntries.length; idx++) {
+    const p = passEntries[idx]!;
+    const noCmd = noCmds[idx]!;
+    const shareChars = passCharShares[idx] ?? 0;
+    const shareBytes = passByteShares[idx] ?? 0;
+    let shrunk = noCmd;
+    if (
+      noCmd.length > shareChars ||
+      Buffer.byteLength(noCmd, "utf8") > shareBytes
+    ) {
+      const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+      const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+      const bodyBytesAvail = shareBytes - hdrBytes - 2;
+      if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+        const trimmedBody = sliceUtf8Bytes(
+          sliceSafeChars(p.body, bodyCharsAvail - 3),
+          bodyBytesAvail - 3,
+        );
+        shrunk =
+          trimmedBody.length > 0
+            ? `${p.compactHeader}: ${trimmedBody}...`
+            : p.compactHeader;
+      } else if (
+        p.compactHeader.length <= shareChars &&
+        hdrBytes <= shareBytes
+      ) {
+        shrunk = p.compactHeader;
+      } else {
+        shrunk = sliceUtf8Bytes(
+          sliceSafeChars(p.compactHeader, shareChars),
+          shareBytes,
+        );
+      }
+    }
+    blocks[p.index] = shrunk;
+    passChars += shrunk.length;
+    passBytes += Buffer.byteLength(shrunk, "utf8");
+  }
+  return { passChars, passBytes };
+}
+
 export async function runChecks(
   input: RunChecksInput,
   budgetMs = MCP_CALL_BUDGET_SEC * 1000,
@@ -424,12 +531,6 @@ export async function runChecks(
     // Fixed tier: PASS (concise 1-line summary <= 300 chars; yields budget if starving FAIL) + capped [NOT RUN]
     // Elastic tier: FAIL / ERROR / TIMEOUT commands water-fill the remaining char & UTF-8 byte budget
     blocks = new Array<string>(outcomes.length);
-    interface PassEntry {
-      index: number;
-      compactHeader: string;
-      body: string;
-      fullBlock: string;
-    }
     interface FailEntry {
       index: number;
       spec: NormalizedCommand;
@@ -439,7 +540,7 @@ export async function runChecks(
       pass1Body: string;
       pass1Block: string;
     }
-    const passEntries: PassEntry[] = [];
+    const passEntries: CompactPassEntry[] = [];
     const failEntries: FailEntry[] = [];
     let notRunChars = 0;
     let notRunBytes = 0;
@@ -510,10 +611,10 @@ export async function runChecks(
       });
     }
 
-    if (failEntries.length > 0) {
-      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
-      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
+    const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+    const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
 
+    if (failEntries.length > 0) {
       const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
       const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
 
@@ -566,59 +667,12 @@ export async function runChecks(
             0,
             availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes),
           );
-          const passCharShares = computeWaterFillBudgets(
-            passEntries.map((p) => p.fullBlock.length),
+          ({ passChars, passBytes } = shrinkPassBlocks(
+            passEntries,
             passPoolChars,
-          );
-          const passByteShares = computeWaterFillBudgets(
-            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
             passPoolBytes,
-          );
-
-          passChars = 0;
-          passBytes = 0;
-          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
-            const p = passEntries[pIdx]!;
-            const shareChars = passCharShares[pIdx] ?? 0;
-            const shareBytes = passByteShares[pIdx] ?? 0;
-            let shrunk = p.fullBlock;
-            if (
-              shrunk.length > shareChars ||
-              Buffer.byteLength(shrunk, "utf8") > shareBytes
-            ) {
-              const noCmd = `${p.compactHeader}: ${p.body}`;
-              if (
-                noCmd.length <= shareChars &&
-                Buffer.byteLength(noCmd, "utf8") <= shareBytes
-              ) {
-                shrunk = noCmd;
-              } else {
-                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
-                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
-                const bodyBytesAvail = shareBytes - hdrBytes - 2;
-                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
-                  const trimmedBody = sliceUtf8Bytes(
-                    sliceSafeChars(p.body, bodyCharsAvail - 3),
-                    bodyBytesAvail - 3,
-                  );
-                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
-                } else if (
-                  p.compactHeader.length <= shareChars &&
-                  hdrBytes <= shareBytes
-                ) {
-                  shrunk = p.compactHeader;
-                } else {
-                  shrunk = sliceUtf8Bytes(
-                    sliceSafeChars(p.compactHeader, shareChars),
-                    shareBytes,
-                  );
-                }
-              }
-            }
-            blocks[p.index] = shrunk;
-            passChars += shrunk.length;
-            passBytes += Buffer.byteLength(shrunk, "utf8");
-          }
+            blocks,
+          ));
         }
       }
 
@@ -693,8 +747,28 @@ export async function runChecks(
           ).text;
         }
 
+        if (Buffer.byteLength(compactedBody, "utf8") > allowedBodyBytes) {
+          compactedBody = truncateHeadTailWithByteNotice(
+            compactedBody,
+            allowedBodyBytes,
+          );
+        }
+        if (compactedBody.length > allowedBodyChars) {
+          compactedBody = truncateHeadTailWithNotice(compactedBody, allowedBodyChars);
+        }
+
         blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
       }
+    } else if (
+      passEntries.length > 0 &&
+      (passChars > availAfterNotRunChars || passBytes > availAfterNotRunBytes)
+    ) {
+      shrinkPassBlocks(
+        passEntries,
+        availAfterNotRunChars,
+        availAfterNotRunBytes,
+        blocks,
+      );
     }
   }
 
@@ -712,6 +786,12 @@ export async function runChecks(
   );
   if (maxBytes !== undefined) {
     text = truncateWithByteNotice(text, maxBytes);
+    if (text.length > maxChars) {
+      text = truncateWithNotice(text, maxChars);
+    }
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      text = sliceUtf8Bytes(text, maxBytes);
+    }
   }
   return { text, isError: false };
 }

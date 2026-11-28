@@ -1326,7 +1326,7 @@ function stripAnsi(text) {
   return text.replace(ANSI_REGEX, "");
 }
 var LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
-var LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
+var LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[(?:[0-9;]*m|[01]?G|\?[0-9;]*[hl]))*\x1B\[0?K/;
 function normalizeTerminalOutput(raw) {
   const rawLines = raw.replace(/\r\n/g, "\n").split("\n");
   const normalizedLines = [];
@@ -1681,7 +1681,13 @@ function isFailureNoiseLine(line) {
   }
   return false;
 }
-var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
+var INVOCATION_BANNER_LINE_PATTERN = /^(?:>\s+\S|\$\s+\S|yarn run v\d|(?:@[\w.-]+\/)?[\w./-]+\s+[A-Za-z][\w.-]*\$\s+\S|•\s+(?:Packages in scope:|Running\s+\S))/i;
+var INDIVIDUAL_TEST_LINE_PATTERN = /^(?:test\s+\S+\s+\.\.\.\s+ok\b|---\s+PASS:\s+\S|ok\s+\d+\s+-\s+\S|running\s+\d+\s+tests?$|Ran all test suites\.?$)/i;
+var INDIVIDUAL_CHECKMARK_PREFIX_PATTERN = /^[✓✔]\s+(?!built\b|done\b|all\b|\d+\s+(?:tests?|specs?|suites?|files?|modules?|checks?)\b)/i;
+var TRAILING_TIMING_PAREN_PATTERN = /^\(\d+(?:\.\d+)?\s*(?:ms|s)\)$/i;
+var SOURCE_FILE_PROGRESS_PATTERN = /^\S+\.(?:py|[cm]?[jt]sx?|go|rs|rb|java|kt)\s/;
+var NODE_TEST_SUMMARY_LINE_PATTERN = /^(?:ℹ|#)\s+(tests|suites|pass|fail|cancelled|skipped|todo|files|duration_ms)\s+(\S.*)$/;
+var SUMMARY_LINE_PATTERN = /(?:^(?:\[INFO\]\s*)?(?:ok(?:\s+\S|$)|built\b|build success(?:ful)?\b)|\b(?:passed|passing|succeeded|successful|compiled|done in|finished|built in)\b|\b(?:0|no)\s+(?:warnings?|errors?|failures?|failed)\b|\b\d+\s+(?:warnings?|errors?|tests?|specs?|suites?|pass|fail|skipped)\b|\b(?:warnings?|errors?|tests?|specs?|suites?|pass|fail|skipped)[\s:=]+\d+)/i;
 var MONOREPO_PREFIX_PATTERN = /^(?:@[\w.-]+\/)?[\w./-]+(?::[A-Za-z][\w.-]*|\s+[A-Za-z][\w.-]*):\s+/;
 var GREEN_BUILD_OR_PASS_PATTERNS = [
   // Vite / Rollup / esbuild / Webpack / bundler banners & asset size lines
@@ -2118,6 +2124,116 @@ function formatExitFailureLabel(exitCode, signal) {
   if (fatalExit) return fatalExit;
   return `exit ${exitCode ?? "err"}`;
 }
+function isInvocationBannerLine(line) {
+  if (INVOCATION_BANNER_LINE_PATTERN.test(line)) return true;
+  const monoMatch = MONOREPO_PREFIX_PATTERN.exec(line);
+  if (!monoMatch) return false;
+  const inner = line.slice(monoMatch[0].length).trim();
+  return inner.length > 0 && INVOCATION_BANNER_LINE_PATTERN.test(inner);
+}
+function isIndividualTestCaseLine(line) {
+  if (INDIVIDUAL_TEST_LINE_PATTERN.test(line)) return true;
+  if (SOURCE_FILE_PROGRESS_PATTERN.test(line)) return true;
+  if (INDIVIDUAL_CHECKMARK_PREFIX_PATTERN.test(line)) {
+    const lastParen = line.lastIndexOf("(");
+    if (lastParen !== -1 && TRAILING_TIMING_PAREN_PATTERN.test(line.slice(lastParen))) {
+      return true;
+    }
+  }
+  return false;
+}
+function formatNodeTestSummaryFields(fields) {
+  const parts = [];
+  for (const key of ["tests", "pass", "fail"]) {
+    const val = fields.get(key);
+    if (val !== void 0) parts.push(`${key} ${val}`);
+  }
+  for (const key of ["skipped", "cancelled", "todo"]) {
+    const val = fields.get(key);
+    if (val !== void 0 && val !== "0") {
+      parts.push(`${key} ${val}`);
+    }
+  }
+  return parts.join(" | ");
+}
+function collapseNodeTestSummaryBlocks(lines) {
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(line);
+    const prefix = monoMatch ? monoMatch[0] : "";
+    const inner = prefix ? line.slice(prefix.length).trim() : line;
+    const firstMatch = NODE_TEST_SUMMARY_LINE_PATTERN.exec(inner);
+    if (!firstMatch) {
+      out.push({ text: line, isNodeTestSummary: false });
+      i++;
+      continue;
+    }
+    const blockStart = i;
+    const fields = /* @__PURE__ */ new Map();
+    while (i < lines.length) {
+      const cur = lines[i];
+      const curInner = prefix ? cur.startsWith(prefix) ? cur.slice(prefix.length).trim() : "" : cur;
+      const m = curInner ? NODE_TEST_SUMMARY_LINE_PATTERN.exec(curInner) : null;
+      if (!m) break;
+      const key = m[1];
+      if (fields.has(key)) break;
+      fields.set(key, m[2].trim());
+      i++;
+    }
+    if (fields.has("tests") && (fields.has("pass") || fields.has("fail"))) {
+      const formatted = formatNodeTestSummaryFields(fields);
+      out.push({
+        text: prefix ? `${prefix}${formatted}` : formatted,
+        isNodeTestSummary: true
+      });
+    } else {
+      for (let j = blockStart; j < i; j++) {
+        out.push({ text: lines[j], isNodeTestSummary: false });
+      }
+    }
+  }
+  return out;
+}
+function cleanPassSummaryLine(line) {
+  let start = 0;
+  while (start < line.length && line.charCodeAt(start) === 61) start++;
+  let end = line.length;
+  while (end > start && line.charCodeAt(end - 1) === 61) end--;
+  if (start < 3) start = 0;
+  if (line.length - end < 3) end = line.length;
+  const trimmed = line.slice(start, end).trim();
+  return trimmed || line;
+}
+function summarizePassingOutput(combined) {
+  const lines = combined.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) {
+    return { kind: "pass-empty", bodyText: "OK" };
+  }
+  const nonBannerLines = lines.filter((l) => !isInvocationBannerLine(l));
+  if (nonBannerLines.length === 0) {
+    const picked2 = lines.length <= 2 ? lines : [lines[lines.length - 1]];
+    return { kind: "pass-summary", bodyText: picked2.join(" | ") };
+  }
+  const candidates = collapseNodeTestSummaryBlocks(nonBannerLines);
+  const summaryEntries = candidates.filter(
+    (c) => c.isNodeTestSummary || !isIndividualTestCaseLine(c.text) && SUMMARY_LINE_PATTERN.test(c.text)
+  );
+  if (summaryEntries.length > 0) {
+    const last = summaryEntries[summaryEntries.length - 1];
+    if (last.isNodeTestSummary) {
+      const prev = summaryEntries.length >= 2 ? summaryEntries[summaryEntries.length - 2] : null;
+      const picked3 = prev && prev.isNodeTestSummary ? [prev.text, last.text] : [last.text];
+      return { kind: "pass-summary", bodyText: picked3.join(" | ") };
+    }
+    const picked2 = summaryEntries.slice(-2).map((entry) => cleanPassSummaryLine(entry.text));
+    return { kind: "pass-summary", bodyText: picked2.join(" | ") };
+  }
+  const fallbackLines = candidates.map((c) => c.text);
+  const picked = fallbackLines.length <= 2 ? fallbackLines : [fallbackLines[fallbackLines.length - 1]];
+  return { kind: "pass-summary", bodyText: picked.join(" | ") };
+}
 function prepareCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
   const err = normalizeTerminalOutput(params.stderr);
@@ -2154,12 +2270,10 @@ ${tail}` : "TIMED OUT (no output)",
         rawChars: 0
       };
     }
-    const lines = combined.split("\n").map((l) => l.trim()).filter(Boolean);
-    const summaryLines = lines.filter((l) => SUMMARY_LINE_PATTERN.test(l));
-    const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines.length <= 2 ? lines : [lines[lines.length - 1]];
+    const summarized = summarizePassingOutput(combined);
     return {
-      kind: "pass-summary",
-      bodyText: picked.join(" | "),
+      kind: summarized.kind,
+      bodyText: summarized.bodyText,
       collapsedLines: 0,
       rawLines,
       rawChars
@@ -2222,11 +2336,20 @@ function renderPreparedCompactCommandOutput(prepared, maxChars) {
   }
   if (prepared.kind === "pass-summary") {
     const cap = Math.min(maxChars, 320);
-    const text2 = truncateWithNotice(prepared.bodyText, cap);
+    if (prepared.bodyText.length <= cap) {
+      return {
+        text: prepared.bodyText,
+        collapsedLines: 0,
+        truncated: false,
+        rawLines: prepared.rawLines,
+        rawChars: prepared.rawChars
+      };
+    }
+    const text2 = cap <= 3 ? sliceSafeChars(prepared.bodyText, cap) : `${sliceSafeChars(prepared.bodyText, cap - 3)}...`;
     return {
       text: text2,
       collapsedLines: 0,
-      truncated: text2 !== prepared.bodyText,
+      truncated: true,
       rawLines: prepared.rawLines,
       rawChars: prepared.rawChars
     };
@@ -8852,6 +8975,79 @@ async function mapWithConcurrency(items, concurrency, worker) {
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
   return results;
 }
+function shrinkPassBlocks(passEntries, passPoolChars, passPoolBytes, blocks) {
+  const noCmds = passEntries.map((p) => `${p.compactHeader}: ${p.body}`);
+  const totalNoCmdChars = noCmds.reduce((sum, s) => sum + s.length, 0);
+  const totalNoCmdBytes = noCmds.reduce(
+    (sum, s) => sum + Buffer.byteLength(s, "utf8"),
+    0
+  );
+  let passChars = 0;
+  let passBytes = 0;
+  if (totalNoCmdChars <= passPoolChars && totalNoCmdBytes <= passPoolBytes) {
+    const cmdOverheadChars = passEntries.map(
+      (p, idx) => p.fullBlock.length - noCmds[idx].length
+    );
+    const cmdOverheadBytes = passEntries.map(
+      (p, idx) => Buffer.byteLength(p.fullBlock, "utf8") - Buffer.byteLength(noCmds[idx], "utf8")
+    );
+    const extraCharShares = computeWaterFillBudgets(
+      cmdOverheadChars,
+      passPoolChars - totalNoCmdChars
+    );
+    const extraByteShares = computeWaterFillBudgets(
+      cmdOverheadBytes,
+      passPoolBytes - totalNoCmdBytes
+    );
+    for (let idx = 0; idx < passEntries.length; idx++) {
+      const p = passEntries[idx];
+      const keepFull = cmdOverheadChars[idx] <= (extraCharShares[idx] ?? 0) && cmdOverheadBytes[idx] <= (extraByteShares[idx] ?? 0);
+      const chosen = keepFull ? p.fullBlock : noCmds[idx];
+      blocks[p.index] = chosen;
+      passChars += chosen.length;
+      passBytes += Buffer.byteLength(chosen, "utf8");
+    }
+    return { passChars, passBytes };
+  }
+  const passCharShares = computeWaterFillBudgets(
+    noCmds.map((s) => s.length),
+    passPoolChars
+  );
+  const passByteShares = computeWaterFillBudgets(
+    noCmds.map((s) => Buffer.byteLength(s, "utf8")),
+    passPoolBytes
+  );
+  for (let idx = 0; idx < passEntries.length; idx++) {
+    const p = passEntries[idx];
+    const noCmd = noCmds[idx];
+    const shareChars = passCharShares[idx] ?? 0;
+    const shareBytes = passByteShares[idx] ?? 0;
+    let shrunk = noCmd;
+    if (noCmd.length > shareChars || Buffer.byteLength(noCmd, "utf8") > shareBytes) {
+      const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+      const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+      const bodyBytesAvail = shareBytes - hdrBytes - 2;
+      if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+        const trimmedBody = sliceUtf8Bytes(
+          sliceSafeChars(p.body, bodyCharsAvail - 3),
+          bodyBytesAvail - 3
+        );
+        shrunk = trimmedBody.length > 0 ? `${p.compactHeader}: ${trimmedBody}...` : p.compactHeader;
+      } else if (p.compactHeader.length <= shareChars && hdrBytes <= shareBytes) {
+        shrunk = p.compactHeader;
+      } else {
+        shrunk = sliceUtf8Bytes(
+          sliceSafeChars(p.compactHeader, shareChars),
+          shareBytes
+        );
+      }
+    }
+    blocks[p.index] = shrunk;
+    passChars += shrunk.length;
+    passBytes += Buffer.byteLength(shrunk, "utf8");
+  }
+  return { passChars, passBytes };
+}
 async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   const parsedCommands = parseMaybeJsonArray(input?.commands);
   if (!parsedCommands.ok) {
@@ -9209,9 +9405,9 @@ $ ${spec.command}
         pass1Block: `${header}${pass1Body}`
       });
     }
+    const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+    const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
     if (failEntries.length > 0) {
-      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
-      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
       const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
       const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
       if (passEntries.length > 0) {
@@ -9256,49 +9452,12 @@ $ ${spec.command}
             0,
             availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes)
           );
-          const passCharShares = computeWaterFillBudgets(
-            passEntries.map((p) => p.fullBlock.length),
-            passPoolChars
-          );
-          const passByteShares = computeWaterFillBudgets(
-            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
-            passPoolBytes
-          );
-          passChars = 0;
-          passBytes = 0;
-          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
-            const p = passEntries[pIdx];
-            const shareChars = passCharShares[pIdx] ?? 0;
-            const shareBytes = passByteShares[pIdx] ?? 0;
-            let shrunk = p.fullBlock;
-            if (shrunk.length > shareChars || Buffer.byteLength(shrunk, "utf8") > shareBytes) {
-              const noCmd = `${p.compactHeader}: ${p.body}`;
-              if (noCmd.length <= shareChars && Buffer.byteLength(noCmd, "utf8") <= shareBytes) {
-                shrunk = noCmd;
-              } else {
-                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
-                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
-                const bodyBytesAvail = shareBytes - hdrBytes - 2;
-                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
-                  const trimmedBody = sliceUtf8Bytes(
-                    sliceSafeChars(p.body, bodyCharsAvail - 3),
-                    bodyBytesAvail - 3
-                  );
-                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
-                } else if (p.compactHeader.length <= shareChars && hdrBytes <= shareBytes) {
-                  shrunk = p.compactHeader;
-                } else {
-                  shrunk = sliceUtf8Bytes(
-                    sliceSafeChars(p.compactHeader, shareChars),
-                    shareBytes
-                  );
-                }
-              }
-            }
-            blocks[p.index] = shrunk;
-            passChars += shrunk.length;
-            passBytes += Buffer.byteLength(shrunk, "utf8");
-          }
+          ({ passChars, passBytes } = shrinkPassBlocks(
+            passEntries,
+            passPoolChars,
+            passPoolBytes,
+            blocks
+          ));
         }
       }
       const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
@@ -9357,8 +9516,24 @@ $ ${spec.command}
             targetChars
           ).text;
         }
+        if (Buffer.byteLength(compactedBody, "utf8") > allowedBodyBytes) {
+          compactedBody = truncateHeadTailWithByteNotice(
+            compactedBody,
+            allowedBodyBytes
+          );
+        }
+        if (compactedBody.length > allowedBodyChars) {
+          compactedBody = truncateHeadTailWithNotice(compactedBody, allowedBodyChars);
+        }
         blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
       }
+    } else if (passEntries.length > 0 && (passChars > availAfterNotRunChars || passBytes > availAfterNotRunBytes)) {
+      shrinkPassBlocks(
+        passEntries,
+        availAfterNotRunChars,
+        availAfterNotRunBytes,
+        blocks
+      );
     }
   }
   const nonEmptyBlocks = blocks.filter((b) => b.length > 0);
@@ -9375,6 +9550,12 @@ $ ${spec.command}
   );
   if (maxBytes !== void 0) {
     text = truncateWithByteNotice(text, maxBytes);
+    if (text.length > maxChars) {
+      text = truncateWithNotice(text, maxChars);
+    }
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      text = sliceUtf8Bytes(text, maxBytes);
+    }
   }
   return { text, isError: false };
 }
@@ -11580,7 +11761,7 @@ function createAgyFastServer(options = {}) {
     server.registerTool(
       applySchemaCompat({
         name: "run_checks",
-        description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
+        description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) keeps 1-line pass summary + failures; 'full' keeps all passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
         inputSchema: {
           type: "object",
           properties: {
