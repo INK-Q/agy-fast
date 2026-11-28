@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   const opts = parseCliArgs(process.argv);
 
   if (opts.clearSkip) {
-    await clearSkippedVersion();
+    await clearSkippedVersion(process.env, opts.pluginDir);
     const res = {
       status: "cleared-skip",
       message: "Cleared skipped agy-fast version preference.",
@@ -103,7 +103,11 @@ async function main(): Promise<void> {
   }
 
   if (opts.skipVersion) {
-    const { version } = await skipUpdateVersion(opts.skipVersion);
+    const { version } = await skipUpdateVersion(
+      opts.skipVersion,
+      process.env,
+      opts.pluginDir,
+    );
     const res = {
       status: "skipped-version",
       skippedVersion: version,

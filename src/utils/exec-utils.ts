@@ -523,6 +523,84 @@ function hasPowerShellSemicolonChaining(
   return hasSemicolonChain;
 }
 
+export interface ExplicitWindowsPowerShellInvocation {
+  requestedBin: WindowsPowerShellBin;
+  script: string;
+}
+
+/**
+ * Extracts standalone `powershell`/`pwsh` `-Command`/`-c` invocations that could
+ * not be unwrapped to `cmd.exe` (because they use cmdlets, pipelines, `;`, etc.)
+ * so Windows can spawn PowerShell directly (`shell: false`) with `-NoLogo`,
+ * `-NoProfile`, `-NonInteractive`, and UTF-8 OutputEncoding — avoiding an extra
+ * `cmd.exe` wrapper, `$PROFILE` startup errors/latency, and legacy codepage mojibake.
+ *
+ * Returns `null` whenever non-benign flags (`-ExecutionPolicy`, `-File`,
+ * `-EncodedCommand`, `-WorkingDirectory`, etc.), outer `cmd.exe` chains/pipes
+ * after the closing quote, inner quote escapes, `%VAR%` expansions, or newlines
+ * are present so specialized invocations preserve exact `cmd.exe` semantics.
+ */
+export function extractExplicitWindowsPowerShellInvocation(
+  command: string,
+): ExplicitWindowsPowerShellInvocation | null {
+  const trimmed = command.trim();
+  if (!trimmed || /[\r\n\x00]/.test(trimmed)) return null;
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return null;
+
+  const rawBinToken = binMatch[0].replace(/^["']|["']$/g, "").toLowerCase();
+  const requestedBin: WindowsPowerShellBin = rawBinToken.startsWith("pwsh")
+    ? "pwsh"
+    : "powershell.exe";
+
+  let rest = trimmed.slice(binMatch[0].length);
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return null;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return null;
+    const tok = tokMatch[1]!;
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return null;
+      sawCommandFlag = true;
+      break;
+    }
+    if (!WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      return null;
+    }
+  }
+  if (!sawCommandFlag) return null;
+
+  const payload = rest.trim();
+  if (!payload || WINDOWS_CMD_ENV_VAR_RE.test(payload)) {
+    return null;
+  }
+
+  let script: string;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    if (payload.length < 2 || payload.indexOf(quote, 1) !== payload.length - 1) {
+      return null;
+    }
+    const rawInner = payload.slice(1, -1);
+    if (quote === '"' && rawInner.endsWith("\\")) {
+      return null;
+    }
+    script = rawInner.trim();
+  } else {
+    if (payload.startsWith("-") || /[&|<>^"`']/.test(payload)) {
+      return null;
+    }
+    script = payload;
+  }
+
+  if (!script) return null;
+  return { requestedBin, script };
+}
+
 function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
   let out = "";
   let quote: '"' | "'" | null = null;
@@ -642,9 +720,11 @@ export function buildPowerShellUtf8Command(command: string): string {
 
 let cachedWindowsPowerShell: WindowsPowerShellBin | null | undefined;
 let cachedWindowsPowerShellExecPath: string | null = null;
+let cachedLegacyPowerShellExecPath: string | null | undefined;
 let pendingWindowsPowerShellProbe: Promise<WindowsPowerShellBin | null> | null = null;
+let pendingLegacyPowerShellProbe: Promise<string | null> | null = null;
 
-async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<boolean> {
+async function probeShellExecPath(bin: WindowsPowerShellBin): Promise<string | null> {
   const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
   const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
   const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
@@ -653,14 +733,12 @@ async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<bool
     maxOutputBytes: 4096,
   });
   if (!whereRes.error && !whereRes.timedOut) {
-    if (whereRes.exitCode !== 0) return false;
+    if (whereRes.exitCode !== 0) return null;
     const resolved = whereRes.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
       .find((line) => /\.exe$/i.test(line));
-    if (!resolved) return false;
-    cachedWindowsPowerShellExecPath = resolved;
-    return true;
+    return resolved ?? null;
   }
   const res = await execBinaryAsync(
     exeQuery,
@@ -672,10 +750,50 @@ async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<bool
     },
   );
   if (!res.error && !res.timedOut && res.exitCode === 0) {
-    cachedWindowsPowerShellExecPath = exeQuery;
+    return exeQuery;
+  }
+  return null;
+}
+
+async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<boolean> {
+  const resolved = await probeShellExecPath(bin);
+  if (bin === "powershell.exe") {
+    cachedLegacyPowerShellExecPath = resolved;
+  }
+  if (resolved) {
+    cachedWindowsPowerShellExecPath = resolved;
     return true;
   }
   return false;
+}
+
+export async function resolveExplicitWindowsPowerShellExecPath(
+  requestedBin: WindowsPowerShellBin,
+  probeExecPath: (bin: WindowsPowerShellBin) => Promise<string | null> = probeShellExecPath,
+): Promise<string | null> {
+  const preferred = await resolveWindowsPowerShell();
+  if (requestedBin === "pwsh") {
+    return preferred === "pwsh" ? (cachedWindowsPowerShellExecPath ?? "pwsh") : null;
+  }
+  if (preferred === "powershell.exe" && cachedWindowsPowerShellExecPath) {
+    return cachedWindowsPowerShellExecPath;
+  }
+  if (cachedLegacyPowerShellExecPath !== undefined) {
+    return cachedLegacyPowerShellExecPath;
+  }
+  if (pendingLegacyPowerShellProbe) {
+    return pendingLegacyPowerShellProbe;
+  }
+  pendingLegacyPowerShellProbe = (async () => {
+    try {
+      const resolved = await probeExecPath("powershell.exe");
+      cachedLegacyPowerShellExecPath = resolved;
+      return resolved;
+    } finally {
+      pendingLegacyPowerShellProbe = null;
+    }
+  })();
+  return pendingLegacyPowerShellProbe;
 }
 
 /**
@@ -718,7 +836,9 @@ export async function resolveWindowsPowerShell(
 export function resetWindowsShellCache(): void {
   cachedWindowsPowerShell = undefined;
   cachedWindowsPowerShellExecPath = null;
+  cachedLegacyPowerShellExecPath = undefined;
   pendingWindowsPowerShellProbe = null;
+  pendingLegacyPowerShellProbe = null;
 }
 
 function hasDefinedEnvKey(
@@ -761,6 +881,21 @@ export async function runShellCommandAsync(
   };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    const explicitPs = extractExplicitWindowsPowerShellInvocation(effectiveCommand);
+    if (explicitPs) {
+      const explicitExecPath = await resolveExplicitWindowsPowerShellExecPath(
+        explicitPs.requestedBin,
+      );
+      if (explicitExecPath) {
+        const utf8Command = buildPowerShellUtf8Command(explicitPs.script);
+        return spawnAndCollect(
+          explicitExecPath,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          effectiveOptions,
+        );
+      }
+    }
     if (needsPowerShellOnWindows(effectiveCommand)) {
       const psBin = await resolveWindowsPowerShell();
       if (psBin) {

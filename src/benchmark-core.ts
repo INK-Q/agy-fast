@@ -44,13 +44,21 @@ export interface TranscriptStep {
   media?: Array<{ mime_type?: string; uri?: string }>;
 }
 
+export type SessionKind = "main" | "subagent" | "swarm";
+
 export interface BenchmarkMetrics {
   sessions: number;
+  mainSessions: number;
+  subagentSessions: number;
   sessionsWithAgyFast: number;
   sessionsWithSnapshot: number;
   llmTurns: number;
   toolTurns: number;
   totalToolCalls: number;
+  totalLogicalOps: number;
+  agyFastLogicalOps: number;
+  avgAgyFastPacking: number;
+  turnsPer10LogicalOps: number;
   singleToolTurnRatio: number;
   consecutiveSingleChainsExtraTurns: number;
   activeTimeSec: number;
@@ -67,6 +75,8 @@ export interface BenchmarkMetrics {
   agyEagerCalls: number;
   agyLazyCalls: number;
   agyCliCalls: number;
+  runChecksFullModeCalls: number;
+  runChecksSingleCommandCalls: number;
   mcpSpillCalls: number;
   agyTruncatedCalls: number;
   agyMaxResultsCappedCalls: number;
@@ -83,7 +93,11 @@ export interface BenchmarkMetrics {
   multiDiffMcpTurns: number;
   multiRunCommandTurns: number;
   mediaLoadedCount: number;
+  userMediaCount: number;
+  toolMediaCount: number;
   multimodalHighCtxTurns: number;
+  multimodalHighCtxUserOnlyTurns: number;
+  multimodalHighCtxToolTurns: number;
   avgContextTokens: number;
   over150kContextRatio: number;
   avgCacheHitRate: number;
@@ -107,10 +121,18 @@ export interface CacheMissAttribution {
   maxConsecutiveMisses: number;
 }
 
-export interface UsageSplitMetrics {
+export interface UsageSplitBucket {
   overall: BenchmarkMetrics;
   withAgyFast: BenchmarkMetrics;
   withoutAgyFast: BenchmarkMetrics;
+}
+
+export interface UsageSplitMetrics extends UsageSplitBucket {
+  bySessionKind?: {
+    main: UsageSplitBucket;
+    subagent: UsageSplitBucket;
+    swarm: UsageSplitBucket;
+  };
 }
 
 const BLOCKING_TOOLS = new Set([
@@ -914,9 +936,9 @@ function parseTranscriptJsonlLine(rawLine: string): ParsedJsonlLineResult {
   const trimmed = rawLine.trim();
   if (!trimmed) return { kind: "empty" };
   try {
-    const parsed = JSON.parse(trimmed) as TranscriptStep;
-    if (parsed && typeof parsed === "object") {
-      return { kind: "step", step: parsed };
+    const parsed: unknown = JSON.parse(trimmed);
+    if (isPlainRecord(parsed)) {
+      return { kind: "step", step: parsed as TranscriptStep };
     }
     return { kind: "malformed" };
   } catch {
@@ -970,9 +992,6 @@ export async function parseTranscriptJsonlFile(
   return steps;
 }
 
-const AGY_FAST_CLI_SEGMENT_RE =
-  /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:(?:"[^"]*[/\\]?node(?:\.exe)?"|'[^']*[/\\]?node(?:\.exe)?'|(?:[^\s"']*[/\\])?node(?:\.exe)?)\s+)(?:--\S+\s+)*(?:"[^"]*[/\\]?mcp-server\.mjs"|'[^']*[/\\]?mcp-server\.mjs'|(?:[^\s"']*[/\\])?mcp-server\.mjs)\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
-
 const AGY_FAST_CLI_ALIAS_MAP: Record<string, string> = {
   search: "batch_search",
   batch_search: "batch_search",
@@ -987,6 +1006,16 @@ const AGY_FAST_CLI_ALIAS_MAP: Record<string, string> = {
   checks: "run_checks",
   run_checks: "run_checks",
 };
+
+interface CliSegmentToken {
+  value: string;
+  startsQuoted: boolean;
+}
+
+interface AgyFastCliInvocation {
+  tool: string;
+  args: string[];
+}
 
 function splitUnquotedShellSegments(cmd: string): string[] {
   const out: string[] = [];
@@ -1024,16 +1053,183 @@ function splitUnquotedShellSegments(cmd: string): string[] {
   return out;
 }
 
-function extractAgyFastCliToolName(cmd: string): string | null {
+function tokenizeCliSegment(seg: string): CliSegmentToken[] {
+  const tokens: CliSegmentToken[] = [];
+  let i = 0;
+  const len = seg.length;
+  while (i < len) {
+    while (i < len && (seg[i] === " " || seg[i] === "\t" || seg[i] === "\r" || seg[i] === "\n")) {
+      i++;
+    }
+    if (i >= len) break;
+    const startsQuoted = seg[i] === "'" || seg[i] === '"';
+    let value = "";
+    while (i < len) {
+      const ch = seg[i]!;
+      if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") break;
+      if (ch === "'") {
+        i++;
+        while (i < len && seg[i] !== "'") {
+          value += seg[i]!;
+          i++;
+        }
+        if (i < len && seg[i] === "'") i++;
+        continue;
+      }
+      if (ch === '"') {
+        i++;
+        while (i < len && seg[i] !== '"') {
+          if (seg[i] === "\\" && i + 1 < len && (seg[i + 1] === '"' || seg[i + 1] === "\\")) {
+            value += seg[i + 1]!;
+            i += 2;
+            continue;
+          }
+          value += seg[i]!;
+          i++;
+        }
+        if (i < len && seg[i] === '"') i++;
+        continue;
+      }
+      if (
+        ch === "\\" &&
+        i + 1 < len &&
+        (seg[i + 1] === " " || seg[i + 1] === "\t" || seg[i + 1] === '"' || seg[i + 1] === "'" || seg[i + 1] === "\\")
+      ) {
+        value += seg[i + 1]!;
+        i += 2;
+        continue;
+      }
+      value += ch;
+      i++;
+    }
+    tokens.push({ value, startsQuoted });
+  }
+  return tokens;
+}
+
+function baseNameAnySep(p: string): string {
+  const lastSlash = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
+}
+
+function stripBinExt(name: string): string {
+  return name.replace(/\.(?:exe|cmd|bat|ps1)$/i, "");
+}
+
+const BARE_REDIRECT_OP_RE = /^(?:\d*(?:>>?|<<-?|<>|<<<)|&>>?)$/;
+const ANY_REDIRECT_TOKEN_RE = /^(?:\d*[<>]|&>)/;
+const ENV_ASSIGN_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function stripShellRedirections(tokens: CliSegmentToken[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    if (!tok.startsQuoted && ANY_REDIRECT_TOKEN_RE.test(tok.value)) {
+      if (BARE_REDIRECT_OP_RE.test(tok.value)) {
+        i += 1;
+      }
+      continue;
+    }
+    out.push(tok.value);
+  }
+  return out;
+}
+
+function parseAgyFastCliSegment(seg: string): AgyFastCliInvocation | null {
+  if (!seg.includes("--cli")) return null;
+  const tokens = tokenizeCliSegment(seg);
+  if (tokens.length < 3) return null;
+
+  let idx = 0;
+  // Skip leading `env` wrapper and `VAR=val` assignments
+  while (idx < tokens.length) {
+    const t = tokens[idx]!;
+    if (!t.startsQuoted && ENV_ASSIGN_TOKEN_RE.test(t.value)) {
+      idx++;
+      continue;
+    }
+    if (!t.startsQuoted && t.value === "env") {
+      idx++;
+      while (idx < tokens.length && !tokens[idx]!.startsQuoted && tokens[idx]!.value.startsWith("-")) {
+        const flag = tokens[idx]!.value;
+        if (flag === "-u" || flag === "--unset" || flag === "-C" || flag === "--chdir") {
+          idx += 2;
+        } else {
+          idx++;
+        }
+      }
+      continue;
+    }
+    break;
+  }
+  if (idx >= tokens.length) return null;
+
+  let binBase = stripBinExt(baseNameAnySep(tokens[idx]!.value)).toLowerCase();
+  if (binBase === "npx") {
+    idx++;
+    while (idx < tokens.length) {
+      const flag = tokens[idx]!.value;
+      if (flag === "-p" || flag === "--package") {
+        idx += 2;
+        continue;
+      }
+      if (flag.startsWith("-")) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+    if (idx >= tokens.length) return null;
+    binBase = stripBinExt(baseNameAnySep(tokens[idx]!.value)).toLowerCase();
+  }
+
+  let cliFlagIdx = -1;
+  if (binBase === "node") {
+    idx++;
+    // Match optional `--*` node flags before script path (never `-e`/`-p`)
+    while (idx < tokens.length && tokens[idx]!.value.startsWith("--")) {
+      idx++;
+    }
+    if (idx >= tokens.length) return null;
+    const scriptBase = baseNameAnySep(tokens[idx]!.value).toLowerCase();
+    if (scriptBase === "mcp-server.mjs") {
+      cliFlagIdx = idx + 1;
+    } else if (scriptBase === "install.mjs" && tokens[idx + 1]?.value === "mcp") {
+      cliFlagIdx = idx + 2;
+    } else {
+      return null;
+    }
+  } else if (binBase === "agy-fast-mcp") {
+    cliFlagIdx = idx + 1;
+  } else if (binBase === "agy-fast" && tokens[idx + 1]?.value === "mcp") {
+    cliFlagIdx = idx + 2;
+  } else {
+    return null;
+  }
+
+  if (tokens[cliFlagIdx]?.value !== "--cli") return null;
+  const subcmd = tokens[cliFlagIdx + 1]?.value;
+  if (!subcmd) return null;
+  const canonical = AGY_FAST_CLI_ALIAS_MAP[subcmd.toLowerCase()];
+  if (!canonical) return null;
+
+  return {
+    tool: canonical,
+    args: stripShellRedirections(tokens.slice(cliFlagIdx + 2)),
+  };
+}
+
+function extractAgyFastCliInvocation(cmd: string): AgyFastCliInvocation | null {
   if (!cmd || !cmd.includes("--cli")) return null;
   for (const seg of splitUnquotedShellSegments(cmd)) {
-    if (!seg.includes("--cli")) continue;
-    const m = AGY_FAST_CLI_SEGMENT_RE.exec(seg);
-    if (m?.[1]) {
-      return AGY_FAST_CLI_ALIAS_MAP[m[1].toLowerCase()] ?? null;
-    }
+    const inv = parseAgyFastCliSegment(seg);
+    if (inv) return inv;
   }
   return null;
+}
+
+function extractAgyFastCliToolName(cmd: string): string | null {
+  return extractAgyFastCliInvocation(cmd)?.tool ?? null;
 }
 
 function extractAgyFastToolName(call: TranscriptToolCall): string | null {
@@ -1095,22 +1291,592 @@ function extractAgyFastInnerArgs(
 }
 
 function maybeParseJsonValue(val: unknown): unknown {
-  if (typeof val !== "string") return val;
-  const trimmed = val.trim();
-  if (
-    trimmed.startsWith("[") ||
-    trimmed.startsWith("{") ||
-    trimmed === "true" ||
-    trimmed === "false" ||
-    trimmed === "null"
-  ) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return val;
+  let cur = val;
+  for (let i = 0; i < 2 && typeof cur === "string"; i++) {
+    const trimmed = cur.trim();
+    if (
+      trimmed.startsWith("[") ||
+      trimmed.startsWith("{") ||
+      (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      trimmed === "true" ||
+      trimmed === "false" ||
+      trimmed === "null"
+    ) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (parsed === cur) break;
+        cur = parsed;
+        continue;
+      } catch {
+        return cur;
+      }
+    }
+    break;
+  }
+  return cur;
+}
+
+function countLineRangeSpecOps(spec: string): number {
+  const trimmed = spec.trim();
+  if (!trimmed) return 0;
+  const lastColon = trimmed.lastIndexOf(":");
+  if (lastColon <= 0) return 1;
+  const rangePart = trimmed.slice(lastColon + 1).trim();
+  if (!/^L?\d+/i.test(rangePart)) return 1;
+  const parts = rangePart.split(",").filter((p) => p.trim().length > 0);
+  return Math.max(1, parts.length);
+}
+
+function isCliSymbolShorthand(spec: string): boolean {
+  return (
+    spec.includes("::") ||
+    (spec.includes("#") && !/:\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(spec))
+  );
+}
+
+function countSymbolSpecOps(spec: string): number {
+  const trimmed = spec.trim();
+  if (!trimmed) return 0;
+  const sepIdx = trimmed.indexOf("::");
+  const splitAt = sepIdx !== -1 ? sepIdx : trimmed.lastIndexOf("#");
+  const sepLen = sepIdx !== -1 ? 2 : 1;
+  if (splitAt <= 0) return 1;
+  const namesPart = trimmed.slice(splitAt + sepLen);
+  const parts = namesPart.split(",").filter((p) => p.trim().length > 0);
+  return Math.max(1, parts.length);
+}
+
+function countApplyEditsOps(
+  inner: Record<string, unknown>,
+  cliVerify?: string,
+): number {
+  const eds = maybeParseJsonValue(inner.edits);
+  let editOps = 0;
+  if (Array.isArray(eds)) {
+    for (const item of eds) {
+      if (!isPlainRecord(item)) return 1;
+      const hunks = maybeParseJsonValue(item.hunks);
+      editOps += Array.isArray(hunks) && hunks.length > 0 ? hunks.length : 1;
     }
   }
-  return val;
+  if (editOps === 0) return 1;
+  const dryRun = maybeParseJsonValue(inner.dryRun) === true;
+  const rawVerify = cliVerify !== undefined ? cliVerify : maybeParseJsonValue(inner.verify);
+  const verifyStr = typeof rawVerify === "string" ? unwrapJsonString(rawVerify).trim() : "";
+  return editOps + (!dryRun && verifyStr.length > 0 ? 1 : 0);
+}
+
+function countReadSlicesOps(inner: Record<string, unknown>): number {
+  let ops = 0;
+  const outlines = maybeParseJsonValue(inner.outlines);
+  if (Array.isArray(outlines)) {
+    for (const item of outlines) {
+      if (typeof item === "string" && item.trim().length > 0) ops += 1;
+    }
+  } else if (typeof outlines === "string" && outlines.trim().length > 0) {
+    ops += 1;
+  }
+  const slices = maybeParseJsonValue(inner.slices);
+  if (Array.isArray(slices)) {
+    for (const item of slices) {
+      if (typeof item === "string") {
+        ops += countLineRangeSpecOps(item);
+      } else if (isPlainRecord(item)) {
+        const ranges = maybeParseJsonValue(item.ranges);
+        ops += Array.isArray(ranges) && ranges.length > 0 ? ranges.length : 1;
+      }
+    }
+  }
+  const lineRanges = maybeParseJsonValue(inner.lineRanges);
+  if (Array.isArray(lineRanges)) {
+    for (const item of lineRanges) {
+      if (typeof item === "string") ops += countLineRangeSpecOps(item);
+    }
+  } else if (typeof lineRanges === "string" && lineRanges.trim().length > 0) {
+    ops += countLineRangeSpecOps(lineRanges);
+  }
+  const symbols = maybeParseJsonValue(inner.symbols);
+  if (Array.isArray(symbols)) {
+    for (const item of symbols) {
+      if (typeof item === "string") {
+        ops += countSymbolSpecOps(item);
+      } else if (isPlainRecord(item)) {
+        const names = maybeParseJsonValue(item.names);
+        if (Array.isArray(names) && names.length > 0) {
+          ops += names.length;
+        } else if (typeof names === "string" && names.trim().length > 0) {
+          ops += 1;
+        } else {
+          ops += 1;
+        }
+      }
+    }
+  } else if (typeof symbols === "string" && symbols.trim().length > 0) {
+    ops += countSymbolSpecOps(symbols);
+  }
+  return Math.max(1, ops);
+}
+
+function countMcpLogicalOps(
+  fastTool: string,
+  inner: Record<string, unknown> | null,
+  corrupted: boolean,
+): number {
+  if (corrupted || !inner) return 1;
+  if (fastTool === "batch_search") {
+    const qs = maybeParseJsonValue(inner.queries);
+    return Array.isArray(qs) && qs.length > 0 ? qs.length : 1;
+  }
+  if (fastTool === "apply_edits") {
+    return countApplyEditsOps(inner);
+  }
+  if (fastTool === "quick_outline") {
+    const raw =
+      inner.paths !== undefined
+        ? inner.paths
+        : inner.outlines !== undefined
+          ? inner.outlines
+          : inner.files;
+    const paths = maybeParseJsonValue(raw);
+    return Array.isArray(paths) && paths.length > 0 ? paths.length : 1;
+  }
+  if (fastTool === "read_slices") {
+    return countReadSlicesOps(inner);
+  }
+  if (fastTool === "run_checks") {
+    const cmds = maybeParseJsonValue(inner.commands);
+    return Array.isArray(cmds) && cmds.length > 0 ? cmds.length : 1;
+  }
+  return 1;
+}
+
+interface RunChecksInspection {
+  isFullMode: boolean;
+  isSingleCommand: boolean;
+  commandCount: number | null;
+}
+
+function inspectMcpRunChecks(
+  inner: Record<string, unknown> | null,
+  corrupted: boolean,
+): RunChecksInspection {
+  if (!inner) {
+    return { isFullMode: false, isSingleCommand: false, commandCount: null };
+  }
+  const modeVal = maybeParseJsonValue(inner.outputMode);
+  const modeStr = typeof modeVal === "string" ? unwrapJsonString(modeVal).trim() : "";
+  const isFullMode = modeStr === "full";
+  if (corrupted) {
+    return { isFullMode, isSingleCommand: false, commandCount: null };
+  }
+  const cmds = maybeParseJsonValue(inner.commands);
+  if (Array.isArray(cmds) && cmds.length > 0) {
+    return {
+      isFullMode,
+      isSingleCommand: cmds.length === 1,
+      commandCount: cmds.length,
+    };
+  }
+  return { isFullMode, isSingleCommand: false, commandCount: null };
+}
+
+function splitLongFlag(raw: string, valueFlags: ReadonlySet<string>): {
+  flag: string;
+  inlineVal: string | undefined;
+} {
+  if (raw.startsWith("--")) {
+    const eq = raw.indexOf("=");
+    if (eq > 2) {
+      const candidate = raw.slice(0, eq);
+      if (valueFlags.has(candidate)) {
+        return { flag: candidate, inlineVal: raw.slice(eq + 1) };
+      }
+    }
+  }
+  return { flag: raw, inlineVal: undefined };
+}
+
+const CLI_CHECK_VALUE_FLAGS = new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--output-mode",
+  "--concurrency",
+  "--timeout",
+]);
+
+function inspectCliRunChecks(args: string[]): RunChecksInspection {
+  let cliOutputMode: "compact" | "full" | undefined;
+  let jsonRaw: string | undefined;
+  let positionalCount = 0;
+  let afterDoubleDash = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i]!;
+    if (afterDoubleDash) {
+      positionalCount++;
+      continue;
+    }
+    if (raw === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (raw === "-h" || raw === "--help") {
+      return { isFullMode: false, isSingleCommand: false, commandCount: null };
+    }
+    const { flag, inlineVal } = splitLongFlag(raw, CLI_CHECK_VALUE_FLAGS);
+    const takeVal = (): string | undefined => {
+      if (inlineVal !== undefined) return inlineVal;
+      return args[++i];
+    };
+    if (flag === "--full") {
+      cliOutputMode = "full";
+      continue;
+    }
+    if (flag === "--compact") {
+      cliOutputMode = "compact";
+      continue;
+    }
+    if (flag === "--output-mode") {
+      const val = takeVal()?.trim();
+      if (val === "full" || val === "compact") cliOutputMode = val;
+      continue;
+    }
+    if (flag === "--json") {
+      jsonRaw = takeVal();
+      continue;
+    }
+    if (CLI_CHECK_VALUE_FLAGS.has(flag)) {
+      takeVal();
+      continue;
+    }
+    if (flag === "--stdin" || flag.startsWith("-")) {
+      continue;
+    }
+    positionalCount++;
+  }
+
+  let jsonOutputMode: "compact" | "full" | undefined;
+  let jsonCmdCount: number | null = null;
+  if (jsonRaw !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(jsonRaw);
+      if (
+        Array.isArray(parsed) &&
+        parsed.every((c) => typeof c === "string" || isPlainRecord(c))
+      ) {
+        jsonCmdCount = parsed.length;
+      } else if (isPlainRecord(parsed)) {
+        const modeVal = maybeParseJsonValue(parsed.outputMode);
+        const modeStr = typeof modeVal === "string" ? unwrapJsonString(modeVal).trim() : "";
+        if (modeStr === "full" || modeStr === "compact") {
+          jsonOutputMode = modeStr;
+        }
+        const cmds = maybeParseJsonValue(parsed.commands);
+        if (
+          Array.isArray(cmds) &&
+          cmds.every((c) => typeof c === "string" || isPlainRecord(c))
+        ) {
+          jsonCmdCount = cmds.length;
+        }
+      }
+    } catch {
+      // Malformed inline JSON falls back to CLI flags
+    }
+  }
+
+  const effectiveMode = cliOutputMode ?? jsonOutputMode ?? "compact";
+  const commandCount =
+    jsonCmdCount !== null
+      ? jsonCmdCount
+      : positionalCount > 0
+        ? positionalCount
+        : null;
+  return {
+    isFullMode: effectiveMode === "full",
+    isSingleCommand: commandCount === 1,
+    commandCount,
+  };
+}
+
+const CLI_SEARCH_QUERY_FLAGS = new Set([
+  "--text",
+  "-t",
+  "--regex",
+  "-r",
+  "--glob",
+  "-g",
+  "--fuzzy",
+  "-f",
+  "--git",
+  "--pattern",
+]);
+
+const CLI_SEARCH_VALUE_FLAGS = new Set([
+  ...CLI_SEARCH_QUERY_FLAGS,
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--type",
+  "--path",
+  "-p",
+  "--file-type",
+  "--glob-filter",
+  "--output-mode",
+  "--sort-by",
+  "--context",
+  "-C",
+  "--max-results",
+]);
+
+const CLI_EDIT_VALUE_FLAGS = new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--verify",
+  "--verify-timeout",
+  "--max-verify-chars",
+]);
+
+const CLI_SLICE_VALUE_FLAGS = new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--outline",
+  "-o",
+  "--symbol",
+  "-s",
+]);
+
+const CLI_OUTLINE_VALUE_FLAGS = new Set(["--cwd", "--max-chars", "--json"]);
+
+function countCliLogicalOps(
+  inv: AgyFastCliInvocation,
+  runChecksInfo?: RunChecksInspection,
+): number {
+  const { tool, args } = inv;
+  if (tool === "run_checks") {
+    const info = runChecksInfo ?? inspectCliRunChecks(args);
+    return info.commandCount !== null && info.commandCount > 0 ? info.commandCount : 1;
+  }
+
+  if (tool === "batch_search") {
+    let queryCount = 0;
+    let jsonRaw: string | undefined;
+    let afterDoubleDash = false;
+    for (let i = 0; i < args.length; i++) {
+      const raw = args[i]!;
+      if (afterDoubleDash) {
+        queryCount++;
+        continue;
+      }
+      if (raw === "--") {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (raw === "-h" || raw === "--help") return 1;
+      const { flag, inlineVal } = splitLongFlag(raw, CLI_SEARCH_VALUE_FLAGS);
+      const consumeVal = (): string | undefined => (inlineVal !== undefined ? inlineVal : args[++i]);
+      if (flag === "--json") {
+        jsonRaw = consumeVal();
+        continue;
+      }
+      if (CLI_SEARCH_QUERY_FLAGS.has(flag)) {
+        consumeVal();
+        queryCount++;
+        continue;
+      }
+      if (CLI_SEARCH_VALUE_FLAGS.has(flag)) {
+        consumeVal();
+        continue;
+      }
+      if (flag.startsWith("-")) continue;
+      queryCount++;
+    }
+    if (jsonRaw !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(jsonRaw);
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(isPlainRecord)) {
+          return parsed.length;
+        }
+        if (isPlainRecord(parsed)) {
+          const qs = maybeParseJsonValue(parsed.queries);
+          if (Array.isArray(qs) && qs.length > 0 && qs.every(isPlainRecord)) {
+            return qs.length;
+          }
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    return Math.max(1, queryCount);
+  }
+
+  if (tool === "quick_outline") {
+    let pathCount = 0;
+    let jsonRaw: string | undefined;
+    let afterDoubleDash = false;
+    for (let i = 0; i < args.length; i++) {
+      const raw = args[i]!;
+      if (afterDoubleDash) {
+        pathCount++;
+        continue;
+      }
+      if (raw === "--") {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (raw === "-h" || raw === "--help") return 1;
+      const { flag, inlineVal } = splitLongFlag(raw, CLI_OUTLINE_VALUE_FLAGS);
+      const consumeVal = (): string | undefined => (inlineVal !== undefined ? inlineVal : args[++i]);
+      if (flag === "--json") {
+        jsonRaw = consumeVal();
+        continue;
+      }
+      if (CLI_OUTLINE_VALUE_FLAGS.has(flag)) {
+        consumeVal();
+        continue;
+      }
+      if (flag.startsWith("-")) continue;
+      pathCount++;
+    }
+    if (jsonRaw !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(jsonRaw);
+        if (
+          Array.isArray(parsed) &&
+          parsed.length > 0 &&
+          parsed.every((p) => typeof p === "string")
+        ) {
+          return parsed.length;
+        }
+        if (isPlainRecord(parsed)) {
+          const ps = maybeParseJsonValue(parsed.paths ?? parsed.outlines ?? parsed.files);
+          if (Array.isArray(ps) && ps.length > 0 && ps.every((p) => typeof p === "string")) {
+            return ps.length;
+          }
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    return Math.max(1, pathCount);
+  }
+
+  if (tool === "read_slices") {
+    let ops = 0;
+    let jsonRaw: string | undefined;
+    let afterDoubleDash = false;
+    for (let i = 0; i < args.length; i++) {
+      const raw = args[i]!;
+      if (afterDoubleDash) {
+        ops += isCliSymbolShorthand(raw)
+          ? countSymbolSpecOps(raw)
+          : countLineRangeSpecOps(raw);
+        continue;
+      }
+      if (raw === "--") {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (raw === "-h" || raw === "--help") return 1;
+      const { flag, inlineVal } = splitLongFlag(raw, CLI_SLICE_VALUE_FLAGS);
+      const consumeVal = (): string | undefined => (inlineVal !== undefined ? inlineVal : args[++i]);
+      if (flag === "--json") {
+        jsonRaw = consumeVal();
+        continue;
+      }
+      if (flag === "--outline" || flag === "-o") {
+        consumeVal();
+        ops += 1;
+        continue;
+      }
+      if (flag === "--symbol" || flag === "-s") {
+        const val = consumeVal();
+        ops += val !== undefined ? countSymbolSpecOps(val) : 1;
+        continue;
+      }
+      if (CLI_SLICE_VALUE_FLAGS.has(flag)) {
+        consumeVal();
+        continue;
+      }
+      if (flag.startsWith("-")) continue;
+      ops += isCliSymbolShorthand(raw)
+        ? countSymbolSpecOps(raw)
+        : countLineRangeSpecOps(raw);
+    }
+    if (jsonRaw !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(jsonRaw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.every((item) => typeof item === "string")
+            ? countReadSlicesOps({ lineRanges: parsed })
+            : countReadSlicesOps({ slices: parsed });
+        }
+        if (isPlainRecord(parsed)) {
+          return countReadSlicesOps(parsed);
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    return Math.max(1, ops);
+  }
+
+  if (tool === "apply_edits") {
+    let jsonRaw: string | undefined;
+    let cliVerify: string | undefined;
+    let cliDryRun = false;
+    let afterDoubleDash = false;
+    for (let i = 0; i < args.length; i++) {
+      const raw = args[i]!;
+      if (afterDoubleDash) continue;
+      if (raw === "--") {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (raw === "-h" || raw === "--help") return 1;
+      const { flag, inlineVal } = splitLongFlag(raw, CLI_EDIT_VALUE_FLAGS);
+      const consumeVal = (): string | undefined => (inlineVal !== undefined ? inlineVal : args[++i]);
+      if (flag === "--json") {
+        jsonRaw = consumeVal();
+        continue;
+      }
+      if (flag === "--verify") {
+        cliVerify = consumeVal();
+        continue;
+      }
+      if (flag === "--dry-run") {
+        cliDryRun = true;
+        continue;
+      }
+      if (CLI_EDIT_VALUE_FLAGS.has(flag)) {
+        consumeVal();
+      }
+    }
+    if (jsonRaw !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(jsonRaw);
+        if (Array.isArray(parsed)) {
+          return countApplyEditsOps(
+            { edits: parsed, ...(cliDryRun ? { dryRun: true } : {}) },
+            cliVerify,
+          );
+        }
+        if (isPlainRecord(parsed)) {
+          return countApplyEditsOps(
+            { ...parsed, ...(cliDryRun ? { dryRun: true } : {}) },
+            cliVerify,
+          );
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    return 1 + (!cliDryRun && cliVerify && cliVerify.trim().length > 0 ? 1 : 0);
+  }
+
+  return 1;
 }
 
 function getCanonicalToolName(call: TranscriptToolCall): string {
@@ -1217,15 +1983,25 @@ function hasCorruptedAgyFastArgs(
 
 const fullSessionStepsMap = new WeakMap<TranscriptStep[], TranscriptStep[]>();
 
-function isSwarmWorkerSession(steps: TranscriptStep[]): boolean {
+const SUBAGENT_MESSAGE_SENDER_RE = /\[Message\]\s[^\r\n]*\bsender=([^\s\]]+)/;
+
+export function classifySessionKind(steps: TranscriptStep[]): SessionKind {
   const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
   let hasUserRequest = false;
   let hasSwarmWorkerTool = false;
+  let hasSubagentSignal = false;
   for (const step of identitySteps) {
     if (step.type === "USER_INPUT") {
       const text = typeof step.content === "string" ? step.content : "";
-      if (text.includes("<USER_REQUEST>") || text.trim().length > 0) {
+      const hasMedia = Array.isArray(step.media) && step.media.length > 0;
+      if (text.includes("<USER_REQUEST>") || text.trim().length > 0 || hasMedia) {
         hasUserRequest = true;
+      }
+    }
+    if (step.type === "SYSTEM_MESSAGE" && typeof step.content === "string") {
+      const m = SUBAGENT_MESSAGE_SENDER_RE.exec(step.content);
+      if (m?.[1] && !m[1].includes("/task-")) {
+        hasSubagentSignal = true;
       }
     }
     if (step.type === "PLANNER_RESPONSE" && Array.isArray(step.tool_calls)) {
@@ -1233,11 +2009,16 @@ function isSwarmWorkerSession(steps: TranscriptStep[]): boolean {
         const n = tc.name ?? "";
         if (n === "read_board" || n === "post_message" || n === "swarm_wait") {
           hasSwarmWorkerTool = true;
+        } else if (n === "send_message") {
+          hasSubagentSignal = true;
         }
       }
     }
   }
-  return hasSwarmWorkerTool && !hasUserRequest;
+  if (hasUserRequest) return "main";
+  if (hasSwarmWorkerTool) return "swarm";
+  if (hasSubagentSignal) return "subagent";
+  return "main";
 }
 
 export function sessionUsesAgyFast(steps: TranscriptStep[]): boolean {
@@ -1360,12 +2141,16 @@ export function analyzeTranscriptSessions(
   sessions: TranscriptStep[][],
 ): BenchmarkMetrics {
   let validSessions = 0;
+  let mainSessions = 0;
+  let subagentSessions = 0;
   let sessionsWithAgyFast = 0;
   let sessionsWithSnapshot = 0;
   let llmTurns = 0;
   let toolTurns = 0;
   let singleToolTurns = 0;
   let totalToolCalls = 0;
+  let totalLogicalOps = 0;
+  let agyFastLogicalOps = 0;
   let consecutiveSingleChainsExtraTurns = 0;
   let activeTimeSec = 0;
   let llmTimeSec = 0;
@@ -1386,6 +2171,8 @@ export function analyzeTranscriptSessions(
   let agyEagerCalls = 0;
   let agyLazyCalls = 0;
   let agyCliCalls = 0;
+  let runChecksFullModeCalls = 0;
+  let runChecksSingleCommandCalls = 0;
   let mcpSpillCalls = 0;
   let agyTruncatedCalls = 0;
   let agyMaxResultsCappedCalls = 0;
@@ -1402,7 +2189,11 @@ export function analyzeTranscriptSessions(
   let multiDiffMcpTurns = 0;
   let multiRunCommandTurns = 0;
   let mediaLoadedCount = 0;
+  let userMediaCount = 0;
+  let toolMediaCount = 0;
   let multimodalHighCtxTurns = 0;
+  let multimodalHighCtxUserOnlyTurns = 0;
+  let multimodalHighCtxToolTurns = 0;
 
   let contextSum = 0;
   let contextCount = 0;
@@ -1432,6 +2223,8 @@ export function analyzeTranscriptSessions(
     let hasPlanner = false;
     let sessionFastCalls = 0;
     let sessionMediaCount = 0;
+    let sessionUserMediaCount = 0;
+    let sessionToolMediaCount = 0;
 
     let prevSingleToolName: string | null = null;
     let prevPlannerMs: number | null = null;
@@ -1462,6 +2255,11 @@ export function analyzeTranscriptSessions(
       const step = steps[i]!;
       if (Array.isArray(step.media) && step.media.length > 0) {
         sessionMediaCount += step.media.length;
+        if (step.type === "USER_INPUT") {
+          sessionUserMediaCount += step.media.length;
+        } else {
+          sessionToolMediaCount += step.media.length;
+        }
       }
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
@@ -1535,6 +2333,11 @@ export function analyzeTranscriptSessions(
         if (ctxTok >= 150_000) over150kCount += 1;
         if (sessionMediaCount > 0 && ctxTok >= 180_000) {
           multimodalHighCtxTurns += 1;
+          if (sessionToolMediaCount > 0) {
+            multimodalHighCtxToolTurns += 1;
+          } else if (sessionUserMediaCount > 0) {
+            multimodalHighCtxUserOnlyTurns += 1;
+          }
         }
         if (ctxTok >= 10_000) {
           cacheHitSum += safeCacheTok / ctxTok;
@@ -1655,6 +2458,7 @@ export function analyzeTranscriptSessions(
           const callArgs = getCallArgs(call);
           if (name === "edit_file") {
             editFileCalls += 1;
+            totalLogicalOps += 1;
             const p = getTargetPath(callArgs);
             if (p) {
               const cnt = (editedFilesThisTurn.get(p) ?? 0) + 1;
@@ -1663,8 +2467,9 @@ export function analyzeTranscriptSessions(
             }
           } else if (name === "run_command") {
             const cmd = getCommandString(callArgs);
-            const cliFastTool = extractAgyFastCliToolName(cmd);
-            if (cliFastTool && agyFastToolCalls[cliFastTool] !== undefined) {
+            const cliInv = extractAgyFastCliInvocation(cmd);
+            if (cliInv && agyFastToolCalls[cliInv.tool] !== undefined) {
+              const cliFastTool = cliInv.tool;
               agyFastToolCalls[cliFastTool] = (agyFastToolCalls[cliFastTool] ?? 0) + 1;
               agyCliCalls += 1;
               sessionFastCalls += 1;
@@ -1674,9 +2479,21 @@ export function analyzeTranscriptSessions(
                 (agyToolsThisTurn.get(cliFastTool) ?? 0) + 1,
               );
               agyCallsThisTurn.push({ callIdx, call, fastTool: cliFastTool });
+              const rcInfo =
+                cliFastTool === "run_checks"
+                  ? inspectCliRunChecks(cliInv.args)
+                  : undefined;
+              if (rcInfo) {
+                if (rcInfo.isFullMode) runChecksFullModeCalls += 1;
+                if (rcInfo.isSingleCommand) runChecksSingleCommandCalls += 1;
+              }
+              const cliOps = countCliLogicalOps(cliInv, rcInfo);
+              agyFastLogicalOps += cliOps;
+              totalLogicalOps += cliOps;
             } else {
               runCommandCalls += 1;
               runCmdCallsThisTurn += 1;
+              totalLogicalOps += 1;
               if (isReadonlySearchShell(cmd)) {
                 readonlySearchRunCommandCalls += 1;
               }
@@ -1694,10 +2511,22 @@ export function analyzeTranscriptSessions(
               mcpCallsThisTurn += 1;
               agyToolsThisTurn.set(fastTool, (agyToolsThisTurn.get(fastTool) ?? 0) + 1);
               agyCallsThisTurn.push({ callIdx, call, fastTool });
-              if (hasCorruptedAgyFastArgs(call, fastTool)) {
+              const corrupted = hasCorruptedAgyFastArgs(call, fastTool);
+              if (corrupted) {
                 agyCorruptedArgCalls += 1;
                 turnCorruptedAgyCalls += 1;
               }
+              const inner = extractAgyFastInnerArgs(call);
+              if (fastTool === "run_checks") {
+                const rcInfo = inspectMcpRunChecks(inner, corrupted);
+                if (rcInfo.isFullMode) runChecksFullModeCalls += 1;
+                if (rcInfo.isSingleCommand) runChecksSingleCommandCalls += 1;
+              }
+              const ops = countMcpLogicalOps(fastTool, inner, corrupted);
+              agyFastLogicalOps += ops;
+              totalLogicalOps += ops;
+            } else {
+              totalLogicalOps += 1;
             }
           }
         }
@@ -1897,22 +2726,38 @@ export function analyzeTranscriptSessions(
     if (hasPlanner) {
       validSessions += 1;
       mediaLoadedCount += sessionMediaCount;
+      userMediaCount += sessionUserMediaCount;
+      toolMediaCount += sessionToolMediaCount;
       if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
       if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
-      if (isSwarmWorkerSession(steps)) {
+      const sessionKind = classifySessionKind(steps);
+      if (sessionKind === "swarm") {
         swarmWorkerSessions += 1;
         if (sessionFastCalls > 0) swarmWorkerSessionsWithAgyFast += 1;
+      } else if (sessionKind === "subagent") {
+        subagentSessions += 1;
+      } else {
+        mainSessions += 1;
       }
     }
   }
 
+  const fastTotal = Object.values(agyFastToolCalls).reduce((a, b) => a + b, 0);
+
   return {
     sessions: validSessions,
+    mainSessions,
+    subagentSessions,
     sessionsWithAgyFast,
     sessionsWithSnapshot,
     llmTurns,
     toolTurns,
     totalToolCalls,
+    totalLogicalOps,
+    agyFastLogicalOps,
+    avgAgyFastPacking: fastTotal > 0 ? round2(agyFastLogicalOps / fastTotal) : 0,
+    turnsPer10LogicalOps:
+      totalLogicalOps > 0 ? round2((llmTurns / totalLogicalOps) * 10) : 0,
     singleToolTurnRatio: toolTurns > 0 ? singleToolTurns / toolTurns : 0,
     consecutiveSingleChainsExtraTurns,
     activeTimeSec: round2(activeTimeSec),
@@ -1929,6 +2774,8 @@ export function analyzeTranscriptSessions(
     agyEagerCalls,
     agyLazyCalls,
     agyCliCalls,
+    runChecksFullModeCalls,
+    runChecksSingleCommandCalls,
     mcpSpillCalls,
     agyTruncatedCalls,
     agyMaxResultsCappedCalls,
@@ -1945,7 +2792,11 @@ export function analyzeTranscriptSessions(
     multiDiffMcpTurns,
     multiRunCommandTurns,
     mediaLoadedCount,
+    userMediaCount,
+    toolMediaCount,
     multimodalHighCtxTurns,
+    multimodalHighCtxUserOnlyTurns,
+    multimodalHighCtxToolTurns,
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
@@ -2334,11 +3185,7 @@ export async function analyzePaths(
   return analyzeTranscriptSessions(sessions);
 }
 
-export async function analyzePathsByUsage(
-  inputs: string[],
-  options: AnalyzeOptions = {},
-): Promise<UsageSplitMetrics> {
-  const sessions = await loadFilteredSessions(inputs, options);
+function splitSessionsByUsage(sessions: TranscriptStep[][]): UsageSplitBucket {
   const withFastSessions: TranscriptStep[][] = [];
   const withoutFastSessions: TranscriptStep[][] = [];
   for (const s of sessions) {
@@ -2355,8 +3202,50 @@ export async function analyzePathsByUsage(
   };
 }
 
+export async function analyzePathsByUsage(
+  inputs: string[],
+  options: AnalyzeOptions = {},
+): Promise<UsageSplitMetrics> {
+  const sessions = await loadFilteredSessions(inputs, options);
+  const mainList: TranscriptStep[][] = [];
+  const subagentList: TranscriptStep[][] = [];
+  const swarmList: TranscriptStep[][] = [];
+  for (const s of sessions) {
+    const kind = classifySessionKind(s);
+    if (kind === "swarm") {
+      swarmList.push(s);
+    } else if (kind === "subagent") {
+      subagentList.push(s);
+    } else {
+      mainList.push(s);
+    }
+  }
+  return {
+    ...splitSessionsByUsage(sessions),
+    bySessionKind: {
+      main: splitSessionsByUsage(mainList),
+      subagent: splitSessionsByUsage(subagentList),
+      swarm: splitSessionsByUsage(swarmList),
+    },
+  };
+}
+
+function formatRunChecksHygieneCell(m: BenchmarkMetrics): string {
+  const rc = m.agyFastToolCalls.run_checks ?? 0;
+  if (rc === 0) return "-";
+  return `${m.runChecksFullModeCalls}/${rc} (${pct(m.runChecksFullModeCalls / rc)}) / ${m.runChecksSingleCommandCalls}/${rc} (${pct(m.runChecksSingleCommandCalls / rc)})`;
+}
+
+function formatLogicalOpsCell(m: BenchmarkMetrics): string {
+  const fastTotal = Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
+  return fastTotal > 0
+    ? `${m.totalLogicalOps} (agy-fast: ${m.agyFastLogicalOps}, ${m.avgAgyFastPacking.toFixed(2)}x avg)`
+    : `${m.totalLogicalOps}`;
+}
+
 export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
   const fastTotal = Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
+  const rcTotal = m.agyFastToolCalls.run_checks ?? 0;
   const editRedundancy =
     m.editFileCalls > 0
       ? pct(m.redundantSameTurnEditFileCalls / m.editFileCalls)
@@ -2365,6 +3254,10 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
     m.runCommandCalls > 0
       ? pct(m.readonlySearchRunCommandCalls / m.runCommandCalls)
       : "0.0%";
+  const multimodalCell =
+    m.mediaLoadedCount > 0
+      ? `${m.multimodalHighCtxTurns} (tool:${m.multimodalHighCtxToolTurns}, user-only:${m.multimodalHighCtxUserOnlyTurns}; ${m.mediaLoadedCount} media: user:${m.userMediaCount}, tool:${m.toolMediaCount})`
+      : `${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media)`;
 
   return [
     "# agy-fast Transcript Benchmark",
@@ -2372,9 +3265,16 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
     "| Metric | Value |",
     "| :--- | ---: |",
     `| Sessions | ${m.sessions} |`,
+    ...(m.subagentSessions > 0 || m.swarmWorkerSessions > 0
+      ? [
+          `| Session types (main / subagent / swarm) | ${m.mainSessions} / ${m.subagentSessions} / ${m.swarmWorkerSessions} |`,
+        ]
+      : []),
     `| Sessions using agy-fast | ${m.sessionsWithAgyFast}/${m.sessions} (snapshot: ${m.sessionsWithSnapshot}) |`,
     `| LLM turns | ${m.llmTurns} |`,
     `| Tool calls | ${m.totalToolCalls} |`,
+    `| Logical ops (agy-fast avg packing) | ${formatLogicalOpsCell(m)} |`,
+    `| LLM turns / 10 logical ops | ${m.turnsPer10LogicalOps.toFixed(2)} |`,
     `| Active time (s) | ${m.activeTimeSec.toFixed(1)} |`,
     `| LLM wait & decode (s) | ${m.llmTimeSec.toFixed(1)} |`,
     `| Multi-tool stream buffer wait (s) | ${m.streamWaitSec.toFixed(1)} |`,
@@ -2389,8 +3289,11 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
     ...formatCacheMissRows(m.cacheMissAttribution),
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${rcTotal}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyMaxResultsCappedCalls} / ${m.agyErrorCalls} / ${m.agyVerifyFailedCalls} |`,
+    ...(rcTotal > 0
+      ? [`| run_checks hygiene (full-mode / single-cmd) | ${formatRunChecksHygieneCell(m)} |`]
+      : []),
     ...(m.agyUnpairedResultCalls > 0
       ? [`| agy-fast unpaired results | ${m.agyUnpairedResultCalls} |`]
       : []),
@@ -2405,7 +3308,7 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
         ]
       : []),
     `| Parallel batching leaks (same-MCP (diff-MCP) / multi-run_command) | ${m.multiSameMcpTurns} (${m.multiDiffMcpTurns}) / ${m.multiRunCommandTurns} |`,
-    `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`,
+    `| Multimodal >=180k turns (media loaded) | ${multimodalCell} |`,
   ].join("\n");
 }
 
@@ -2439,6 +3342,14 @@ export function formatCompareMarkdown(
   before: BenchmarkMetrics,
   after: BenchmarkMetrics,
 ): string {
+  const showRunChecksHygiene =
+    (before.agyFastToolCalls.run_checks ?? 0) > 0 ||
+    (after.agyFastToolCalls.run_checks ?? 0) > 0;
+  const fmtCmpMultimodal = (m: BenchmarkMetrics): string =>
+    m.mediaLoadedCount > 0
+      ? `${m.multimodalHighCtxTurns} (tool:${m.multimodalHighCtxToolTurns}, user:${m.multimodalHighCtxUserOnlyTurns}; u${m.userMediaCount}/t${m.toolMediaCount})`
+      : `${m.multimodalHighCtxTurns}`;
+
   return [
     "# agy-fast A/B Comparison",
     "",
@@ -2447,6 +3358,8 @@ export function formatCompareMarkdown(
     `| Sessions | ${before.sessions} | ${after.sessions} | - |`,
     `| LLM turns | ${before.llmTurns} | ${after.llmTurns} | ${formatDelta(before.llmTurns, after.llmTurns)} |`,
     `| Tool calls | ${before.totalToolCalls} | ${after.totalToolCalls} | ${formatDelta(before.totalToolCalls, after.totalToolCalls)} |`,
+    `| Logical ops (agy-fast avg packing) | ${formatLogicalOpsCell(before)} | ${formatLogicalOpsCell(after)} | ${formatDelta(before.totalLogicalOps, after.totalLogicalOps)} |`,
+    `| LLM turns / 10 logical ops | ${before.turnsPer10LogicalOps.toFixed(2)} | ${after.turnsPer10LogicalOps.toFixed(2)} | ${formatDelta(before.turnsPer10LogicalOps, after.turnsPer10LogicalOps)} |`,
     `| Active time (s) | ${before.activeTimeSec.toFixed(1)} | ${after.activeTimeSec.toFixed(1)} | ${formatDelta(before.activeTimeSec, after.activeTimeSec)} |`,
     `| Tool execution time (s) | ${before.toolExecTimeSec.toFixed(1)} | ${after.toolExecTimeSec.toFixed(1)} | ${formatDelta(before.toolExecTimeSec, after.toolExecTimeSec)} |`,
     `| Effective throughput (tok/s) | ${before.effectiveTps.toFixed(1)} | ${after.effectiveTps.toFixed(1)} | ${formatDelta(before.effectiveTps, after.effectiveTps)} |`,
@@ -2470,11 +3383,16 @@ export function formatCompareMarkdown(
     `| agy-fast maxResults caps | ${before.agyMaxResultsCappedCalls} | ${after.agyMaxResultsCappedCalls} | ${formatDelta(before.agyMaxResultsCappedCalls, after.agyMaxResultsCappedCalls)} |`,
     `| agy-fast tool errors | ${before.agyErrorCalls} | ${after.agyErrorCalls} | ${formatDelta(before.agyErrorCalls, after.agyErrorCalls)} |`,
     `| agy-fast verify failures | ${before.agyVerifyFailedCalls} | ${after.agyVerifyFailedCalls} | ${formatDelta(before.agyVerifyFailedCalls, after.agyVerifyFailedCalls)} |`,
+    ...(showRunChecksHygiene
+      ? [
+          `| run_checks hygiene (full-mode / single-cmd) | ${formatRunChecksHygieneCell(before)} | ${formatRunChecksHygieneCell(after)} | - |`,
+        ]
+      : []),
     before.agyCliCalls > 0 || after.agyCliCalls > 0
       ? `| agy-fast dispatch (eager / lazy / cli) | ${before.agyEagerCalls} / ${before.agyLazyCalls} / ${before.agyCliCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} / ${after.agyCliCalls} | - |`
       : `| agy-fast dispatch (eager / lazy) | ${before.agyEagerCalls} / ${before.agyLazyCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} | - |`,
     `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${before.multiSameMcpTurns} (${before.multiDiffMcpTurns}) / ${before.multiRunCommandTurns} | ${after.multiSameMcpTurns} (${after.multiDiffMcpTurns}) / ${after.multiRunCommandTurns} | - |`,
-    `| Multimodal >=180k turns | ${before.multimodalHighCtxTurns} | ${after.multimodalHighCtxTurns} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`,
+    `| Multimodal >=180k turns | ${fmtCmpMultimodal(before)} | ${fmtCmpMultimodal(after)} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`,
   ].join("\n");
 }
 
@@ -2486,16 +3404,31 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
     m.runCommandCalls > 0 ? m.readonlySearchRunCommandCalls / m.runCommandCalls : 0;
   const fastSum = (m: BenchmarkMetrics): number =>
     Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
+  const hasMixedSessionKinds =
+    overall.subagentSessions > 0 || overall.swarmWorkerSessions > 0;
+  const fmtKinds = (m: BenchmarkMetrics): string =>
+    `${m.mainSessions} / ${m.subagentSessions} / ${m.swarmWorkerSessions}`;
+  const fmtSplitMultimodal = (m: BenchmarkMetrics): string =>
+    m.mediaLoadedCount > 0
+      ? `${m.multimodalHighCtxTurns} (tool:${m.multimodalHighCtxToolTurns}, user:${m.multimodalHighCtxUserOnlyTurns}; u${m.userMediaCount}/t${m.toolMediaCount})`
+      : `${m.multimodalHighCtxTurns} (${m.mediaLoadedCount})`;
 
-  return [
+  const lines: string[] = [
     "# agy-fast Usage Split Benchmark",
     "",
     "| Metric | Overall | Without agy-fast | With agy-fast | With vs Without |",
     "| :--- | ---: | ---: | ---: | ---: |",
     `| Sessions | ${overall.sessions} | ${wo.sessions} | ${wf.sessions} | - |`,
+    ...(hasMixedSessionKinds
+      ? [
+          `| Session types (main / subagent / swarm) | ${fmtKinds(overall)} | ${fmtKinds(wo)} | ${fmtKinds(wf)} | - |`,
+        ]
+      : []),
     `| Sessions with snapshot | ${overall.sessionsWithSnapshot} | ${wo.sessionsWithSnapshot} | ${wf.sessionsWithSnapshot} | - |`,
     `| LLM turns | ${overall.llmTurns} | ${wo.llmTurns} | ${wf.llmTurns} | - |`,
     `| Tool calls | ${overall.totalToolCalls} | ${wo.totalToolCalls} | ${wf.totalToolCalls} | - |`,
+    `| Logical ops (agy-fast avg packing) | ${formatLogicalOpsCell(overall)} | ${wo.totalLogicalOps} | ${formatLogicalOpsCell(wf)} | - |`,
+    `| LLM turns / 10 logical ops | ${overall.turnsPer10LogicalOps.toFixed(2)} | ${wo.turnsPer10LogicalOps.toFixed(2)} | ${wf.turnsPer10LogicalOps.toFixed(2)} | ${formatDelta(wo.turnsPer10LogicalOps, wf.turnsPer10LogicalOps)} |`,
     `| Active time (s) | ${overall.activeTimeSec.toFixed(1)} | ${wo.activeTimeSec.toFixed(1)} | ${wf.activeTimeSec.toFixed(1)} | - |`,
     `| Multi-tool stream wait (s) | ${overall.streamWaitSec.toFixed(1)} | ${wo.streamWaitSec.toFixed(1)} | ${wf.streamWaitSec.toFixed(1)} | - |`,
     `| Effective throughput (tok/s) | ${overall.effectiveTps.toFixed(1)} | ${wo.effectiveTps.toFixed(1)} | ${wf.effectiveTps.toFixed(1)} | ${formatDelta(wo.effectiveTps, wf.effectiveTps)} |`,
@@ -2517,6 +3450,11 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
       : []),
     `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}${overall.agyCliCalls > 0 ? `, cli:${overall.agyCliCalls}` : ""}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}${wf.agyCliCalls > 0 ? `, cli:${wf.agyCliCalls}` : ""}) | - |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyMaxResultsCappedCalls} / ${overall.agyErrorCalls} / ${overall.agyVerifyFailedCalls} | 0 / 0 / 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyMaxResultsCappedCalls} / ${wf.agyErrorCalls} / ${wf.agyVerifyFailedCalls} | - |`,
+    ...((overall.agyFastToolCalls.run_checks ?? 0) > 0
+      ? [
+          `| run_checks hygiene (full-mode / single-cmd) | ${formatRunChecksHygieneCell(overall)} | - | ${formatRunChecksHygieneCell(wf)} | - |`,
+        ]
+      : []),
     ...(overall.agyUnpairedResultCalls > 0
       ? [
           `| agy-fast unpaired results | ${overall.agyUnpairedResultCalls} | 0 | ${wf.agyUnpairedResultCalls} | - |`,
@@ -2533,6 +3471,30 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
         ]
       : []),
     `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${overall.multiSameMcpTurns} (${overall.multiDiffMcpTurns}) / ${overall.multiRunCommandTurns} | ${wo.multiSameMcpTurns} (${wo.multiDiffMcpTurns}) / ${wo.multiRunCommandTurns} | ${wf.multiSameMcpTurns} (${wf.multiDiffMcpTurns}) / ${wf.multiRunCommandTurns} | - |`,
-    `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`,
-  ].join("\n");
+    `| Multimodal >=180k turns (media) | ${fmtSplitMultimodal(overall)} | ${fmtSplitMultimodal(wo)} | ${fmtSplitMultimodal(wf)} | - |`,
+  ];
+
+  const mainSplit = split.bySessionKind?.main;
+  if (hasMixedSessionKinds && mainSplit && mainSplit.overall.sessions > 0) {
+    const mo = mainSplit.overall;
+    const mwo = mainSplit.withoutAgyFast;
+    const mwf = mainSplit.withAgyFast;
+    lines.push(
+      "",
+      "## Main Sessions Only (Apples-to-Apples)",
+      "",
+      "| Metric | Overall | Without agy-fast | With agy-fast | With vs Without |",
+      "| :--- | ---: | ---: | ---: | ---: |",
+      `| Sessions | ${mo.sessions} | ${mwo.sessions} | ${mwf.sessions} | - |`,
+      `| LLM turns | ${mo.llmTurns} | ${mwo.llmTurns} | ${mwf.llmTurns} | - |`,
+      `| Logical ops (agy-fast avg packing) | ${formatLogicalOpsCell(mo)} | ${mwo.totalLogicalOps} | ${formatLogicalOpsCell(mwf)} | - |`,
+      `| LLM turns / 10 logical ops | ${mo.turnsPer10LogicalOps.toFixed(2)} | ${mwo.turnsPer10LogicalOps.toFixed(2)} | ${mwf.turnsPer10LogicalOps.toFixed(2)} | ${formatDelta(mwo.turnsPer10LogicalOps, mwf.turnsPer10LogicalOps)} |`,
+      `| Effective throughput (tok/s) | ${mo.effectiveTps.toFixed(1)} | ${mwo.effectiveTps.toFixed(1)} | ${mwf.effectiveTps.toFixed(1)} | ${formatDelta(mwo.effectiveTps, mwf.effectiveTps)} |`,
+      `| Average context (tokens) | ${mo.avgContextTokens.toLocaleString("en-US")} | ${mwo.avgContextTokens.toLocaleString("en-US")} | ${mwf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(mwo.avgContextTokens, mwf.avgContextTokens)} |`,
+      `| Prompt Cache hit rate | ${pct(mo.avgCacheHitRate)} | ${pct(mwo.avgCacheHitRate)} | ${pct(mwf.avgCacheHitRate)} | ${formatDelta(mwo.avgCacheHitRate, mwf.avgCacheHitRate)} |`,
+      `| Turn gaps > 60s | ${pct(mo.over60sGapRatio)} | ${pct(mwo.over60sGapRatio)} | ${pct(mwf.over60sGapRatio)} | ${formatDelta(mwo.over60sGapRatio, mwf.over60sGapRatio)} |`,
+    );
+  }
+
+  return lines.join("\n");
 }

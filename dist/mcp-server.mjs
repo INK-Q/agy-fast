@@ -89,6 +89,7 @@ var TOOL_VALIDATION_EXAMPLES = {
   apply_edits: '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
   read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
   read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_symbols: '{"symbols":["src/app.ts::main,MyClass.run"]}',
   quick_outline: '{"paths":["src/app.ts"]}',
   run_checks: '{"commands":[{"name":"test","command":"npm test"}]}'
 };
@@ -520,6 +521,57 @@ function hasPowerShellSemicolonChaining(command, withoutSingle, unquoted) {
   }
   return hasSemicolonChain;
 }
+function extractExplicitWindowsPowerShellInvocation(command) {
+  const trimmed = command.trim();
+  if (!trimmed || /[\r\n\x00]/.test(trimmed)) return null;
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return null;
+  const rawBinToken = binMatch[0].replace(/^["']|["']$/g, "").toLowerCase();
+  const requestedBin = rawBinToken.startsWith("pwsh") ? "pwsh" : "powershell.exe";
+  let rest = trimmed.slice(binMatch[0].length);
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return null;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return null;
+    const tok = tokMatch[1];
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return null;
+      sawCommandFlag = true;
+      break;
+    }
+    if (!WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      return null;
+    }
+  }
+  if (!sawCommandFlag) return null;
+  const payload = rest.trim();
+  if (!payload || WINDOWS_CMD_ENV_VAR_RE.test(payload)) {
+    return null;
+  }
+  let script;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    if (payload.length < 2 || payload.indexOf(quote, 1) !== payload.length - 1) {
+      return null;
+    }
+    const rawInner = payload.slice(1, -1);
+    if (quote === '"' && rawInner.endsWith("\\")) {
+      return null;
+    }
+    script = rawInner.trim();
+  } else {
+    if (payload.startsWith("-") || /[&|<>^"`']/.test(payload)) {
+      return null;
+    }
+    script = payload;
+  }
+  if (!script) return null;
+  return { requestedBin, script };
+}
 function stripQuotedSpans(command, stripDoubleQuotes) {
   let out = "";
   let quote = null;
@@ -617,8 +669,10 @@ function buildPowerShellUtf8Command(command) {
 }
 var cachedWindowsPowerShell;
 var cachedWindowsPowerShellExecPath = null;
+var cachedLegacyPowerShellExecPath;
 var pendingWindowsPowerShellProbe = null;
-async function defaultProbeWindowsShell(bin) {
+var pendingLegacyPowerShellProbe = null;
+async function probeShellExecPath(bin) {
   const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
   const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
   const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
@@ -627,11 +681,9 @@ async function defaultProbeWindowsShell(bin) {
     maxOutputBytes: 4096
   });
   if (!whereRes.error && !whereRes.timedOut) {
-    if (whereRes.exitCode !== 0) return false;
+    if (whereRes.exitCode !== 0) return null;
     const resolved = whereRes.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line));
-    if (!resolved) return false;
-    cachedWindowsPowerShellExecPath = resolved;
-    return true;
+    return resolved ?? null;
   }
   const res = await execBinaryAsync(
     exeQuery,
@@ -643,10 +695,45 @@ async function defaultProbeWindowsShell(bin) {
     }
   );
   if (!res.error && !res.timedOut && res.exitCode === 0) {
-    cachedWindowsPowerShellExecPath = exeQuery;
+    return exeQuery;
+  }
+  return null;
+}
+async function defaultProbeWindowsShell(bin) {
+  const resolved = await probeShellExecPath(bin);
+  if (bin === "powershell.exe") {
+    cachedLegacyPowerShellExecPath = resolved;
+  }
+  if (resolved) {
+    cachedWindowsPowerShellExecPath = resolved;
     return true;
   }
   return false;
+}
+async function resolveExplicitWindowsPowerShellExecPath(requestedBin, probeExecPath = probeShellExecPath) {
+  const preferred = await resolveWindowsPowerShell();
+  if (requestedBin === "pwsh") {
+    return preferred === "pwsh" ? cachedWindowsPowerShellExecPath ?? "pwsh" : null;
+  }
+  if (preferred === "powershell.exe" && cachedWindowsPowerShellExecPath) {
+    return cachedWindowsPowerShellExecPath;
+  }
+  if (cachedLegacyPowerShellExecPath !== void 0) {
+    return cachedLegacyPowerShellExecPath;
+  }
+  if (pendingLegacyPowerShellProbe) {
+    return pendingLegacyPowerShellProbe;
+  }
+  pendingLegacyPowerShellProbe = (async () => {
+    try {
+      const resolved = await probeExecPath("powershell.exe");
+      cachedLegacyPowerShellExecPath = resolved;
+      return resolved;
+    } finally {
+      pendingLegacyPowerShellProbe = null;
+    }
+  })();
+  return pendingLegacyPowerShellProbe;
 }
 async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   if (cachedWindowsPowerShell !== void 0) {
@@ -704,6 +791,21 @@ async function runShellCommandAsync(command, options) {
   };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    const explicitPs = extractExplicitWindowsPowerShellInvocation(effectiveCommand);
+    if (explicitPs) {
+      const explicitExecPath = await resolveExplicitWindowsPowerShellExecPath(
+        explicitPs.requestedBin
+      );
+      if (explicitExecPath) {
+        const utf8Command = buildPowerShellUtf8Command(explicitPs.script);
+        return spawnAndCollect(
+          explicitExecPath,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          effectiveOptions
+        );
+      }
+    }
     if (needsPowerShellOnWindows(effectiveCommand)) {
       const psBin = await resolveWindowsPowerShell();
       if (psBin) {
@@ -2919,6 +3021,367 @@ ${summaryLines.join("\n")}`;
   const assembled = joinSections(failedSection, appliedSection);
   return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
 }
+var DIFF_CONTEXT_LINES = 2;
+var CREATED_DIFF_MAX_LINES = 40;
+var DIFF_LCS_CELL_LIMIT = 4e4;
+function splitDiffLines(text) {
+  if (text.length === 0) {
+    return { lines: [], hasTrailingNewline: false };
+  }
+  if (text.endsWith("\n")) {
+    return { lines: text.slice(0, -1).split("\n"), hasTrailingNewline: true };
+  }
+  return { lines: text.split("\n"), hasTrailingNewline: false };
+}
+function computeLineDiffOps(oldLines, newLines, oldBase = 0, newBase = 0) {
+  const ops = [];
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) {
+    ops.push({
+      kind: " ",
+      line: oldLines[prefix],
+      oldIdx: oldBase + prefix,
+      newIdx: newBase + prefix
+    });
+    prefix++;
+  }
+  let suffix = 0;
+  while (suffix < minLen - prefix && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]) {
+    suffix++;
+  }
+  const aEnd = oldLines.length - suffix;
+  const bEnd = newLines.length - suffix;
+  const aLen = aEnd - prefix;
+  const bLen = bEnd - prefix;
+  if (aLen > 0 || bLen > 0) {
+    if (aLen === 0) {
+      for (let j = prefix; j < bEnd; j++) {
+        ops.push({ kind: "+", line: newLines[j], oldIdx: oldBase + prefix, newIdx: newBase + j });
+      }
+    } else if (bLen === 0) {
+      for (let i = prefix; i < aEnd; i++) {
+        ops.push({ kind: "-", line: oldLines[i], oldIdx: oldBase + i, newIdx: newBase + prefix });
+      }
+    } else if (aLen * bLen <= DIFF_LCS_CELL_LIMIT) {
+      const cols = bLen + 1;
+      const dp = new Int32Array((aLen + 1) * cols);
+      for (let i2 = aLen - 1; i2 >= 0; i2--) {
+        const row = i2 * cols;
+        const nextRow = (i2 + 1) * cols;
+        for (let j2 = bLen - 1; j2 >= 0; j2--) {
+          if (oldLines[prefix + i2] === newLines[prefix + j2]) {
+            dp[row + j2] = dp[nextRow + j2 + 1] + 1;
+          } else {
+            const down = dp[nextRow + j2];
+            const right = dp[row + j2 + 1];
+            dp[row + j2] = down >= right ? down : right;
+          }
+        }
+      }
+      let i = 0;
+      let j = 0;
+      while (i < aLen && j < bLen) {
+        if (oldLines[prefix + i] === newLines[prefix + j]) {
+          ops.push({
+            kind: " ",
+            line: oldLines[prefix + i],
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j
+          });
+          i++;
+          j++;
+        } else if (dp[(i + 1) * cols + j] >= dp[i * cols + j + 1]) {
+          ops.push({
+            kind: "-",
+            line: oldLines[prefix + i],
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j
+          });
+          i++;
+        } else {
+          ops.push({
+            kind: "+",
+            line: newLines[prefix + j],
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j
+          });
+          j++;
+        }
+      }
+      while (i < aLen) {
+        ops.push({
+          kind: "-",
+          line: oldLines[prefix + i],
+          oldIdx: oldBase + prefix + i,
+          newIdx: newBase + prefix + j
+        });
+        i++;
+      }
+      while (j < bLen) {
+        ops.push({
+          kind: "+",
+          line: newLines[prefix + j],
+          oldIdx: oldBase + prefix + i,
+          newIdx: newBase + prefix + j
+        });
+        j++;
+      }
+    } else {
+      for (let i = prefix; i < aEnd; i++) {
+        ops.push({ kind: "-", line: oldLines[i], oldIdx: oldBase + i, newIdx: newBase + prefix });
+      }
+      for (let j = prefix; j < bEnd; j++) {
+        ops.push({ kind: "+", line: newLines[j], oldIdx: oldBase + aEnd, newIdx: newBase + j });
+      }
+    }
+  }
+  for (let s = 0; s < suffix; s++) {
+    const oldI = aEnd + s;
+    const newI = bEnd + s;
+    ops.push({
+      kind: " ",
+      line: oldLines[oldI],
+      oldIdx: oldBase + oldI,
+      newIdx: newBase + newI
+    });
+  }
+  return ops;
+}
+function formatUnifiedHunksFromOps(ops, contextLines = DIFF_CONTEXT_LINES) {
+  const changeIndices = [];
+  for (let i = 0; i < ops.length; i++) {
+    if (ops[i].kind !== " ") {
+      changeIndices.push(i);
+    }
+  }
+  if (changeIndices.length === 0) return [];
+  const clusters = [];
+  let clusterStart = changeIndices[0];
+  let clusterEnd = changeIndices[0];
+  for (let i = 1; i < changeIndices.length; i++) {
+    const idx = changeIndices[i];
+    if (idx - clusterEnd <= contextLines * 2 + 1) {
+      clusterEnd = idx;
+    } else {
+      clusters.push({ start: clusterStart, end: clusterEnd });
+      clusterStart = idx;
+      clusterEnd = idx;
+    }
+  }
+  clusters.push({ start: clusterStart, end: clusterEnd });
+  return clusters.map(({ start, end }) => {
+    const winStart = Math.max(0, start - contextLines);
+    const winEnd = Math.min(ops.length - 1, end + contextLines);
+    const hunkOps = ops.slice(winStart, winEnd + 1);
+    let oldCount = 0;
+    let newCount = 0;
+    for (const op of hunkOps) {
+      if (op.kind !== "+") oldCount++;
+      if (op.kind !== "-") newCount++;
+    }
+    const firstOp = hunkOps[0];
+    const oldStart = oldCount === 0 ? firstOp.oldIdx : firstOp.oldIdx + 1;
+    const newStart = newCount === 0 ? firstOp.newIdx : firstOp.newIdx + 1;
+    const header = `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`;
+    const body = hunkOps.map((op) => `${op.kind}${op.line}`);
+    return `${header}
+${body.join("\n")}`;
+  });
+}
+function buildCompactDiffForHunkPlans(relPath, normalizedOriginal, spans) {
+  if (spans.length === 0) return "";
+  const lineStarts = computeLineStarts(normalizedOriginal);
+  const { lines: oldLines, hasTrailingNewline: oldTrailingNl } = splitDiffLines(normalizedOriginal);
+  const maxLineIdx = Math.max(0, oldLines.length - 1);
+  const rawGroups = [];
+  for (const span of spans) {
+    const rawStartLine = offsetToLine(lineStarts, span.start) - 1;
+    const startLineIdx = Math.min(maxLineIdx, rawStartLine);
+    let endLineIdx = span.end > span.start ? Math.min(maxLineIdx, offsetToLine(lineStarts, span.end - 1) - 1) : startLineIdx;
+    if (endLineIdx < oldLines.length - 1 && span.end > span.start && normalizedOriginal[span.end - 1] === "\n" && (span.replacement.length > 0 || span.start > (lineStarts[startLineIdx] ?? 0)) && !span.replacement.endsWith("\n")) {
+      endLineIdx++;
+    }
+    const prev = rawGroups[rawGroups.length - 1];
+    if (prev && startLineIdx <= prev.endLineIdx + DIFF_CONTEXT_LINES * 2 + 1) {
+      prev.endLineIdx = Math.max(prev.endLineIdx, endLineIdx);
+      prev.spans.push(span);
+    } else {
+      rawGroups.push({ startLineIdx, endLineIdx, spans: [span] });
+    }
+  }
+  const computeRegionNewText = (group) => {
+    const byteStart = lineStarts[group.startLineIdx] ?? 0;
+    const byteEnd = group.endLineIdx + 1 < lineStarts.length && group.endLineIdx + 1 < oldLines.length ? lineStarts[group.endLineIdx + 1] : normalizedOriginal.length;
+    const pieces = [];
+    let cursor = byteStart;
+    for (const sp of group.spans) {
+      pieces.push(normalizedOriginal.slice(cursor, sp.start));
+      pieces.push(sp.replacement);
+      cursor = sp.end;
+    }
+    pieces.push(normalizedOriginal.slice(cursor, byteEnd));
+    return pieces.join("");
+  };
+  const groups = [];
+  let gi = 0;
+  while (gi < rawGroups.length) {
+    const current = {
+      startLineIdx: rawGroups[gi].startLineIdx,
+      endLineIdx: rawGroups[gi].endLineIdx,
+      spans: [...rawGroups[gi].spans]
+    };
+    gi++;
+    while (true) {
+      while (gi < rawGroups.length && rawGroups[gi].startLineIdx <= current.endLineIdx + DIFF_CONTEXT_LINES * 2 + 1) {
+        const nxt = rawGroups[gi];
+        current.endLineIdx = Math.max(current.endLineIdx, nxt.endLineIdx);
+        current.spans.push(...nxt.spans);
+        gi++;
+      }
+      if (current.endLineIdx >= oldLines.length - 1) {
+        break;
+      }
+      const regionNewText = computeRegionNewText(current);
+      if (regionNewText.length === 0 || regionNewText.endsWith("\n")) {
+        break;
+      }
+      current.endLineIdx++;
+    }
+    groups.push(current);
+  }
+  const allHunks = [];
+  let cumulativeDelta = 0;
+  for (const group of groups) {
+    const regionStart = group.startLineIdx;
+    const regionEnd = group.endLineIdx;
+    const regionNewText = computeRegionNewText(group);
+    const regionOldLines = oldLines.slice(regionStart, regionEnd + 1);
+    const regionNewLines = splitDiffLines(regionNewText).lines;
+    const ctxBeforeStart = Math.max(0, regionStart - DIFF_CONTEXT_LINES);
+    const ctxAfterEnd = Math.min(oldLines.length - 1, regionEnd + DIFF_CONTEXT_LINES);
+    const newRegionStart = regionStart + cumulativeDelta;
+    const ops = [];
+    for (let i = ctxBeforeStart; i < regionStart; i++) {
+      ops.push({
+        kind: " ",
+        line: oldLines[i],
+        oldIdx: i,
+        newIdx: i + cumulativeDelta
+      });
+    }
+    ops.push(
+      ...computeLineDiffOps(regionOldLines, regionNewLines, regionStart, newRegionStart)
+    );
+    const afterNewDelta = cumulativeDelta + (regionNewLines.length - regionOldLines.length);
+    for (let i = regionEnd + 1; i <= ctxAfterEnd; i++) {
+      ops.push({
+        kind: " ",
+        line: oldLines[i],
+        oldIdx: i,
+        newIdx: i + afterNewDelta
+      });
+    }
+    allHunks.push(...formatUnifiedHunksFromOps(ops, DIFF_CONTEXT_LINES));
+    cumulativeDelta = afterNewDelta;
+  }
+  if (allHunks.length === 0) {
+    const lastOld = oldLines.length;
+    const lastNew = lastOld + cumulativeDelta;
+    const note = oldTrailingNl ? "trailing newline removed" : "trailing newline added";
+    allHunks.push(`@@ -${lastOld},0 +${lastNew},0 @@
+\\ ${note}`);
+  }
+  return `--- a/${relPath}
++++ b/${relPath}
+${allHunks.join("\n")}`;
+}
+function buildCompactDiffForCreate(relPath, originalBuffer, createBodyNormalized, existed) {
+  const { lines: newLines, hasTrailingNewline: newTrailingNl } = splitDiffLines(createBodyNormalized);
+  if (!existed || !originalBuffer) {
+    if (newLines.length === 0) {
+      return `--- /dev/null
++++ b/${relPath}
+@@ -0,0 +0,0 @@
+ (empty file)`;
+    }
+    const shown = newLines.slice(0, CREATED_DIFF_MAX_LINES);
+    const omitted = newLines.length - shown.length;
+    const body = shown.map((l) => `+${l}`).join("\n");
+    const suffix = omitted > 0 ? `
+... (+${omitted} more created line(s))` : "";
+    return `--- /dev/null
++++ b/${relPath}
+@@ -0,0 +1,${newLines.length} @@
+${body}${suffix}`;
+  }
+  const rawOld = (hasUtf8Bom(originalBuffer) ? originalBuffer.subarray(3) : originalBuffer).toString("utf8");
+  const { lines: oldLines, hasTrailingNewline: oldTrailingNl } = splitDiffLines(
+    rawOld.replace(/\r\n/g, "\n")
+  );
+  const ops = computeLineDiffOps(oldLines, newLines, 0, 0);
+  const hunks = formatUnifiedHunksFromOps(ops, DIFF_CONTEXT_LINES);
+  if (hunks.length === 0) {
+    if (oldTrailingNl === newTrailingNl) return "";
+    const note = oldTrailingNl ? "trailing newline removed" : "trailing newline added";
+    hunks.push(`@@ -${oldLines.length},0 +${newLines.length},0 @@
+\\ ${note}`);
+  }
+  return `--- a/${relPath}
++++ b/${relPath}
+${hunks.join("\n")}`;
+}
+function packCompactDiffsWithinBudget(diffBlocks, maxBytes) {
+  if (diffBlocks.length === 0 || maxBytes < 140) return "";
+  const joined = diffBlocks.join("\n");
+  if (Buffer.byteLength(joined, "utf8") <= maxBytes) {
+    return joined;
+  }
+  const footer = "\n... [diff truncated to fit 8800B budget; line stats above remain complete]";
+  const contentBudget = maxBytes - Buffer.byteLength(footer, "utf8");
+  if (contentBudget < 80) return "";
+  const kept = [];
+  let usedBytes = 0;
+  let truncated = false;
+  for (const block of diffBlocks) {
+    const sepBeforeBlock = kept.length > 0 ? 1 : 0;
+    const blockBytes = sepBeforeBlock + Buffer.byteLength(block, "utf8");
+    if (usedBytes + blockBytes <= contentBudget) {
+      kept.push(...block.split("\n"));
+      usedBytes += blockBytes;
+      continue;
+    }
+    const blockLines = block.split("\n");
+    const candidateLines = [];
+    let candidateBytes = usedBytes;
+    let lastBodyEnd = 0;
+    for (let lineIdx = 0; lineIdx < blockLines.length; lineIdx++) {
+      const line = blockLines[lineIdx];
+      const sep = kept.length > 0 || candidateLines.length > 0 ? 1 : 0;
+      const lineBytes = sep + Buffer.byteLength(line, "utf8");
+      if (candidateBytes + lineBytes > contentBudget) {
+        break;
+      }
+      candidateLines.push(line);
+      candidateBytes += lineBytes;
+      if (lineIdx >= 2 && !line.startsWith("@@ ")) {
+        lastBodyEnd = candidateLines.length;
+      }
+    }
+    truncated = true;
+    if (lastBodyEnd > 0) {
+      const validSlice = candidateLines.slice(0, lastBodyEnd);
+      const validText = validSlice.join("\n");
+      usedBytes += (kept.length > 0 ? 1 : 0) + Buffer.byteLength(validText, "utf8");
+      kept.push(...validSlice);
+      break;
+    }
+  }
+  if (kept.length === 0) {
+    return truncated ? "... [diff omitted to fit 8800B budget; line stats above remain complete]" : "";
+  }
+  return truncated ? `${kept.join("\n")}${footer}` : kept.join("\n");
+}
 async function runApplyEdits(input) {
   const parsedEdits = parseMaybeJsonArray(input?.edits);
   if (!parsedEdits.ok) {
@@ -3059,6 +3522,16 @@ async function runApplyEdits(input) {
       };
     }
   }
+  if (input.diff !== void 0 && typeof input.diff !== "boolean") {
+    return {
+      text: withValidationExample(
+        "Validation failed (0 files modified):\n- 'diff' must be a boolean.",
+        TOOL_VALIDATION_EXAMPLES.apply_edits
+      ),
+      isError: true
+    };
+  }
+  const includeDiff = input.diff === true;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   if (!input.dryRun && validatedVerify?.cwd) {
     const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
@@ -3240,6 +3713,12 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
       const newContent2 = originalHadBom && !item.create.startsWith("\uFEFF") ? `\uFEFF${item.create}` : item.create;
       const createBody = item.create.startsWith("\uFEFF") ? item.create.slice(1) : item.create;
       const newLines = countLines(createBody);
+      const diffText2 = includeDiff ? buildCompactDiffForCreate(
+        item.relPath,
+        originalBuffer,
+        createBody.replace(/\r\n/g, "\n"),
+        exists
+      ) : void 0;
       plans.push({
         absPath: item.absPath,
         writeTargetPath: item.writeTargetPath,
@@ -3252,7 +3731,8 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
         hunkCount: 1,
         lineDelta: newLines - oldLines,
         created: !exists,
-        isNoOp: false
+        isNoOp: false,
+        diffText: diffText2
       });
       continue;
     }
@@ -3291,6 +3771,11 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
       isNoOp = Buffer.byteLength(newContent, "utf8") === fileData.rawBuffer.length && Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
     }
     const lineDelta = normalizedUnchanged ? 0 : countLines(planned.newNormalized) - countLines(normalizedOriginal);
+    const diffText = includeDiff && !isNoOp ? buildCompactDiffForHunkPlans(
+      item.relPath,
+      normalizedOriginal,
+      planned.spans
+    ) : void 0;
     plans.push({
       absPath: item.absPath,
       writeTargetPath: item.writeTargetPath,
@@ -3302,7 +3787,8 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
       hunkCount: planned.appliedMatches,
       lineDelta,
       created: false,
-      isNoOp
+      isNoOp,
+      diffText
     });
   }
   const bestEffort = Boolean(input.bestEffort);
@@ -3437,10 +3923,39 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
       Math.max(64, remainingAppliedBytes)
     );
     const combined = `${appliedSection}${verifySection}`;
+    let finalText = Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES);
+    if (includeDiff && status === "PASS" && appliedSection === appliedFull) {
+      const diffBlocks = plans.map((p) => p.diffText).filter((d) => Boolean(d));
+      if (diffBlocks.length > 0) {
+        const remaining = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(finalText, "utf8") - 2;
+        const packedDiff = packCompactDiffsWithinBudget(diffBlocks, remaining);
+        if (packedDiff) {
+          finalText = `${finalText}
+
+${packedDiff}`;
+        }
+      }
+    }
     return {
-      text: Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      text: finalText,
       isError: false
     };
+  }
+  if (includeDiff) {
+    const diffBlocks = plans.map((p) => p.diffText).filter((d) => Boolean(d));
+    const appliedBytes = Buffer.byteLength(appliedFull, "utf8");
+    if (diffBlocks.length > 0 && appliedBytes <= DEFAULT_INLINE_MAX_BYTES) {
+      const remaining = DEFAULT_INLINE_MAX_BYTES - appliedBytes - 2;
+      const packedDiff = packCompactDiffsWithinBudget(diffBlocks, remaining);
+      if (packedDiff) {
+        return {
+          text: `${appliedFull}
+
+${packedDiff}`,
+          isError: false
+        };
+      }
+    }
   }
   return {
     text: truncateWithByteNotice(appliedFull, DEFAULT_INLINE_MAX_BYTES),
@@ -6225,6 +6740,7 @@ function extractPythonSymbols(lines) {
     const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
     raw.push({ indent, kind, name: m[3], defIdx: i });
   }
+  const indentStack = [];
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx];
     let startIdx = item.defIdx;
@@ -6253,12 +6769,19 @@ function extractPythonSymbols(lines) {
       }
       endIdx--;
     }
+    const startLine = startIdx + 1;
+    const endLine = endIdx + 1;
+    while (indentStack.length > 0 && (indentStack[indentStack.length - 1].endLine < startLine || indentStack[indentStack.length - 1].indent >= item.indent)) {
+      indentStack.pop();
+    }
+    const depth = indentStack.length;
+    indentStack.push({ indent: item.indent, endLine });
     symbols.push({
       kind: item.kind,
       name: item.name,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: item.indent > 0 ? 1 : 0
+      startLine,
+      endLine,
+      depth
     });
   }
   return symbols;
@@ -8039,6 +8562,159 @@ async function runReadSlices(input) {
       }
     }
   }
+  const symbolRequests = [];
+  const parseSymbolShorthand = (raw, label) => {
+    const trimmed = raw.trim();
+    const sepIdx = trimmed.indexOf("::");
+    const hashIdx = sepIdx === -1 ? trimmed.lastIndexOf("#") : -1;
+    const splitAt = sepIdx !== -1 ? sepIdx : hashIdx;
+    const sepLen = sepIdx !== -1 ? 2 : 1;
+    if (splitAt <= 0) {
+      if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must use 'path::sym1,sym2' or 'path#sym' format (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+      return null;
+    }
+    const filePath = trimmed.slice(0, splitAt).trim();
+    const names = trimmed.slice(splitAt + sepLen).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!filePath || names.length === 0) {
+      if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must provide both file path and symbol name(s) (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+      return null;
+    }
+    return { path: filePath, names };
+  };
+  if (input?.symbols !== void 0) {
+    const parsedSymbols = parseMaybeStringOrJsonArray(input.symbols);
+    if (!parsedSymbols.ok) {
+      if (parsedSymbols.kind === "corrupted_literal" || input.symbols === null || typeof input.symbols === "boolean") {
+        corruptedItems.push({
+          label: "symbols",
+          value: parsedSymbols.kind === "corrupted_literal" ? parsedSymbols.value : input.symbols,
+          expected: "an array of 'path::sym1,sym2' strings or { path, names } objects"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'symbols' must be an array of 'path::sym1,sym2' strings or { path, names } objects (${parsedSymbols.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+    } else {
+      const normalizedSymReqs = [];
+      for (let i = 0; i < parsedSymbols.value.length; i++) {
+        const item = parsedSymbols.value[i];
+        if (item === null || typeof item === "boolean") {
+          corruptedItems.push({
+            label: `symbols[${i}]`,
+            value: item,
+            expected: "a 'path::sym1,sym2' string or { path, names } object"
+          });
+          continue;
+        }
+        if (typeof item === "string") {
+          if (!item.trim()) {
+            if (sliceFormatError === null) {
+              sliceFormatError = withValidationExample(
+                `Error: symbols[${i}] must be a non-empty 'path::sym1,sym2' or 'path#sym' string.`,
+                TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+              );
+            }
+            continue;
+          }
+          const parsed = parseSymbolShorthand(item, `symbols[${i}]`);
+          if (parsed) normalizedSymReqs.push(parsed);
+          continue;
+        }
+        if (!isPlainObject(item)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}] must be a 'path::sym1,sym2' string or { path, names } object.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          continue;
+        }
+        let itemValid = true;
+        if (item.path === null || typeof item.path === "boolean") {
+          corruptedItems.push({
+            label: `symbols[${i}].path`,
+            value: item.path,
+            expected: "a non-empty file path string"
+          });
+          itemValid = false;
+        } else if (typeof item.path !== "string" || !item.path.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}].path must be a non-empty file path string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          itemValid = false;
+        }
+        const parsedNames = parseMaybeStringOrJsonArray(item.names);
+        const validNames = [];
+        if (!parsedNames.ok) {
+          if (parsedNames.kind === "corrupted_literal" || item.names === null || typeof item.names === "boolean") {
+            corruptedItems.push({
+              label: `symbols[${i}].names`,
+              value: parsedNames.kind === "corrupted_literal" ? parsedNames.value : item.names,
+              expected: "a non-empty array of symbol name strings"
+            });
+          } else if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}].names must be a non-empty array of symbol name strings (${parsedNames.detail}).`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          itemValid = false;
+        } else {
+          for (let j = 0; j < parsedNames.value.length; j++) {
+            const nameItem = parsedNames.value[j];
+            if (nameItem === null || typeof nameItem === "boolean") {
+              corruptedItems.push({
+                label: `symbols[${i}].names[${j}]`,
+                value: nameItem,
+                expected: "a non-empty symbol name string"
+              });
+              itemValid = false;
+            } else if (typeof nameItem !== "string" || !nameItem.trim()) {
+              if (sliceFormatError === null) {
+                sliceFormatError = withValidationExample(
+                  `Error: symbols[${i}].names[${j}] must be a non-empty symbol name string.`,
+                  TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+                );
+              }
+              itemValid = false;
+            } else {
+              validNames.push(nameItem.trim());
+            }
+          }
+          if (itemValid && validNames.length === 0) {
+            if (sliceFormatError === null) {
+              sliceFormatError = withValidationExample(
+                `Error: symbols[${i}].names must contain at least one symbol name.`,
+                TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+              );
+            }
+            itemValid = false;
+          }
+        }
+        if (itemValid && typeof item.path === "string") {
+          normalizedSymReqs.push({ path: item.path.trim(), names: validNames });
+        }
+      }
+      if (corruptedItems.length === 0) {
+        symbolRequests.push(...normalizedSymReqs);
+      }
+    }
+  }
   if (corruptedItems.length > 0) {
     return {
       text: formatCorruptedArrayError({
@@ -8053,18 +8729,18 @@ async function runReadSlices(input) {
   if (sliceFormatError !== null) {
     return { text: sliceFormatError, isError: true };
   }
-  if (outlines.length === 0 && slices.length === 0) {
+  if (outlines.length === 0 && slices.length === 0 && symbolRequests.length === 0) {
     return {
       text: withValidationExample(
-        "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+        "Error: provide at least one entry in 'outlines', 'slices', 'lineRanges', or 'symbols'.",
         TOOL_VALIDATION_EXAMPLES.read_slices
       ),
       isError: true
     };
   }
-  if (outlines.length > MAX_OUTLINES || slices.length > MAX_SLICE_FILES) {
+  if (outlines.length > MAX_OUTLINES || slices.length + symbolRequests.length > MAX_SLICE_FILES) {
     return {
-      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice files per call).`,
+      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice/symbol files per call).`,
       isError: true
     };
   }
@@ -8189,6 +8865,147 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
     );
     sectionEntries.push(...sliceResults);
   }
+  const normalizeContainerName = (kind, rawName) => {
+    let name = rawName.trim();
+    if (kind === "impl") {
+      if (name.startsWith("<")) {
+        let angle = 0;
+        for (let k = 0; k < name.length; k++) {
+          if (name[k] === "<") angle++;
+          else if (name[k] === ">") {
+            angle--;
+            if (angle === 0) {
+              name = name.slice(k + 1).trim();
+              break;
+            }
+          }
+        }
+      }
+      const forMatch = /\s+for\s+([\s\S]+)$/.exec(name);
+      if (forMatch?.[1]) {
+        name = forMatch[1].trim();
+      }
+    }
+    const ltIdx = name.indexOf("<");
+    if (ltIdx > 0) {
+      name = name.slice(0, ltIdx).trim();
+    }
+    return name;
+  };
+  const normalizeQualifiedSep = (name) => name.replace(/::/g, ".");
+  const CONTAINER_SYMBOL_KINDS = /* @__PURE__ */ new Set([
+    "class",
+    "interface",
+    "struct",
+    "impl",
+    "trait",
+    "mod",
+    "namespace",
+    "module"
+  ]);
+  if (symbolRequests.length > 0) {
+    const symbolResults = await Promise.all(
+      symbolRequests.map(async (req) => {
+        const absPath = resolvePath(req.path, baseCwd);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
+        try {
+          const { lines } = await loadLines(absPath);
+          const totalLines = lines.length;
+          const allSymbols = extractSymbolsFromLines(absPath, lines);
+          const qualified = [];
+          const containerStack = [];
+          for (const sym of allSymbols) {
+            while (containerStack.length > 0 && (containerStack[containerStack.length - 1].endLine < sym.startLine || containerStack[containerStack.length - 1].depth >= sym.depth)) {
+              containerStack.pop();
+            }
+            const immediateParent = containerStack.length > 0 ? containerStack[containerStack.length - 1].name : "";
+            const fullChain = containerStack.map((c) => c.name).join(".");
+            const alreadyPrefixed = immediateParent.length > 0 && (sym.name.startsWith(`${immediateParent}.`) || sym.name.startsWith(`${immediateParent}::`));
+            const qualifiedName = alreadyPrefixed ? sym.name : fullChain ? `${fullChain}.${sym.name}` : sym.name;
+            const immediateName = alreadyPrefixed ? sym.name : immediateParent ? `${immediateParent}.${sym.name}` : sym.name;
+            qualified.push({
+              sym,
+              qualifiedName,
+              immediateName,
+              qualifiedNorm: normalizeQualifiedSep(qualifiedName),
+              immediateNorm: normalizeQualifiedSep(immediateName),
+              rawNorm: normalizeQualifiedSep(sym.name)
+            });
+            if (CONTAINER_SYMBOL_KINDS.has(sym.kind)) {
+              const containerName = normalizeContainerName(sym.kind, sym.name);
+              if (containerName) {
+                containerStack.push({
+                  name: containerName,
+                  endLine: sym.endLine,
+                  depth: sym.depth
+                });
+              }
+            }
+          }
+          const blocks = [];
+          for (const rawQuery of req.names) {
+            const q = rawQuery.trim();
+            const qNorm = normalizeQualifiedSep(q);
+            const qLower = q.toLowerCase();
+            const qNormLower = qNorm.toLowerCase();
+            let hits = qualified.filter(
+              (item) => item.qualifiedName === q || item.immediateName === q || item.sym.name === q || item.qualifiedNorm === qNorm || item.immediateNorm === qNorm || item.rawNorm === qNorm
+            );
+            if (hits.length === 0) {
+              hits = qualified.filter(
+                (item) => item.qualifiedName.toLowerCase() === qLower || item.immediateName.toLowerCase() === qLower || item.sym.name.toLowerCase() === qLower || item.qualifiedNorm.toLowerCase() === qNormLower || item.immediateNorm.toLowerCase() === qNormLower || item.rawNorm.toLowerCase() === qNormLower
+              );
+            }
+            if (hits.length === 0) {
+              hits = qualified.filter(
+                (item) => item.sym.detail && item.sym.detail.toLowerCase().includes(qLower)
+              );
+            }
+            if (hits.length === 0) {
+              const sample = qualified.slice(0, 12).map((x) => `${x.qualifiedName}(L${x.sym.startLine})`).join(", ");
+              blocks.push(
+                `--- Symbol '${q}' NOT FOUND ---
+Available symbols: ${sample || "(none)"}`
+              );
+              continue;
+            }
+            const shownHits = hits.slice(0, 3);
+            for (const hit of shownHits) {
+              const start = Math.max(1, hit.sym.startLine);
+              const end = Math.min(totalLines, hit.sym.endLine);
+              const width = String(end).length;
+              const detailTag = hit.sym.detail ? ` ${hit.sym.detail}` : "";
+              const snippet = [
+                `--- [${hit.sym.kind}] ${hit.qualifiedName}${detailTag} L${start}-L${end} (of ${totalLines}) ---`
+              ];
+              for (let ln = start; ln <= end; ln++) {
+                const num = String(ln).padStart(width, " ");
+                snippet.push(`${num}: ${lines[ln - 1] ?? ""}`);
+              }
+              blocks.push(snippet.join("\n"));
+            }
+            if (hits.length > shownHits.length) {
+              blocks.push(
+                `... (+${hits.length - shownHits.length} more matches for '${q}')`
+              );
+            }
+          }
+          return {
+            kind: "static",
+            fullText: `## Symbols: ${relPath} (${totalLines} lines)
+${blocks.join("\n")}`
+          };
+        } catch (err) {
+          return {
+            kind: "static",
+            fullText: `## Symbols: ${relPath}
+ERROR: ${err instanceof Error ? err.message : String(err)}`
+          };
+        }
+      })
+    );
+    sectionEntries.push(...symbolResults);
+  }
   const separator = "\n\n";
   const sepChars = separator.length * Math.max(0, sectionEntries.length - 1);
   const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, sectionEntries.length - 1);
@@ -8205,7 +9022,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
       isError: false
     };
   }
-  const activeTip = slices.length > 0 ? SLICE_TRUNCATION_TIP : outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
+  const activeTip = slices.length > 0 || symbolRequests.length > 0 ? SLICE_TRUNCATION_TIP : outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
   const applyTip = activeTip !== null && maxChars > activeTip.length + 200;
   const tipChars = applyTip ? activeTip.length : 0;
   const tipBytes = applyTip ? Buffer.byteLength(activeTip, "utf8") : 0;
@@ -8902,7 +9719,7 @@ function formatCliUsage() {
     "",
     "Commands (aliases):",
     "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
-    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  slice   | read_slices   <path:start-end | path::sym1,sym2...> [--outline <file>] [--symbol <path::sym>] [--cwd <dir>]",
     "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
     "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
@@ -8910,7 +9727,7 @@ function formatCliUsage() {
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
@@ -9075,6 +9892,7 @@ var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--context",
   "--max-results",
   "--outline",
+  "--symbol",
   "--concurrency",
   "--timeout",
   "--verify",
@@ -9089,7 +9907,8 @@ function parseToolFlags(tool, rawArgs) {
     searchQueries: [],
     implicitTypeQueryIndices: /* @__PURE__ */ new Set(),
     trailingSearchMods: {},
-    outlineFiles: []
+    outlineFiles: [],
+    symbolSpecs: []
   };
   let pendingMods = {};
   let pendingType;
@@ -9246,6 +10065,10 @@ function parseToolFlags(tool, rawArgs) {
         opts.outlineFiles.push(consumeValue());
         continue;
       }
+      if (arg === "--symbol" || arg === "-s") {
+        opts.symbolSpecs.push(consumeValue());
+        continue;
+      }
     } else if (tool === "run_checks") {
       if (arg === "--compact") {
         opts.outputMode = "compact";
@@ -9278,6 +10101,10 @@ function parseToolFlags(tool, rawArgs) {
       }
       if (arg === "--dry-run") {
         opts.dryRun = true;
+        continue;
+      }
+      if (arg === "--diff") {
+        opts.diff = true;
         continue;
       }
       if (arg === "--verify") {
@@ -9340,7 +10167,7 @@ async function runAgyFastCli(argv, io = {}) {
 `);
     return 0;
   }
-  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0 || opts.symbolSpecs.length > 0;
   let jsonInput = null;
   try {
     if (opts.jsonRaw !== void 0) {
@@ -9419,16 +10246,26 @@ async function runAgyFastCli(argv, io = {}) {
         ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
       };
     } else {
-      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+      const autoSymbols = [...opts.symbolSpecs];
+      const lineRanges = [];
+      for (const pos of opts.positionals) {
+        if (pos.includes("::") || pos.includes("#") && !/:\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pos)) {
+          autoSymbols.push(pos);
+        } else {
+          lineRanges.push(pos);
+        }
+      }
+      if (lineRanges.length === 0 && opts.outlineFiles.length === 0 && autoSymbols.length === 0) {
         stderr.write(
-          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n"
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), symbol specs (e.g. src/a.ts::fn), --outline <file>, --symbol <path::sym>, or JSON input.\n"
         );
         return 1;
       }
       payload = {
         cwd: effectiveCwd,
         ...opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {},
-        ...opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {},
+        ...autoSymbols.length > 0 ? { symbols: autoSymbols } : {},
+        ...lineRanges.length > 0 ? { lineRanges } : {},
         ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
       };
     }
@@ -9447,6 +10284,7 @@ async function runAgyFastCli(argv, io = {}) {
       cwd: effectiveCwd,
       ...opts.bestEffort !== void 0 ? { bestEffort: opts.bestEffort } : {},
       ...opts.dryRun !== void 0 ? { dryRun: opts.dryRun } : {},
+      ...opts.diff !== void 0 ? { diff: opts.diff } : {},
       ...opts.verify !== void 0 ? { verify: opts.verify } : {},
       ...opts.verifyTimeoutSec !== void 0 ? { verifyTimeoutSec: opts.verifyTimeoutSec } : {},
       ...effectiveMaxVerifyChars !== void 0 ? { maxVerifyChars: effectiveMaxVerifyChars } : {}
@@ -9493,9 +10331,9 @@ function shouldCliExitNonZero(tool, result) {
 }
 
 // src/mcp-server-core.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import os4 from "node:os";
-import path7 from "node:path";
+import path8 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/protocol/mcp.ts
@@ -10424,10 +11262,107 @@ function readSavedEditsFormatSync(env = process.env) {
   }
 }
 
+// src/utils/session-workspace.ts
+import fs6 from "node:fs";
+import path7 from "node:path";
+
+// src/utils/snapshot.ts
+var SNAPSHOT_COLLAPSE_DIRS = /* @__PURE__ */ new Set([
+  "tmp",
+  "temp",
+  "output",
+  "outputs",
+  "artifacts",
+  "ssl",
+  "SSL",
+  "playwright-report",
+  "test-results",
+  "coverage",
+  "logs"
+]);
+var DEFAULT_IGNORE_DIRS_LOWER = new Set(
+  [...DEFAULT_IGNORE_DIRS].map((d) => d.toLowerCase())
+);
+var SNAPSHOT_COLLAPSE_DIRS_LOWER = new Set(
+  [...SNAPSHOT_COLLAPSE_DIRS].map((d) => d.toLowerCase())
+);
+var TIMEOUT_SENTINEL = Symbol("snapshot-timeout");
+var MANIFEST_SKIP_SUBDIRS_LOWER = new Set(
+  [
+    "docs",
+    "doc",
+    "assets",
+    "scripts",
+    "test",
+    "tests",
+    "fixtures",
+    "examples",
+    ...SNAPSHOT_COLLAPSE_DIRS
+  ].map((d) => d.toLowerCase())
+);
+
+// src/utils/session-workspace.ts
+function isFullAbsolutePath(dirPath) {
+  return process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(dirPath) : path7.isAbsolute(dirPath);
+}
+function canonicalizeDirSync(dirPath) {
+  const resolved = path7.resolve(dirPath);
+  try {
+    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+function isSameOrSubdir(candidate, root) {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
+  const normRoot = caseInsensitive ? root.toLowerCase() : root;
+  const rel = path7.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
+}
+function isInstalledPluginPath(dirPath) {
+  const posix = dirPath.replace(/\\/g, "/");
+  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
+    posix
+  );
+}
+function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.env, options = {}) {
+  const allowLinkedDevCheckout = options.allowLinkedDevCheckout === true;
+  const resolvedCandidate = path7.resolve(candidateDir);
+  const canonCandidate = canonicalizeDirSync(resolvedCandidate);
+  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
+    if (typeof envRoot === "string" && envRoot.trim()) {
+      const trimmedEnvRoot = envRoot.trim();
+      const resolvedEnvRoot = path7.resolve(trimmedEnvRoot);
+      const canonEnvRoot = canonicalizeDirSync(resolvedEnvRoot);
+      if (isSameOrSubdir(canonCandidate, canonEnvRoot)) {
+        if (!allowLinkedDevCheckout) {
+          return trimmedEnvRoot;
+        }
+        const isDevCheckout = fs6.existsSync(
+          path7.join(canonEnvRoot, "src", "mcp-server.ts")
+        );
+        if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
+          return trimmedEnvRoot;
+        }
+      }
+    }
+  }
+  const resolvedScriptRoot = path7.resolve(scriptPluginRoot);
+  const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
+  if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
+    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
+      return scriptPluginRoot;
+    }
+  }
+  return null;
+}
+
 // src/mcp-server-core.ts
 var SERVER_VERSION = "0.3.2";
-var DEFAULT_PLUGIN_ROOT = path7.resolve(
-  path7.dirname(fileURLToPath2(import.meta.url)),
+var DEFAULT_PLUGIN_ROOT = path8.resolve(
+  path8.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
 var ALL_MCP_TOOLS = [
@@ -10621,71 +11556,33 @@ function printMcpServerHelp() {
     ].join("\n")
   );
 }
-function canonicalizeDir(dirPath) {
-  const resolved = path7.resolve(dirPath);
-  try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-function isSameOrSubdir(candidate, root) {
-  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
-  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
-  const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path7.relative(normRoot, normCandidate);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
-}
-function isInstalledPluginPath(dirPath) {
-  const posix = dirPath.replace(/\\/g, "/");
-  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
-    posix
-  );
-}
 function isSameDir(a, b) {
   const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 function detectNonWorkspaceCwd(env, currentCwd) {
-  const canonCwd = canonicalizeDir(currentCwd);
-  if (path7.parse(canonCwd).root === canonCwd) {
+  const canonCwd = canonicalizeDirSync(currentCwd);
+  if (path8.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
   const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
-  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
+  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsolutePath(h));
   if (homes.length === 0 && env === process.env) {
     try {
       const osHome = os4.homedir();
-      if (isFullAbsPath(osHome)) homes.push(osHome);
+      if (isFullAbsolutePath(osHome)) homes.push(osHome);
     } catch {
     }
   }
   for (const home of homes) {
-    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+    if (home && isSameDir(canonCwd, canonicalizeDirSync(home))) {
       return { dir: canonCwd, place: "the home directory" };
     }
   }
   return null;
 }
 function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
-  const canonCwd = canonicalizeDir(currentCwd);
-  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
-    if (typeof envRoot === "string" && envRoot.trim()) {
-      const canonEnvRoot = canonicalizeDir(envRoot.trim());
-      if (isSameOrSubdir(canonCwd, canonEnvRoot)) {
-        return envRoot.trim();
-      }
-    }
-  }
-  const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
-  if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
-    if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
-      return scriptPluginRoot;
-    }
-  }
-  return null;
+  return detectPluginInstallDir(currentCwd, scriptPluginRoot, env);
 }
 function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
@@ -10720,7 +11617,7 @@ function buildApplyEditsToolDefinition(compat) {
       required: ["path"]
     }
   };
-  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files per file, gives closest lines, skips verify on failure. dryRun validates only. verify cmd in cwd after writes (60s/4000 chars, ${MCP_CALL_BUDGET_SEC}s max). diff adds +-2-line diff. 8800B UTF-8 max. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
   return {
     name: "apply_edits",
     description: preferStringEdits ? baseDesc : `${baseDesc} Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
@@ -10731,6 +11628,7 @@ function buildApplyEditsToolDefinition(compat) {
         edits: editsSchema,
         dryRun: { type: "boolean" },
         bestEffort: { type: "boolean" },
+        diff: { type: "boolean" },
         verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",
@@ -10800,11 +11698,11 @@ function createAgyFastServer(options = {}) {
         value: { ...args, cwd: void 0 }
       };
     }
-    if (!path7.isAbsolute(rawCwd) && !isHomePath) {
+    if (!path8.isAbsolute(rawCwd) && !isHomePath) {
       if (defaultCwd) {
         return {
           ok: true,
-          value: { ...args, cwd: path7.resolve(defaultCwd, rawCwd) }
+          value: { ...args, cwd: path8.resolve(defaultCwd, rawCwd) }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -10846,12 +11744,12 @@ function createAgyFastServer(options = {}) {
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
       const trimmed = rawCwd.trim();
       const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path7.isAbsolute(trimmed) && !isHome;
+      return !path8.isAbsolute(trimmed) && !isHome;
     },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs6.statSync(candidate).isDirectory()) {
+          if (fs7.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
@@ -10923,7 +11821,7 @@ function createAgyFastServer(options = {}) {
     server.registerTool(
       applySchemaCompat({
         name: "read_slices",
-        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40), symbol bodies, + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). symbols: 'path::sym1,Cls.m'; lineRanges: 'path:start-end,s2-e2'; slices: 1-based [start,end]. maxChars 8500; 8800B cap.",
         inputSchema: {
           type: "object",
           properties: {
@@ -10931,6 +11829,11 @@ function createAgyFastServer(options = {}) {
             outlines: {
               type: "array",
               maxItems: 40,
+              items: { type: "string" }
+            },
+            symbols: {
+              type: "array",
+              maxItems: 30,
               items: { type: "string" }
             },
             slices: {

@@ -56,6 +56,7 @@ export interface ApplyEditsInput {
   edits: string | FileEdit[];
   dryRun?: boolean;
   bestEffort?: boolean;
+  diff?: boolean;
   verify?: string | VerifySpec;
   verifyTimeoutSec?: number;
   maxVerifyChars?: number;
@@ -81,6 +82,7 @@ interface PlannedWrite {
   lineDelta: number;
   created: boolean;
   isNoOp: boolean;
+  diffText?: string;
 }
 
 function computeLineStarts(text: string): number[] {
@@ -1090,6 +1092,452 @@ function formatBestEffortPartialResult(params: {
     : truncateWithByteNotice(assembled, maxBytes);
 }
 
+const DIFF_CONTEXT_LINES = 2;
+const CREATED_DIFF_MAX_LINES = 40;
+const DIFF_LCS_CELL_LIMIT = 40_000;
+
+interface DiffOp {
+  kind: " " | "-" | "+";
+  line: string;
+  oldIdx: number;
+  newIdx: number;
+}
+
+function splitDiffLines(text: string): { lines: string[]; hasTrailingNewline: boolean } {
+  if (text.length === 0) {
+    return { lines: [], hasTrailingNewline: false };
+  }
+  if (text.endsWith("\n")) {
+    return { lines: text.slice(0, -1).split("\n"), hasTrailingNewline: true };
+  }
+  return { lines: text.split("\n"), hasTrailingNewline: false };
+}
+
+function computeLineDiffOps(
+  oldLines: string[],
+  newLines: string[],
+  oldBase = 0,
+  newBase = 0,
+): DiffOp[] {
+  const ops: DiffOp[] = [];
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) {
+    ops.push({
+      kind: " ",
+      line: oldLines[prefix]!,
+      oldIdx: oldBase + prefix,
+      newIdx: newBase + prefix,
+    });
+    prefix++;
+  }
+
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  const aEnd = oldLines.length - suffix;
+  const bEnd = newLines.length - suffix;
+  const aLen = aEnd - prefix;
+  const bLen = bEnd - prefix;
+
+  if (aLen > 0 || bLen > 0) {
+    if (aLen === 0) {
+      for (let j = prefix; j < bEnd; j++) {
+        ops.push({ kind: "+", line: newLines[j]!, oldIdx: oldBase + prefix, newIdx: newBase + j });
+      }
+    } else if (bLen === 0) {
+      for (let i = prefix; i < aEnd; i++) {
+        ops.push({ kind: "-", line: oldLines[i]!, oldIdx: oldBase + i, newIdx: newBase + prefix });
+      }
+    } else if (aLen * bLen <= DIFF_LCS_CELL_LIMIT) {
+      const cols = bLen + 1;
+      const dp = new Int32Array((aLen + 1) * cols);
+      for (let i = aLen - 1; i >= 0; i--) {
+        const row = i * cols;
+        const nextRow = (i + 1) * cols;
+        for (let j = bLen - 1; j >= 0; j--) {
+          if (oldLines[prefix + i] === newLines[prefix + j]) {
+            dp[row + j] = dp[nextRow + j + 1]! + 1;
+          } else {
+            const down = dp[nextRow + j]!;
+            const right = dp[row + j + 1]!;
+            dp[row + j] = down >= right ? down : right;
+          }
+        }
+      }
+      let i = 0;
+      let j = 0;
+      while (i < aLen && j < bLen) {
+        if (oldLines[prefix + i] === newLines[prefix + j]) {
+          ops.push({
+            kind: " ",
+            line: oldLines[prefix + i]!,
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j,
+          });
+          i++;
+          j++;
+        } else if (dp[(i + 1) * cols + j]! >= dp[i * cols + j + 1]!) {
+          ops.push({
+            kind: "-",
+            line: oldLines[prefix + i]!,
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j,
+          });
+          i++;
+        } else {
+          ops.push({
+            kind: "+",
+            line: newLines[prefix + j]!,
+            oldIdx: oldBase + prefix + i,
+            newIdx: newBase + prefix + j,
+          });
+          j++;
+        }
+      }
+      while (i < aLen) {
+        ops.push({
+          kind: "-",
+          line: oldLines[prefix + i]!,
+          oldIdx: oldBase + prefix + i,
+          newIdx: newBase + prefix + j,
+        });
+        i++;
+      }
+      while (j < bLen) {
+        ops.push({
+          kind: "+",
+          line: newLines[prefix + j]!,
+          oldIdx: oldBase + prefix + i,
+          newIdx: newBase + prefix + j,
+        });
+        j++;
+      }
+    } else {
+      for (let i = prefix; i < aEnd; i++) {
+        ops.push({ kind: "-", line: oldLines[i]!, oldIdx: oldBase + i, newIdx: newBase + prefix });
+      }
+      for (let j = prefix; j < bEnd; j++) {
+        ops.push({ kind: "+", line: newLines[j]!, oldIdx: oldBase + aEnd, newIdx: newBase + j });
+      }
+    }
+  }
+
+  for (let s = 0; s < suffix; s++) {
+    const oldI = aEnd + s;
+    const newI = bEnd + s;
+    ops.push({
+      kind: " ",
+      line: oldLines[oldI]!,
+      oldIdx: oldBase + oldI,
+      newIdx: newBase + newI,
+    });
+  }
+  return ops;
+}
+
+function formatUnifiedHunksFromOps(
+  ops: DiffOp[],
+  contextLines = DIFF_CONTEXT_LINES,
+): string[] {
+  const changeIndices: number[] = [];
+  for (let i = 0; i < ops.length; i++) {
+    if (ops[i]!.kind !== " ") {
+      changeIndices.push(i);
+    }
+  }
+  if (changeIndices.length === 0) return [];
+
+  const clusters: Array<{ start: number; end: number }> = [];
+  let clusterStart = changeIndices[0]!;
+  let clusterEnd = changeIndices[0]!;
+  for (let i = 1; i < changeIndices.length; i++) {
+    const idx = changeIndices[i]!;
+    if (idx - clusterEnd <= contextLines * 2 + 1) {
+      clusterEnd = idx;
+    } else {
+      clusters.push({ start: clusterStart, end: clusterEnd });
+      clusterStart = idx;
+      clusterEnd = idx;
+    }
+  }
+  clusters.push({ start: clusterStart, end: clusterEnd });
+
+  return clusters.map(({ start, end }) => {
+    const winStart = Math.max(0, start - contextLines);
+    const winEnd = Math.min(ops.length - 1, end + contextLines);
+    const hunkOps = ops.slice(winStart, winEnd + 1);
+    let oldCount = 0;
+    let newCount = 0;
+    for (const op of hunkOps) {
+      if (op.kind !== "+") oldCount++;
+      if (op.kind !== "-") newCount++;
+    }
+    const firstOp = hunkOps[0]!;
+    const oldStart = oldCount === 0 ? firstOp.oldIdx : firstOp.oldIdx + 1;
+    const newStart = newCount === 0 ? firstOp.newIdx : firstOp.newIdx + 1;
+    const header = `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`;
+    const body = hunkOps.map((op) => `${op.kind}${op.line}`);
+    return `${header}\n${body.join("\n")}`;
+  });
+}
+
+function buildCompactDiffForHunkPlans(
+  relPath: string,
+  normalizedOriginal: string,
+  spans: MatchSpan[],
+): string {
+  if (spans.length === 0) return "";
+  const lineStarts = computeLineStarts(normalizedOriginal);
+  const { lines: oldLines, hasTrailingNewline: oldTrailingNl } =
+    splitDiffLines(normalizedOriginal);
+  const maxLineIdx = Math.max(0, oldLines.length - 1);
+
+  interface SpanLineGroup {
+    startLineIdx: number;
+    endLineIdx: number;
+    spans: MatchSpan[];
+  }
+
+  const rawGroups: SpanLineGroup[] = [];
+  for (const span of spans) {
+    const rawStartLine = offsetToLine(lineStarts, span.start) - 1;
+    const startLineIdx = Math.min(maxLineIdx, rawStartLine);
+    let endLineIdx =
+      span.end > span.start
+        ? Math.min(maxLineIdx, offsetToLine(lineStarts, span.end - 1) - 1)
+        : startLineIdx;
+    // If a replacement drops the trailing newline of a non-final line (including empty
+    // replacement after a non-empty prefix), the following line merges onto it — pull it in.
+    if (
+      endLineIdx < oldLines.length - 1 &&
+      span.end > span.start &&
+      normalizedOriginal[span.end - 1] === "\n" &&
+      (span.replacement.length > 0 || span.start > (lineStarts[startLineIdx] ?? 0)) &&
+      !span.replacement.endsWith("\n")
+    ) {
+      endLineIdx++;
+    }
+
+    const prev = rawGroups[rawGroups.length - 1];
+    if (prev && startLineIdx <= prev.endLineIdx + DIFF_CONTEXT_LINES * 2 + 1) {
+      prev.endLineIdx = Math.max(prev.endLineIdx, endLineIdx);
+      prev.spans.push(span);
+    } else {
+      rawGroups.push({ startLineIdx, endLineIdx, spans: [span] });
+    }
+  }
+
+  const computeRegionNewText = (group: SpanLineGroup): string => {
+    const byteStart = lineStarts[group.startLineIdx] ?? 0;
+    const byteEnd =
+      group.endLineIdx + 1 < lineStarts.length && group.endLineIdx + 1 < oldLines.length
+        ? lineStarts[group.endLineIdx + 1]!
+        : normalizedOriginal.length;
+    const pieces: string[] = [];
+    let cursor = byteStart;
+    for (const sp of group.spans) {
+      pieces.push(normalizedOriginal.slice(cursor, sp.start));
+      pieces.push(sp.replacement);
+      cursor = sp.end;
+    }
+    pieces.push(normalizedOriginal.slice(cursor, byteEnd));
+    return pieces.join("");
+  };
+
+  // Enforce region-boundary newline-drop closure for multi-span cascades:
+  // e.g. span 1 drops trailing '\n' (pulling L+1) while span 2 deletes L+1 completely,
+  // so L+2 also merges onto span 1 and must be pulled into the group (absorbing any
+  // overlapping context window).
+  const groups: SpanLineGroup[] = [];
+  let gi = 0;
+  while (gi < rawGroups.length) {
+    const current: SpanLineGroup = {
+      startLineIdx: rawGroups[gi]!.startLineIdx,
+      endLineIdx: rawGroups[gi]!.endLineIdx,
+      spans: [...rawGroups[gi]!.spans],
+    };
+    gi++;
+
+    while (true) {
+      while (
+        gi < rawGroups.length &&
+        rawGroups[gi]!.startLineIdx <= current.endLineIdx + DIFF_CONTEXT_LINES * 2 + 1
+      ) {
+        const nxt = rawGroups[gi]!;
+        current.endLineIdx = Math.max(current.endLineIdx, nxt.endLineIdx);
+        current.spans.push(...nxt.spans);
+        gi++;
+      }
+
+      if (current.endLineIdx >= oldLines.length - 1) {
+        break;
+      }
+      const regionNewText = computeRegionNewText(current);
+      if (regionNewText.length === 0 || regionNewText.endsWith("\n")) {
+        break;
+      }
+      current.endLineIdx++;
+    }
+    groups.push(current);
+  }
+
+  const allHunks: string[] = [];
+  let cumulativeDelta = 0;
+
+  for (const group of groups) {
+    const regionStart = group.startLineIdx;
+    const regionEnd = group.endLineIdx;
+    const regionNewText = computeRegionNewText(group);
+
+    const regionOldLines = oldLines.slice(regionStart, regionEnd + 1);
+    const regionNewLines = splitDiffLines(regionNewText).lines;
+
+    const ctxBeforeStart = Math.max(0, regionStart - DIFF_CONTEXT_LINES);
+    const ctxAfterEnd = Math.min(oldLines.length - 1, regionEnd + DIFF_CONTEXT_LINES);
+    const newRegionStart = regionStart + cumulativeDelta;
+
+    const ops: DiffOp[] = [];
+    for (let i = ctxBeforeStart; i < regionStart; i++) {
+      ops.push({
+        kind: " ",
+        line: oldLines[i]!,
+        oldIdx: i,
+        newIdx: i + cumulativeDelta,
+      });
+    }
+    ops.push(
+      ...computeLineDiffOps(regionOldLines, regionNewLines, regionStart, newRegionStart),
+    );
+    const afterNewDelta = cumulativeDelta + (regionNewLines.length - regionOldLines.length);
+    for (let i = regionEnd + 1; i <= ctxAfterEnd; i++) {
+      ops.push({
+        kind: " ",
+        line: oldLines[i]!,
+        oldIdx: i,
+        newIdx: i + afterNewDelta,
+      });
+    }
+
+    allHunks.push(...formatUnifiedHunksFromOps(ops, DIFF_CONTEXT_LINES));
+    cumulativeDelta = afterNewDelta;
+  }
+
+  if (allHunks.length === 0) {
+    const lastOld = oldLines.length;
+    const lastNew = lastOld + cumulativeDelta;
+    const note = oldTrailingNl ? "trailing newline removed" : "trailing newline added";
+    allHunks.push(`@@ -${lastOld},0 +${lastNew},0 @@\n\\ ${note}`);
+  }
+
+  return `--- a/${relPath}\n+++ b/${relPath}\n${allHunks.join("\n")}`;
+}
+
+function buildCompactDiffForCreate(
+  relPath: string,
+  originalBuffer: Buffer | null,
+  createBodyNormalized: string,
+  existed: boolean,
+): string {
+  const { lines: newLines, hasTrailingNewline: newTrailingNl } =
+    splitDiffLines(createBodyNormalized);
+  if (!existed || !originalBuffer) {
+    if (newLines.length === 0) {
+      return `--- /dev/null\n+++ b/${relPath}\n@@ -0,0 +0,0 @@\n (empty file)`;
+    }
+    const shown = newLines.slice(0, CREATED_DIFF_MAX_LINES);
+    const omitted = newLines.length - shown.length;
+    const body = shown.map((l) => `+${l}`).join("\n");
+    const suffix = omitted > 0 ? `\n... (+${omitted} more created line(s))` : "";
+    return `--- /dev/null\n+++ b/${relPath}\n@@ -0,0 +1,${newLines.length} @@\n${body}${suffix}`;
+  }
+
+  const rawOld = (
+    hasUtf8Bom(originalBuffer) ? originalBuffer.subarray(3) : originalBuffer
+  ).toString("utf8");
+  const { lines: oldLines, hasTrailingNewline: oldTrailingNl } = splitDiffLines(
+    rawOld.replace(/\r\n/g, "\n"),
+  );
+  const ops = computeLineDiffOps(oldLines, newLines, 0, 0);
+  const hunks = formatUnifiedHunksFromOps(ops, DIFF_CONTEXT_LINES);
+  if (hunks.length === 0) {
+    if (oldTrailingNl === newTrailingNl) return "";
+    const note = oldTrailingNl ? "trailing newline removed" : "trailing newline added";
+    hunks.push(`@@ -${oldLines.length},0 +${newLines.length},0 @@\n\\ ${note}`);
+  }
+  return `--- a/${relPath}\n+++ b/${relPath}\n${hunks.join("\n")}`;
+}
+
+function packCompactDiffsWithinBudget(diffBlocks: string[], maxBytes: number): string {
+  if (diffBlocks.length === 0 || maxBytes < 140) return "";
+  const joined = diffBlocks.join("\n");
+  if (Buffer.byteLength(joined, "utf8") <= maxBytes) {
+    return joined;
+  }
+
+  const footer =
+    "\n... [diff truncated to fit 8800B budget; line stats above remain complete]";
+  const contentBudget = maxBytes - Buffer.byteLength(footer, "utf8");
+  if (contentBudget < 80) return "";
+
+  const kept: string[] = [];
+  let usedBytes = 0;
+  let truncated = false;
+
+  for (const block of diffBlocks) {
+    const sepBeforeBlock = kept.length > 0 ? 1 : 0;
+    const blockBytes = sepBeforeBlock + Buffer.byteLength(block, "utf8");
+    if (usedBytes + blockBytes <= contentBudget) {
+      kept.push(...block.split("\n"));
+      usedBytes += blockBytes;
+      continue;
+    }
+
+    // Try partial prefix of this block only if at least one hunk body line fits.
+    // Identify file headers positionally (indices 0..1) so deleted `--...` or added
+    // `++...` source lines are never misclassified as `---`/`+++` file headers.
+    const blockLines = block.split("\n");
+    const candidateLines: string[] = [];
+    let candidateBytes = usedBytes;
+    let lastBodyEnd = 0;
+
+    for (let lineIdx = 0; lineIdx < blockLines.length; lineIdx++) {
+      const line = blockLines[lineIdx]!;
+      const sep = kept.length > 0 || candidateLines.length > 0 ? 1 : 0;
+      const lineBytes = sep + Buffer.byteLength(line, "utf8");
+      if (candidateBytes + lineBytes > contentBudget) {
+        break;
+      }
+      candidateLines.push(line);
+      candidateBytes += lineBytes;
+      if (lineIdx >= 2 && !line.startsWith("@@ ")) {
+        lastBodyEnd = candidateLines.length;
+      }
+    }
+
+    truncated = true;
+    if (lastBodyEnd > 0) {
+      const validSlice = candidateLines.slice(0, lastBodyEnd);
+      const validText = validSlice.join("\n");
+      usedBytes += (kept.length > 0 ? 1 : 0) + Buffer.byteLength(validText, "utf8");
+      kept.push(...validSlice);
+      break;
+    }
+  }
+
+  if (kept.length === 0) {
+    return truncated
+      ? "... [diff omitted to fit 8800B budget; line stats above remain complete]"
+      : "";
+  }
+  return truncated ? `${kept.join("\n")}${footer}` : kept.join("\n");
+}
+
 export async function runApplyEdits(
   input: ApplyEditsInput,
 ): Promise<{ text: string; isError: boolean }> {
@@ -1250,6 +1698,17 @@ export async function runApplyEdits(
       };
     }
   }
+
+  if (input.diff !== undefined && typeof input.diff !== "boolean") {
+    return {
+      text: withValidationExample(
+        "Validation failed (0 files modified):\n- 'diff' must be a boolean.",
+        TOOL_VALIDATION_EXAMPLES.apply_edits,
+      ),
+      isError: true,
+    };
+  }
+  const includeDiff = input.diff === true;
 
   const baseCwd = resolvePath(input.cwd || process.cwd());
 
@@ -1456,6 +1915,14 @@ export async function runApplyEdits(
           : item.create;
       const createBody = item.create.startsWith("\uFEFF") ? item.create.slice(1) : item.create;
       const newLines = countLines(createBody);
+      const diffText = includeDiff
+        ? buildCompactDiffForCreate(
+            item.relPath,
+            originalBuffer,
+            createBody.replace(/\r\n/g, "\n"),
+            exists,
+          )
+        : undefined;
       plans.push({
         absPath: item.absPath,
         writeTargetPath: item.writeTargetPath,
@@ -1469,6 +1936,7 @@ export async function runApplyEdits(
         lineDelta: newLines - oldLines,
         created: !exists,
         isNoOp: false,
+        diffText,
       });
       continue;
     }
@@ -1523,6 +1991,14 @@ export async function runApplyEdits(
     const lineDelta = normalizedUnchanged
       ? 0
       : countLines(planned.newNormalized) - countLines(normalizedOriginal);
+    const diffText =
+      includeDiff && !isNoOp
+        ? buildCompactDiffForHunkPlans(
+            item.relPath,
+            normalizedOriginal,
+            planned.spans,
+          )
+        : undefined;
 
     plans.push({
       absPath: item.absPath,
@@ -1536,6 +2012,7 @@ export async function runApplyEdits(
       lineDelta,
       created: false,
       isNoOp,
+      diffText,
     });
   }
 
@@ -1713,13 +2190,48 @@ export async function runApplyEdits(
       Math.max(64, remainingAppliedBytes),
     );
     const combined = `${appliedSection}${verifySection}`;
+    let finalText =
+      Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES
+        ? combined
+        : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES);
+
+    // Priority: preserve verify diagnostics & applied summary first; only emit compact diff
+    // in leftover budget when verify passed and the full applied summary fit without omission.
+    if (includeDiff && status === "PASS" && appliedSection === appliedFull) {
+      const diffBlocks = plans
+        .map((p) => p.diffText)
+        .filter((d): d is string => Boolean(d));
+      if (diffBlocks.length > 0) {
+        const remaining =
+          DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(finalText, "utf8") - 2;
+        const packedDiff = packCompactDiffsWithinBudget(diffBlocks, remaining);
+        if (packedDiff) {
+          finalText = `${finalText}\n\n${packedDiff}`;
+        }
+      }
+    }
+
     return {
-      text:
-        Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES
-          ? combined
-          : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      text: finalText,
       isError: false,
     };
+  }
+
+  if (includeDiff) {
+    const diffBlocks = plans
+      .map((p) => p.diffText)
+      .filter((d): d is string => Boolean(d));
+    const appliedBytes = Buffer.byteLength(appliedFull, "utf8");
+    if (diffBlocks.length > 0 && appliedBytes <= DEFAULT_INLINE_MAX_BYTES) {
+      const remaining = DEFAULT_INLINE_MAX_BYTES - appliedBytes - 2;
+      const packedDiff = packCompactDiffsWithinBudget(diffBlocks, remaining);
+      if (packedDiff) {
+        return {
+          text: `${appliedFull}\n\n${packedDiff}`,
+          isError: false,
+        };
+      }
+    }
   }
 
   return {

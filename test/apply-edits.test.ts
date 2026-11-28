@@ -2001,7 +2001,6 @@ describe("apply_edits", () => {
     assert.equal(overwriteRes.isError, false, overwriteRes.text);
     assert.equal(await fs.readFile(legacyPath, "utf8"), "// café\n// 中文\nconst x = 2;\n");
   });
-
   it("supports hunk aliases (oldText/old_string/newText/new_string), rejects conflicting aliases, and appends 1-line examples on validation errors", async () => {
     const aliasFile = path.join(tmpDir, "alias-edits.ts");
     await fs.writeFile(aliasFile, "const a = 1;\nconst b = 2;\nconst c = 3;\n", "utf8");
@@ -2109,5 +2108,307 @@ describe("apply_edits", () => {
     assert.equal(wrongHunkKeys.isError, true);
     assert.match(wrongHunkKeys.text, /'target' must be a non-empty string/);
     assert.match(wrongHunkKeys.text, /\nExample: \{"edits":/);
+  });
+
+  it("emits compact +-2-line unified diff when diff=true and prioritizes verify/summary within 8800B budget", async () => {
+    const diffDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-diff-"));
+    try {
+      const sampleFile = path.join(diffDir, "mod.ts");
+      const lines = Array.from({ length: 14 }, (_, i) => `const line${i + 1} = ${i + 1};`);
+      await fs.writeFile(sampleFile, `${lines.join("\n")}\n`, "utf8");
+
+      // 1. Default (diff omitted) does NOT emit unified diff hunks
+      const noDiffRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        edits: [
+          {
+            path: "mod.ts",
+            hunks: [{ target: "const line4 = 4;", replacement: "const line4 = 40;" }],
+          },
+        ],
+      });
+      assert.equal(noDiffRes.isError, false);
+      assert.doesNotMatch(noDiffRes.text, /@@/);
+
+      // 2. dryRun + diff=true previews compact +-2-line diff with split hunks (>4 unchanged lines apart)
+      // and trims unchanged prefix/suffix lines inside a wide target block
+      const dryDiffRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "mod.ts",
+            hunks: [
+              {
+                target: "const line3 = 3;\nconst line4 = 4;\nconst line5 = 5;",
+                replacement: "const line3 = 3;\nconst line4 = 40;\nconst line5 = 5;",
+              },
+              {
+                target: "const line12 = 12;",
+                replacement: "const line12 = 120;",
+              },
+            ],
+          },
+        ],
+      });
+      assert.equal(dryDiffRes.isError, false, dryDiffRes.text);
+      assert.match(dryDiffRes.text, /--- a\/mod\.ts\n\+\+\+ b\/mod\.ts/);
+      assert.match(dryDiffRes.text, /@@ -2,5 \+2,5 @@\n const line2 = 2;\n const line3 = 3;\n-const line4 = 4;\n\+const line4 = 40;\n const line5 = 5;\n const line6 = 6;/);
+      assert.match(dryDiffRes.text, /@@ -10,5 \+10,5 @@\n const line10 = 10;\n const line11 = 11;\n-const line12 = 12;\n\+const line12 = 120;\n const line13 = 13;\n const line14 = 14;/);
+
+      // 3. diff=true with passing verify appends compact diff in remaining budget
+      const passVerifyDiff = await runApplyEdits({
+        cwd: diffDir,
+        diff: true,
+        edits: [
+          {
+            path: "mod.ts",
+            hunks: [{ target: "const line4 = 4;", replacement: "const line4 = 40;" }],
+          },
+        ],
+        verify: `${JSON.stringify(process.execPath)} -e "console.log('verify ok')"`,
+      });
+      assert.equal(passVerifyDiff.isError, false);
+      assert.match(passVerifyDiff.text, /Verify \[PASS in \d+ms\]/);
+      assert.match(passVerifyDiff.text, /@@ -2,5 \+2,5 @@/);
+      assert.ok(Buffer.byteLength(passVerifyDiff.text, "utf8") <= 8800);
+
+      // 4. diff=true with FAILING verify prioritizes verify diagnostics + summary and degrades diff to line stats
+      const failVerifyDiff = await runApplyEdits({
+        cwd: diffDir,
+        diff: true,
+        edits: [
+          {
+            path: "mod.ts",
+            hunks: [{ target: "const line12 = 12;", replacement: "const line12 = 999;" }],
+          },
+        ],
+        verify: `${JSON.stringify(process.execPath)} -e "console.error('Error: FAIL_DIAGNOSTIC'); process.exit(1)"`,
+      });
+      assert.equal(failVerifyDiff.isError, false);
+      assert.match(failVerifyDiff.text, /lines \+0/);
+      assert.match(failVerifyDiff.text, /Verify \[FAIL/);
+      assert.match(failVerifyDiff.text, /FAIL_DIAGNOSTIC/);
+      assert.doesNotMatch(failVerifyDiff.text, /@@/);
+
+      // 5. Large multi-file / oversized diff respects 8800B ceiling and keeps complete line stats
+      const bigContent = Array.from({ length: 150 }, (_, i) => `export const item${i} = "${"v".repeat(70)}";`).join("\n") + "\n";
+      await fs.writeFile(path.join(diffDir, "big.ts"), bigContent, "utf8");
+      const bulkDiffRes = await runApplyEdits({
+        cwd: diffDir,
+        diff: true,
+        edits: [
+          {
+            path: "big.ts",
+            hunks: Array.from({ length: 25 }, (_, i) => ({
+              target: `export const item${i * 5} = "${"v".repeat(70)}";`,
+              replacement: `export const item${i * 5} = "${"w".repeat(70)}";`,
+            })),
+          },
+          {
+            path: "created.ts",
+            create: "export const created = true;\n",
+          },
+        ],
+      });
+      assert.equal(bulkDiffRes.isError, false);
+      assert.ok(Buffer.byteLength(bulkDiffRes.text, "utf8") <= 8800);
+      assert.match(bulkDiffRes.text, /- big\.ts: updated \(25 matches\), lines \+0/);
+      assert.match(bulkDiffRes.text, /- created\.ts: created, lines \+1/);
+      assert.match(bulkDiffRes.text, /diff truncated to fit 8800B budget/);
+
+      // 6. Empty-replacement newline deletions joining two lines emit accurate diff & cumulative delta
+      const joinFile = path.join(diffDir, "join.txt");
+      await fs.writeFile(joinFile, "line1\nline2\nline3\nline4\n", "utf8");
+      const joinPrefixRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "join.txt",
+            hunks: [
+              { target: "1\n", replacement: "" },
+              { target: "line4", replacement: "line4x" },
+            ],
+          },
+        ],
+      });
+      assert.equal(joinPrefixRes.isError, false, joinPrefixRes.text);
+      assert.match(
+        joinPrefixRes.text,
+        /@@ -1,4 \+1,3 @@\n-line1\n-line2\n\+lineline2\n line3\n-line4\n\+line4x/,
+      );
+
+      await fs.writeFile(joinFile, "foo\nbar\nbaz\n", "utf8");
+      const joinNewlineOnlyRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "join.txt",
+            hunks: [{ target: "\n", replacement: "", startLine: 1, endLine: 1 }],
+          },
+        ],
+      });
+      assert.equal(joinNewlineOnlyRes.isError, false, joinNewlineOnlyRes.text);
+      assert.match(
+        joinNewlineOnlyRes.text,
+        /@@ -1,3 \+1,2 @@\n-foo\n-bar\n\+foobar\n baz/,
+      );
+
+      // 6b. Multi-span newline-drop cascade pulls merged line and keeps subsequent hunk line numbers exact
+      const cascadeFile = path.join(diffDir, "cascade.txt");
+      await fs.writeFile(
+        cascadeFile,
+        "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\niii\njjj\n",
+        "utf8",
+      );
+      const cascadeRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "cascade.txt",
+            hunks: [
+              { target: "aaa\n", replacement: "AAA" },
+              { target: "bbb\n", replacement: "" },
+              { target: "jjj", replacement: "JJJ" },
+            ],
+          },
+        ],
+      });
+      assert.equal(cascadeRes.isError, false, cascadeRes.text);
+      assert.match(
+        cascadeRes.text,
+        /@@ -1,5 \+1,3 @@\n-aaa\n-bbb\n-ccc\n\+AAAccc\n ddd\n eee/,
+      );
+      assert.match(
+        cascadeRes.text,
+        /@@ -8,3 \+6,3 @@\n hhh\n iii\n-jjj\n\+JJJ/,
+      );
+
+      // 7. Oversized >8.5 KB single-line diff block does not silently hide smaller subsequent diffs
+      await fs.writeFile(path.join(diffDir, "minified.js"), `const x="${"a".repeat(8700)}";\n`, "utf8");
+      const mixedOversize = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "minified.js",
+            hunks: [{ target: `"${"a".repeat(8700)}"`, replacement: `"${"b".repeat(8700)}"` }],
+          },
+          {
+            path: "small.ts",
+            create: "export const ok = 1;\n",
+          },
+        ],
+      });
+      assert.equal(mixedOversize.isError, false, mixedOversize.text);
+      assert.match(mixedOversize.text, /\+\+\+ b\/small\.ts/);
+      assert.match(mixedOversize.text, /diff truncated to fit 8800B budget/);
+
+      // 7b. Truncation keeps deleted `--...` / added `++...` source lines (not misclassified as ---/+++ headers)
+      const sqlPrefixContent =
+        Array.from({ length: 130 }, (_, i) => `const pad${i} = "${"p".repeat(60)}";`).join("\n") +
+        "\n-- sql comment\n";
+      await fs.writeFile(path.join(diffDir, "sql-prefix.sql"), sqlPrefixContent, "utf8");
+      const sqlTrunc = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "sql-prefix.sql",
+            hunks: [
+              { target: "-- sql comment", replacement: "++count" },
+              ...Array.from({ length: 12 }, (_, i) => ({
+                target: `const pad${i * 10} = "${"p".repeat(60)}";`,
+                replacement: `const pad${i * 10} = "${"q".repeat(60)}";`,
+              })),
+            ],
+          },
+        ],
+      });
+      assert.equal(sqlTrunc.isError, false, sqlTrunc.text);
+      assert.ok(Buffer.byteLength(sqlTrunc.text, "utf8") <= 8800);
+
+      // Single truncated block where only `--- keep` / `+++keep` fit inside budget
+      const bigBody = "x".repeat(8700);
+      await fs.writeFile(
+        path.join(diffDir, "tiny-head.sql"),
+        `-- keep\npad1\npad2\npad3\npad4\npad5\npad6\nconst big = "${bigBody}";\n`,
+        "utf8",
+      );
+      const tinyHeadTrunc = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "tiny-head.sql",
+            hunks: [
+              { target: "-- keep", replacement: "++keep" },
+              { target: `"${bigBody}"`, replacement: `"${"y".repeat(8700)}"` },
+            ],
+          },
+        ],
+      });
+      assert.equal(tinyHeadTrunc.isError, false, tinyHeadTrunc.text);
+      assert.match(tinyHeadTrunc.text, /\n--- keep\n\+\+\+keep\n/);
+      assert.match(tinyHeadTrunc.text, /diff truncated to fit 8800B budget/);
+
+      // Block where ONLY `--- keep` fits before an >8.7 KB line overflows (must not be misclassified as a header)
+      await fs.writeFile(
+        path.join(diffDir, "only-dash-fits.sql"),
+        `-- keep\nconst big = "${bigBody}";\n`,
+        "utf8",
+      );
+      const onlyDashTrunc = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [
+          {
+            path: "only-dash-fits.sql",
+            hunks: [
+              { target: "-- keep", replacement: "++keep" },
+              { target: `"${bigBody}"`, replacement: `"${"y".repeat(8700)}"` },
+            ],
+          },
+        ],
+      });
+      assert.equal(onlyDashTrunc.isError, false, onlyDashTrunc.text);
+      assert.match(onlyDashTrunc.text, /\n--- a\/only-dash-fits\.sql\n\+\+\+ b\/only-dash-fits\.sql\n@@ -1,2 \+1,2 @@\n--- keep\n/);
+      assert.match(onlyDashTrunc.text, /diff truncated to fit 8800B budget/);
+
+      // 8. create+overwrite with trailing-newline-only change emits trailing-newline diff
+      await fs.writeFile(path.join(diffDir, "nl.txt"), "hello\n", "utf8");
+      const nlRes = await runApplyEdits({
+        cwd: diffDir,
+        dryRun: true,
+        diff: true,
+        edits: [{ path: "nl.txt", create: "hello", overwrite: true }],
+      });
+      assert.equal(nlRes.isError, false, nlRes.text);
+      assert.match(nlRes.text, /\\ trailing newline removed/);
+
+      // 9. Non-boolean diff fails validation cleanly with 1-line Example
+      const badDiffFlag = await runApplyEdits({
+        cwd: diffDir,
+        diff: "yes" as unknown as boolean,
+        edits: [{ path: "mod.ts", hunks: [{ target: "line1", replacement: "line1" }] }],
+      });
+      assert.equal(badDiffFlag.isError, true);
+      assert.match(badDiffFlag.text, /'diff' must be a boolean/);
+      assert.match(badDiffFlag.text, /\nExample: \{"edits":/);
+    } finally {
+      await fs.rm(diffDir, { recursive: true, force: true });
+    }
   });
 });

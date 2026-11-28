@@ -10,6 +10,10 @@ import {
   parsePorcelainBranchHeader,
   toWorkspaceRelativeStatusLine,
 } from "../src/utils/snapshot.js";
+import {
+  isPluginInstallDir,
+  resolveSessionWorkspaceDir,
+} from "../src/utils/session-workspace.js";
 
 const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
 
@@ -1031,5 +1035,256 @@ describe("session-start hook", () => {
     // Repo-root workspaces and blank lines are left untouched
     assert.equal(toWorkspaceRelativeStatusLine(" M src/a.ts", 0), " M src/a.ts");
     assert.equal(toWorkspaceRelativeStatusLine("", 2), "");
+  });
+
+  it("prefers validated workspacePaths over plugin-dir or $HOME cwd, preserves monorepo subdir cwd, and supports --link dogfooding", async () => {
+    const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ws-prio-"));
+    const fakePluginInstall = path.join(tmpBase, ".gemini", "config", "plugins", "agy-fast");
+    const fakeDevRepo = path.join(tmpBase, "agy-fast-dev-checkout");
+    const linkedPluginInstall = path.join(
+      tmpBase,
+      ".gemini",
+      "config",
+      "plugins",
+      "agy-fast-linked",
+    );
+    const fakeHome = path.join(tmpBase, "fake-home");
+    const tildeProj = path.join(fakeHome, "tilde-proj");
+    const unrelatedInHome = path.join(fakeHome, "Downloads", "random");
+    const deletedDir = path.join(tmpBase, "deleted-workspace");
+    const unrelatedDir = path.join(tmpBase, "unrelated-app");
+    const monoRoot = path.join(tmpBase, "monorepo");
+    const monoPkg = path.join(monoRoot, "packages", "api");
+
+    try {
+      await fs.mkdir(fakePluginInstall, { recursive: true });
+      await fs.writeFile(
+        path.join(fakePluginInstall, "plugin.json"),
+        JSON.stringify({ name: "agy-fast", version: "0.3.1" }),
+        "utf8",
+      );
+      await fs.mkdir(path.join(fakeDevRepo, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(fakeDevRepo, "plugin.json"),
+        JSON.stringify({ name: "agy-fast", version: "0.3.1" }),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(fakeDevRepo, "src", "mcp-server.ts"),
+        "export const dev = true;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(fakeDevRepo, "package.json"),
+        JSON.stringify({ name: "agy-fast-dev", scripts: { test: "node --test" } }),
+        "utf8",
+      );
+      await fs.mkdir(tildeProj, { recursive: true });
+      await fs.mkdir(unrelatedInHome, { recursive: true });
+      await fs.mkdir(unrelatedDir, { recursive: true });
+      await fs.mkdir(monoPkg, { recursive: true });
+      await fs.writeFile(
+        path.join(monoPkg, "package.json"),
+        JSON.stringify({ name: "@demo/api", scripts: { dev: "node index.js" } }),
+        "utf8",
+      );
+
+      // 1. Unit checks on isPluginInstallDir, isHomeOrSystemRoot(env), & resolveSessionWorkspaceDir
+      assert.equal(isPluginInstallDir(fakePluginInstall, fakePluginInstall, {}), true);
+      assert.equal(isPluginInstallDir(gitDir, process.cwd(), {}), false);
+      assert.equal(
+        await isHomeOrSystemRoot(fakeHome, undefined, {
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+        }),
+        true,
+      );
+
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: fakePluginInstall, workspacePaths: [gitDir] },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir({ cwd: fakePluginInstall }, fakePluginInstall, {}),
+        "",
+      );
+      // Single explicit workspacePaths: [targetDir] stays green for `install.mjs doctor`
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { workspacePaths: [fakePluginInstall] },
+          fakePluginInstall,
+          {},
+        ),
+        fakePluginInstall,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: unrelatedDir, workspaceRoots: [gitDir] },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: monoPkg, workspaceRoots: [monoRoot] },
+          fakePluginInstall,
+          {},
+        ),
+        monoPkg,
+      );
+
+      // 2. P1-1 edge cases: deleted roots, $HOME roots, relative roots, non-dir file, and ~ expansion
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: fakePluginInstall, workspacePaths: [deletedDir, gitDir] },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: gitDir, workspacePaths: [deletedDir] },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: fakePluginInstall, workspacePaths: [os.homedir(), gitDir] },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: fakePluginInstall, workspacePaths: [fakeHome, gitDir] },
+          fakePluginInstall,
+          { HOME: fakeHome, USERPROFILE: fakeHome },
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: unrelatedInHome, workspacePaths: [fakeHome, gitDir] },
+          fakePluginInstall,
+          { HOME: fakeHome, USERPROFILE: fakeHome },
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: gitDir, workspacePaths: [fakeHome] },
+          fakePluginInstall,
+          { HOME: fakeHome, USERPROFILE: fakeHome },
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          {
+            cwd: gitDir,
+            workspacePaths: ["packages/web", "scripts", path.join(gitDir, "package.json")],
+          },
+          fakePluginInstall,
+          {},
+        ),
+        gitDir,
+      );
+      assert.equal(
+        await resolveSessionWorkspaceDir(
+          { cwd: fakePluginInstall, workspacePaths: ["~/tilde-proj"] },
+          fakePluginInstall,
+          { HOME: fakeHome, USERPROFILE: fakeHome },
+        ),
+        tildeProj,
+      );
+
+      // 3. P1-2: `install.mjs install --link` symlink dogfooding
+      let createdLink = false;
+      try {
+        await fs.symlink(
+          fakeDevRepo,
+          linkedPluginInstall,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        createdLink = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EPERM") throw err;
+      }
+      if (createdLink) {
+        const linkEnv = { PLUGIN_ROOT: linkedPluginInstall };
+        // Default strict mode (used by MCP write guard) treats even `<dev-repo>` as inside PLUGIN_ROOT
+        assert.equal(
+          isPluginInstallDir(fakeDevRepo, fakeDevRepo, linkEnv),
+          true,
+        );
+        // SessionStart opt-in mode blocks the symlinked plugin path while allowing `<dev-repo>` dogfooding
+        assert.equal(
+          isPluginInstallDir(linkedPluginInstall, linkedPluginInstall, linkEnv, {
+            allowLinkedDevCheckout: true,
+          }),
+          true,
+        );
+        assert.equal(
+          isPluginInstallDir(fakeDevRepo, fakeDevRepo, linkEnv, {
+            allowLinkedDevCheckout: true,
+          }),
+          false,
+        );
+        assert.equal(
+          await resolveSessionWorkspaceDir({ cwd: linkedPluginInstall }, fakeDevRepo, linkEnv),
+          "",
+        );
+        assert.equal(
+          await resolveSessionWorkspaceDir({ cwd: fakeDevRepo }, fakeDevRepo, linkEnv),
+          fakeDevRepo,
+        );
+
+        const dogfoodRes = await runHook(JSON.stringify({ cwd: fakeDevRepo }), linkEnv);
+        assert.equal(dogfoodRes.code, 0);
+        const dogfoodMsg: string = JSON.parse(dogfoodRes.stdout)?.injectSteps?.[0]
+          ?.systemMessage?.systemMessage;
+        assert.ok(dogfoodMsg);
+        assert.match(dogfoodMsg, /package\.json \(agy-fast-dev\)/);
+      }
+
+      // 4. Subprocess integration via dist/session-start.mjs with PLUGIN_ROOT & $HOME
+      const fromPluginCwdWithWorkspace = await runHook(
+        JSON.stringify({ cwd: fakePluginInstall, workspacePaths: [deletedDir, gitDir] }),
+        { PLUGIN_ROOT: fakePluginInstall },
+      );
+      assert.equal(fromPluginCwdWithWorkspace.code, 0);
+      const wsMsg: string = JSON.parse(fromPluginCwdWithWorkspace.stdout)?.injectSteps?.[0]
+        ?.systemMessage?.systemMessage;
+      assert.ok(wsMsg);
+      assert.match(wsMsg, /package\.json \(demo-app\)/);
+
+      const standalonePluginCwd = await runHook(
+        JSON.stringify({ cwd: fakePluginInstall }),
+        { PLUGIN_ROOT: fakePluginInstall },
+      );
+      assert.equal(standalonePluginCwd.code, 0);
+      assert.deepEqual(JSON.parse(standalonePluginCwd.stdout), {});
+
+      const homeCwdWithWorkspace = await runHook(
+        JSON.stringify({ cwd: fakeHome, workspacePaths: [fakeHome, gitDir] }),
+        { HOME: fakeHome, USERPROFILE: fakeHome },
+      );
+      assert.equal(homeCwdWithWorkspace.code, 0);
+      const homeWsMsg: string = JSON.parse(homeCwdWithWorkspace.stdout)?.injectSteps?.[0]
+        ?.systemMessage?.systemMessage;
+      assert.ok(homeWsMsg);
+      assert.match(homeWsMsg, /package\.json \(demo-app\)/);
+    } finally {
+      await fs.rm(tmpBase, { recursive: true, force: true });
+    }
   });
 });

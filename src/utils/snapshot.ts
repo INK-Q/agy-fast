@@ -468,15 +468,38 @@ async function boundedRealpath(p: string, deadlineMs?: number): Promise<string> 
 export async function isHomeOrSystemRoot(
   workspaceDir: string,
   deadlineMs?: number,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
   const resolved = path.resolve(workspaceDir);
   if (path.parse(resolved).root === resolved) return true;
   if (isSystemUserParentPath(resolved)) return true;
 
+  const isFullAbsPath = (p: string): boolean =>
+    process.platform === "win32"
+      ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p)
+      : path.isAbsolute(p);
+  const driveHome =
+    process.platform === "win32" &&
+    typeof env.HOMEDRIVE === "string" &&
+    typeof env.HOMEPATH === "string" &&
+    env.HOMEDRIVE.trim() &&
+    env.HOMEPATH.trim()
+      ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}`
+      : "";
   const homeCandidates = new Set<string>();
-  for (const cand of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
-    if (cand && cand.trim()) {
+  for (const cand of [env.HOME, env.USERPROFILE, driveHome]) {
+    if (typeof cand === "string" && cand.trim() && isFullAbsPath(cand.trim())) {
       homeCandidates.add(path.resolve(cand.trim()));
+    }
+  }
+  if (homeCandidates.size === 0 || env === process.env) {
+    try {
+      const osHome = os.homedir();
+      if (osHome && isFullAbsPath(osHome)) {
+        homeCandidates.add(path.resolve(osHome));
+      }
+    } catch {
+      // No OS home directory available
     }
   }
   const resolvedKey = normalizePathForCompare(resolved);

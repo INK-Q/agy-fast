@@ -159,7 +159,7 @@ Empirical analysis of **55 real Antigravity sessions** (**8,446 LLM turns**, **1
 | **Plugin Manifest** | [`plugin.json`](plugin.json) | Standard Antigravity manifest; passes `agy plugin validate --strict` |
 | **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 5 eagerly loaded composite tools (`"eager": true`) under `agy-fast_fast` |
 | **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (`~35–50 ms`, `250 ms` scan circuit-breaker + OS/home-dir skip list), emitting a `≤1.5 KB` workspace snapshot |
-| **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~6.5 KB`) routing guide with inlined schemas (supports user-owned `rules/AGENTS.local.md` with `trigger: always_on` frontmatter, preserved across updates) |
+| **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~8.5 KB`) routing guide with inlined schemas (supports user-owned `rules/AGENTS.local.md` with `trigger: always_on` frontmatter, preserved across updates) |
 | **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 4 h release checker with staged MCP smoke verification |
 | **Offline Benchmark CLI** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | Local `transcript.jsonl` analyzer and before/after A/B comparator |
 
@@ -220,6 +220,11 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | Edit ≥2 hunks/files in one turn, or edit + verify | **`apply_edits`** | Atomic or `bestEffort` multi-file edits + optional inline `verify` |
 | Run ≥2 independent build, lint, test, or diagnostic commands | **`run_checks`** | Concurrent execution with head-tail folded error-focused output |
 
+> [!NOTE]
+> **Antigravity eager loading:** Antigravity is the first-class plugin target — `agy-fast` ships its `hooks.json` hooks, `rules/AGENTS.md` rules, installer, and zero-latency auto-updater for it. Under eager loading, the host injects a required `toolSummary` argument into every `mcp_agy-fast_fast_*` call (see [`rules/AGENTS.md` Quick Schemas](rules/AGENTS.md)); this injection is an Antigravity eager-loading behavior — it does not apply to lazy `call_mcp_tool` calls or standalone MCP hosts. Include it (a short summary of what the call does) or the first call fails with `missing property 'toolSummary'`.
+>
+> **Standard MCP hosts (Codex, Claude Code, etc.):** mount the same server via `npx -y agy-fast mcp` (or `node <plugin-dir>/scripts/install.mjs mcp`) and print host-agnostic routing rules with `npx -y agy-fast mcp-config --rules` (or see the standalone MCP section of Quick Start) — no manual wiring of `dist/mcp-server.mjs` — optionally passing `--tools` (tool subset) and/or `--schema-compat=minimal` (strict JSON Schema subset hosts; runtime validation stays unchanged).
+
 ### 1. `batch_search` — Concurrent Code, Path & Read-Only Git Search
 - **Up to 20 mixed queries per call:** `text`, `regex`, `glob`, `fuzzy`, and read-only `git` (`status`, `diff`, `log`, `show`, `branch`, `rev-parse`, `ls-files`, `blame`, `shortlog`, `describe`, `tag --list`, `remote -v`), including cross-repo lookups via per-query `path`.
 - **Precision controls:** Filter by `fileType` (e.g., `typescript`, `python`, `gdscript`) or `glob`, switch `outputMode` (`content` | `files_with_matches` | `count`), enable cross-line `multiline: true` (where `count` reports occurrences per file), use `type: "fuzzy"` for case-insensitive path matching, or pass `sortBy: "mtime"` on `glob` queries for newest-first results.
@@ -277,8 +282,9 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | **Health check** *(Node, `rg`, live MCP handshake, `SessionStart` latency, manifest validation)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor` |
 | **Check for updates** *(read-only)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check` |
 | **Update now** *(stages & runs MCP smoke test before swapping)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
+| **Interactive update / skip a version** *(`[y]es/[n]o/[s]kip`, or `none` to clear)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --prompt` *(or `update --skip-version <ver\|none>`)* |
 | **Configure auto-update** *(`auto` \| `notify` \| `off`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
-| **Switch MCP tool loading** *(`eager` \| `lazy`, preserved across updates)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
+| **Switch MCP tool loading / edits format** *(`--tool-loading eager\|lazy`, `--edits-format auto\|array\|string`; preserved across updates)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` *(or `config --edits-format array`)* |
 | **Direct CLI mode** *(for Swarm workers & non-MCP scripts)* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
 | **Standalone MCP stdio server** *(standard MCP hosts; forwards `--tools`, `--schema-compat=minimal`, `--cli`)* | `npx -y agy-fast mcp` *(or `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp`)* |
 | **Generate MCP config / generic rules** *(`--host mcp-only\|json\|generic\|antigravity`, `--tools`, `--rules`)* | `npx -y agy-fast mcp-config --rules` *(or `node .../scripts/install.mjs mcp-config`)* |
@@ -298,9 +304,11 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | Environment Variable | Values / Default | Purpose |
 | :--- | :--- | :--- |
 | `AGY_FAST_AUTO_UPDATE` | `auto` *(default)* \| `notify` \| `off` | Overrides saved auto-update mode |
-| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *(default; `1..720`)* | Background check interval in hours |
+| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `4` *(default; `0.01..720`; CLI `--interval`: `1..720`)* | Background check interval in hours |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *(default)* \| `main` | Track stable semver release tags or `main` |
 | `AGY_FAST_REPO` | Git URL | Use a custom mirror or fork |
+| `AGY_FAST_TOOL_LOADING` | `eager` *(default)* \| `lazy` | Overrides the MCP tool loading mode written to `mcp_config.json` during install/update (also `config --tool-loading`) |
+| `AGY_FAST_CACHE_DIR` | Directory path *(default: `~/.gemini/cache/agy-fast`)* | Overrides the local cache directory for `config.json`, update state, and lock files |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on eager-capable CLI ≥1.5.8, Desktop 2.0, IDE, and third-party hosts, and switches to JSON array strings on pre-eager CLI 1.5.0–1.5.7; server always accepts both) |
 | `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
 | `AGY_FAST_TOOLS` | Comma-separated tool names *(default: all 5)* | Exposes only the specified MCP tool subset (also `--tools <list>`) |
@@ -346,7 +354,7 @@ npm install
 npm run typecheck   # Strict TypeScript check
 npm run build       # Bundle src/*.ts -> dist/*.mjs with esbuild
 npm test            # Run unit, MCP protocol, hook, benchmark, and installer tests
-npm run bench:stress # Run 12-scenario end-to-end stress & performance benchmark
+npm run bench:stress # Run 11-scenario end-to-end stress & performance benchmark (+ optional --real-repo=<path> scenario 12)
 npm run validate    # Run `agy plugin validate --strict .`
 ```
 

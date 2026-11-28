@@ -6,7 +6,7 @@ Thanks for contributing! `agy-fast` uses a protected **`main` + `dev`** branchin
 
 | Branch | Role | Protection |
 | :--- | :--- | :--- |
-| `main` | Stable released code only (`vX.Y.Z` tags) | Protected: PR + passing Linux/Windows CI & stress benchmark required; no direct push, force-push, or deletion |
+| `main` | Stable released code only (`vX.Y.Z` tags) | Protected: PR + passing Linux/macOS/Windows CI & stress benchmark required; no direct push, force-push, or deletion |
 | `dev` | Active integration branch for upcoming releases | Protected against deletion & force-push; default target for feature/fix PRs and Dependabot |
 | `feat/*`, `fix/*`, `docs/*` | Short-lived topic branches branched from `dev` | Automatically deleted after PR merge |
 | `hotfix/*` | Urgent production fixes branched from `main` | PR into `main`, then back-merged into `dev` |
@@ -29,12 +29,12 @@ Thanks for contributing! `agy-fast` uses a protected **`main` + `dev`** branchin
    ```bash
    npm run validate
    ```
-3. Open a PR targeting **`dev`**. CI will automatically verify Linux + Windows (`verify (ubuntu-latest)`, `verify (windows-latest)`), `dist/` bundle freshness, and the 11-scenario stress suite (`stress`).
+3. Open a PR targeting **`dev`**. CI will automatically verify Linux, macOS, and Windows (`verify (ubuntu-latest, Node 20/22/24)`, `verify (macos-latest, Node 20/22/24)`, `verify (windows-latest, Node 20)`), `dist/` bundle freshness, `install.sh` syntax, and the 11-scenario stress suite (`stress`).
 
 ## Release Flow (Maintainers)
 
 1. On `dev`, bump `version` in `package.json` and `plugin.json`, add the `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, run `npm run typecheck && npm run build && npm test && npm run validate && npm run bench:stress`, and commit.
-2. Open a Release PR from `dev` → `main` and wait for all required CI checks (`verify (ubuntu-latest)`, `verify (windows-latest)`, `stress`) to pass.
+2. Open a Release PR from `dev` → `main` and wait for all CI checks (`verify (ubuntu-latest, Node 20/22/24)`, `verify (macos-latest, Node 20/22/24)`, `verify (windows-latest, Node 20)`, and `stress`) to pass.
 3. Merge using **Create a merge commit** (avoid Squash on `dev` → `main` so branch history stays aligned), pull the merged `main`, and push the tag `vX.Y.Z`:
    ```bash
    git checkout main && git pull origin main

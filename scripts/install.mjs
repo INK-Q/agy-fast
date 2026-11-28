@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -85,6 +86,25 @@ function getUpdaterCacheDir() {
   return custom
     ? path.resolve(custom)
     : path.join(getHomeDir(), ".gemini", "cache", PLUGIN_NAME);
+}
+
+async function getUpdaterStatePath(targetDir) {
+  const custom = process.env.AGY_FAST_CACHE_DIR?.trim();
+  const cacheDir = getUpdaterCacheDir();
+  if (custom || !targetDir || !String(targetDir).trim()) {
+    return path.join(cacheDir, "update-state.json");
+  }
+  const canonTarget = toComparePath(await canonicalizeExistingPath(targetDir));
+  const canonDefault = toComparePath(await canonicalizeExistingPath(getGlobalPluginDir()));
+  if (canonTarget === canonDefault) {
+    return path.join(cacheDir, "update-state.json");
+  }
+  const installKey = crypto
+    .createHash("sha256")
+    .update(canonTarget)
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(cacheDir, "installs", installKey, "update-state.json");
 }
 
 async function readJsonSafe(filePath) {
@@ -1176,8 +1196,9 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const installedVersion =
     manifest && typeof manifest.version === "string" ? manifest.version : "unknown";
   const cacheDir = getUpdaterCacheDir();
+  const statePath = await getUpdaterStatePath(targetDir);
   const updaterCfg = (await readJsonSafe(path.join(cacheDir, "config.json"))) || {};
-  const updaterState = (await readJsonSafe(path.join(cacheDir, "update-state.json"))) || {};
+  const updaterState = (await readJsonSafe(statePath)) || {};
   const effectiveAutoMode =
     process.env.AGY_FAST_AUTO_UPDATE?.trim().toLowerCase() ||
     updaterCfg.autoUpdate ||

@@ -6,8 +6,8 @@ Security fixes are applied to the latest release and the `main` branch:
 
 | Version | Supported |
 | :--- | :---: |
-| `main` / latest `0.2.x` | :white_check_mark: |
-| `< 0.2.0` | :x: |
+| `main` / latest `0.3.x` | :white_check_mark: |
+| `< 0.3.0` | :x: |
 
 ## Security Model
 
@@ -17,7 +17,7 @@ Security fixes are applied to the latest release and the `main` branch:
 - **100% local execution** — the MCP server runs over local Stdio (`node dist/mcp-server.mjs`) and never sends source code, transcripts, or prompts to any third-party endpoint.
 - **Read-only Git allowlist** — `batch_search` strictly restricts `git` queries to an allowlist of read-only subcommands and blocks flag injection (`-c`, `--git-dir`, `--ext-diff`, etc.).
 - **Policy-compliant** — does not intercept, bypass, or modify Antigravity's native permissions, checkpoints, or safety gates.
-- **Optional auto-updater** — checks GitHub Releases over HTTPS only (strictly `github.com` / `api.github.com` / `objects.githubusercontent.com`), stages updates in an isolated temp directory, runs an MCP smoke test before atomic swap, and can be disabled with `AGY_FAST_AUTO_UPDATE=0`.
+- **Optional auto-updater** — checks GitHub Releases over HTTPS only (strictly `github.com` / `api.github.com` / `objects.githubusercontent.com`), stages updates in an isolated temp directory, runs an MCP smoke test before atomic swap, and can be disabled with `AGY_FAST_AUTO_UPDATE=off` (or `0`).
 
 ## Reporting a Vulnerability
 

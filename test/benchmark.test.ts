@@ -8,6 +8,7 @@ import {
   analyzePaths,
   analyzePathsByUsage,
   analyzeTranscriptSessions,
+  classifySessionKind,
   collectTranscriptFiles,
   filterStepsByTime,
   formatCompareMarkdown,
@@ -1945,6 +1946,8 @@ describe("benchmark analyzer & CLI", () => {
       "42",
       '"just a string"',
       "null",
+      "[1, 2, 3]",
+      "[]",
       JSON.stringify({
         step_index: 1,
         type: "PLANNER_RESPONSE",
@@ -2079,5 +2082,600 @@ describe("benchmark analyzer & CLI", () => {
     assert.match(cliRes.stderr, /Warning: skipped 2 unreadable\/corrupted transcript file\(s\)/);
     assert.ok(cliRes.stderr.includes("corrupt-a"));
     assert.ok(cliRes.stderr.includes("corrupt-b"));
+  });
+
+  it("tracks run_checks full-mode and single-command hygiene across MCP and --cli (Issue #59)", () => {
+    const steps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T01:00:00Z",
+          content: "<USER_REQUEST>run checks</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T01:00:01Z",
+          output_tokens: 200,
+          tool_calls: [
+            // 1. Eager MCP: full + 1 command (stringified host args)
+            {
+              name: "mcp_agy-fast_fast_run_checks",
+              args: {
+                commands: '[{"command":"npm test"}]',
+                outputMode: '"full"',
+              },
+            },
+            // 2. Lazy call_mcp_tool: default compact + 2 commands (double-encoded)
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: '"agy-fast_fast"',
+                ToolName: '"run_checks"',
+                Arguments: JSON.stringify({
+                  commands: JSON.stringify([{ command: "npm run typecheck" }, { command: "npm test" }]),
+                }),
+              },
+            },
+            // 3. Eager MCP: corrupted commands + outputMode full (full counted, single-cmd NOT counted)
+            {
+              name: "mcp_agy-fast_fast_run_checks",
+              args: {
+                commands: [false],
+                outputMode: "full",
+              },
+            },
+            // 4. --cli via node mcp-server.mjs: --full + 1 cmd + 2>&1 redirect (must not count redirect as 2nd cmd)
+            {
+              name: "run_command",
+              args: {
+                CommandLine: 'node dist/mcp-server.mjs --cli check --full "npm test" 2>&1',
+              },
+            },
+            // 5. --cli via portable agy-fast-mcp bin: --output-mode=compact overrides --json outputMode:full, 2 cmds
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  'agy-fast-mcp --cli check --output-mode=compact --json \'{"commands":["npm run typecheck","npm test"],"outputMode":"full"}\'',
+              },
+            },
+            // 6. --cli via agy-fast mcp bin: --json shorthand array (1 cmd) + --output-mode full
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  'agy-fast mcp --cli check --output-mode full --json \'["npm test"]\'',
+              },
+            },
+            // 7. --cli via node scripts/install.mjs mcp: --stdin (unknown cmd count -> not single-cmd)
+            {
+              name: "run_command",
+              args: {
+                CommandLine: "node scripts/install.mjs mcp --cli check --stdin <<'EOF'\n{}\nEOF",
+              },
+            },
+            // 8. --cli check --full --compact (last flag wins -> compact) + 2 cmds via npx
+            {
+              name: "run_command",
+              args: {
+                CommandLine: 'npx --yes agy-fast-mcp --cli check --full --compact "npm run lint" "npm test"',
+              },
+            },
+            // 9. env -u VAR + corrupted --json commands array must not count as single-cmd
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  'env -u AGY_FAST_TOOLS node dist/mcp-server.mjs --cli check --json \'{"commands":[false]}\'',
+              },
+            },
+            // Non-cli commands must NOT match as --cli
+            {
+              name: "run_command",
+              args: { CommandLine: 'echo "agy-fast-mcp --cli check --full npm test"' },
+            },
+            {
+              name: "run_command",
+              args: { CommandLine: "agy-fast doctor" },
+            },
+          ],
+        }),
+      ].join("\n"),
+    );
+
+    const m = analyzeTranscriptSessions([steps]);
+    assert.equal(m.agyFastToolCalls.run_checks, 9);
+    assert.equal(m.agyEagerCalls, 2);
+    assert.equal(m.agyLazyCalls, 1);
+    assert.equal(m.agyCliCalls, 6);
+    assert.equal(m.runCommandCalls, 2);
+    assert.equal(m.agyCorruptedArgCalls, 1);
+    // Full-mode calls: #1 (eager), #3 (eager corrupted w/ full), #4 (--full), #6 (--output-mode full) = 4
+    assert.equal(m.runChecksFullModeCalls, 4);
+    // Single-cmd calls: #1 (1), #4 (1 after 2>&1 strip), #6 (1 via json) = 3 (#9 corrupted [false] excluded)
+    assert.equal(m.runChecksSingleCommandCalls, 3);
+    // Logical ops for 9 run_checks: 1 + 2 + 1(corrupted) + 1 + 2 + 1 + 1(stdin) + 2 + 1(corrupted cli) = 12; plus 2 raw run_command = 14
+    assert.equal(m.agyFastLogicalOps, 12);
+    assert.equal(m.totalLogicalOps, 14);
+
+    const md = formatMetricsMarkdown(m);
+    assert.match(md, /run_checks hygiene \(full-mode \/ single-cmd\) \| 4\/9 \(44\.4%\) \/ 3\/9 \(33\.3%\) \|/);
+    const cmpMd = formatCompareMarkdown(analyzeTranscriptSessions([]), m);
+    assert.match(cmpMd, /run_checks hygiene \(full-mode \/ single-cmd\) \| - \| 4\/9 \(44\.4%\) \/ 3\/9 \(33\.3%\) \| - \|/);
+    const splitMd = formatUsageSplitMarkdown({
+      overall: m,
+      withAgyFast: m,
+      withoutAgyFast: analyzeTranscriptSessions([]),
+    });
+    assert.match(splitMd, /run_checks hygiene \(full-mode \/ single-cmd\) \| 4\/9 \(44\.4%\) \/ 3\/9 \(33\.3%\) \| - \| 4\/9 \(44\.4%\) \/ 3\/9 \(33\.3%\) \| - \|/);
+  });
+
+  it("splits multimodal media and >=180k turns between USER_INPUT and tool-loaded GENERIC media (Issue #59)", () => {
+    // Session A: user pasted 2 screenshots, 0 agent tool images (Rule 3 fully obeyed)
+    const userOnlySession = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T02:00:00Z",
+          content: "<USER_REQUEST>check these screenshots</USER_REQUEST>",
+          media: [
+            { mime_type: "image/png", uri: "file:///tmp/u1.png" },
+            { mime_type: "image/png", uri: "file:///tmp/u2.png" },
+          ],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T02:00:05Z",
+          input_tokens: 10_000,
+          cache_read_tokens: 185_000,
+          output_tokens: 150,
+          tool_calls: [],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T02:00:10Z",
+          input_tokens: 8_000,
+          cache_read_tokens: 192_000,
+          output_tokens: 120,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+
+    // Session B: starts with USER_INPUT screenshot -> 1 user-only high-ctx turn -> then agent loads image in GENERIC -> 1 tool high-ctx turn
+    const mixedMediaSession = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T02:10:00Z",
+          media: [{ mime_type: "image/png", uri: "file:///tmp/u3.png" }],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T02:10:02Z",
+          input_tokens: 5_000,
+          cache_read_tokens: 180_000,
+          output_tokens: 100,
+          tool_calls: [{ name: "read_file", args: { Path: "/tmp/debug.png" } }],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-26T02:10:03Z",
+          media: [{ mime_type: "image/png", uri: "file:///tmp/debug.png" }],
+          content: "image bytes",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T02:10:08Z",
+          input_tokens: 5_000,
+          cache_read_tokens: 190_000,
+          output_tokens: 100,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+
+    // Session C: planner-less session with USER_INPUT media must not inflate media counters
+    const plannerlessMedia = parseTranscriptJsonl(
+      JSON.stringify({
+        type: "USER_INPUT",
+        created_at: "2026-11-26T02:20:00Z",
+        media: [{ mime_type: "image/png", uri: "file:///tmp/orphan.png" }],
+      }),
+    );
+
+    const m = analyzeTranscriptSessions([userOnlySession, mixedMediaSession, plannerlessMedia]);
+    assert.equal(m.sessions, 2);
+    assert.equal(m.mainSessions, 2); // Session B media-only USER_INPUT still counts as main
+    assert.equal(m.mediaLoadedCount, 4);
+    assert.equal(m.userMediaCount, 3);
+    assert.equal(m.toolMediaCount, 1);
+    assert.equal(m.multimodalHighCtxTurns, 4);
+    assert.equal(m.multimodalHighCtxUserOnlyTurns, 3);
+    assert.equal(m.multimodalHighCtxToolTurns, 1);
+    assert.equal(m.userMediaCount + m.toolMediaCount, m.mediaLoadedCount);
+    assert.equal(m.multimodalHighCtxUserOnlyTurns + m.multimodalHighCtxToolTurns, m.multimodalHighCtxTurns);
+
+    const md = formatMetricsMarkdown(m);
+    assert.match(
+      md,
+      /Multimodal >=180k turns \(media loaded\) \| 4 \(tool:1, user-only:3; 4 media: user:3, tool:1\) \|/,
+    );
+    const cmpMd = formatCompareMarkdown(analyzeTranscriptSessions([userOnlySession]), m);
+    assert.match(cmpMd, /Multimodal >=180k turns \| 2 \(tool:0, user:2; u2\/t0\) \| 4 \(tool:1, user:3; u3\/t1\) \| \+100\.0% \|/);
+  });
+
+  it("computes logical-op packing, classifies main/subagent/swarm sessions, and stratifies --split-usage (Issue #59)", async () => {
+    const stratifyDir = path.join(tmpDir, "issue59-stratify");
+    await fs.mkdir(stratifyDir, { recursive: true });
+
+    // 1. Main session WITH agy-fast: packs multiple ops per call
+    const mainWithFast = [
+      JSON.stringify({
+        type: "USER_INPUT",
+        created_at: "2026-11-26T03:00:00Z",
+        content: "<USER_REQUEST>refactor module</USER_REQUEST>",
+      }),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T03:00:02Z",
+        input_tokens: 20_000,
+        cache_read_tokens: 180_000,
+        output_tokens: 300,
+        tool_calls: [
+          // batch_search: 3 queries -> 3 ops
+          {
+            name: "mcp_agy-fast_fast_batch_search",
+            args: {
+              queries: JSON.stringify([
+                { type: "text", pattern: "alpha" },
+                { type: "regex", pattern: "beta" },
+                { type: "git", pattern: "status --short" },
+              ]),
+            },
+          },
+          // quick_outline: 2 paths -> 2 ops
+          {
+            name: "mcp_agy-fast_fast_quick_outline",
+            args: { paths: ["src/a.ts", "src/b.ts"] },
+          },
+        ],
+      }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:00:05Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:00:06Z", content: "ok" }),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T03:00:08Z",
+        input_tokens: 10_000,
+        cache_read_tokens: 200_000,
+        output_tokens: 400,
+        tool_calls: [
+          // read_slices: 1 outline + 2 slice ranges + 2 lineRanges (Windows path) -> 5 ops
+          {
+            name: "mcp_agy-fast_fast_read_slices",
+            args: {
+              outlines: "src/c.ts",
+              slices: [{ path: "src/a.ts", ranges: [[1, 20], [50, 70]] }],
+              lineRanges: ["C:\\repo\\src\\b.ts:L10-L30,L40-L60"],
+            },
+          },
+          // apply_edits: 3 hunks + 1 create + 1 verify -> 5 ops
+          {
+            name: "mcp_agy-fast_fast_apply_edits",
+            args: {
+              edits: [
+                {
+                  path: "src/a.ts",
+                  hunks: [
+                    { target: "a", replacement: "b" },
+                    { target: "c", replacement: "d" },
+                    { target: "e", replacement: "f" },
+                  ],
+                },
+                { path: "src/new.ts", create: "export const x = 1;\n" },
+              ],
+              verify: '"npm run typecheck"',
+            },
+          },
+          // apply_edits dryRun: true -> verify does NOT add +1 -> 1 op
+          {
+            name: "mcp_agy-fast_fast_apply_edits",
+            args: {
+              edits: [{ path: "src/b.ts", hunks: [{ target: "x", replacement: "y" }] }],
+              dryRun: true,
+              verify: "npm test",
+            },
+          },
+        ],
+      }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:00:12Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:00:13Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:00:14Z", content: "ok" }),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T03:00:16Z",
+        input_tokens: 5_000,
+        cache_read_tokens: 210_000,
+        output_tokens: 200,
+        tool_calls: [],
+      }),
+    ];
+
+    // 2. Main session WITHOUT agy-fast: 4 turns for 4 single built-in ops
+    const mainWithoutFast = [
+      JSON.stringify({
+        type: "USER_INPUT",
+        created_at: "2026-11-26T03:10:00Z",
+        content: "<USER_REQUEST>inspect code</USER_REQUEST>",
+      }),
+      ...Array.from({ length: 4 }, (_, idx) => [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: `2026-11-26T03:10:${String(idx * 4 + 2).padStart(2, "0")}Z`,
+          input_tokens: 15_000,
+          cache_read_tokens: 185_000,
+          output_tokens: 100,
+          tool_calls: [{ name: "read_file", args: { Path: `/repo/f${idx}.ts` } }],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: `2026-11-26T03:10:${String(idx * 4 + 4).padStart(2, "0")}Z`,
+          content: "ok",
+        }),
+      ]).flat(),
+    ];
+
+    // 3. Research subagent WITHOUT agy-fast (short, low context, no USER_INPUT, SYSTEM_MESSAGE sender=parent + send_message)
+    const researchSubagent = [
+      JSON.stringify({
+        type: "SYSTEM_MESSAGE",
+        created_at: "2026-11-26T03:20:00Z",
+        content:
+          "[Message] timestamp=2026-11-26T03:20:00Z sender=parent-conv-uuid priority=MESSAGE_PRIORITY_HIGH content=Inspect src/",
+      }),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T03:20:02Z",
+        input_tokens: 5_000,
+        cache_read_tokens: 15_000,
+        output_tokens: 500,
+        tool_calls: [
+          { name: "read_file", args: { Path: "/repo/a.ts" } },
+          { name: "send_message", args: { Recipient: "parent-conv-uuid", Message: "done" } },
+        ],
+      }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:20:03Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:20:04Z", content: "sent" }),
+    ];
+
+    // 4. Swarm worker WITH --cli (no USER_INPUT, uses read_board + --cli search/outline/slice/edit)
+    const swarmWorker = [
+      JSON.stringify({
+        type: "SYSTEM_MESSAGE",
+        created_at: "2026-11-26T03:30:00Z",
+        content: "[Message] timestamp=2026-11-26T03:30:00Z sender=coord-uuid content=@worker go",
+      }),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T03:30:02Z",
+        input_tokens: 8_000,
+        cache_read_tokens: 20_000,
+        output_tokens: 200,
+        tool_calls: [
+          { name: "read_board", args: {} },
+          // --cli search: 2 queries -> 2 ops
+          {
+            name: "run_command",
+            args: {
+              CommandLine:
+                'env FOO=1 node dist/mcp-server.mjs --cli search --path src --text foo --git "status --short"',
+            },
+          },
+          // --cli slice: 1 outline + 2 lineRanges -> 3 ops
+          {
+            name: "run_command",
+            args: {
+              CommandLine: "agy-fast-mcp --cli slice --outline src/a.ts src/b.ts:1-20,30-50",
+            },
+          },
+          // --cli edit: --stdin + --verify -> 2 ops
+          {
+            name: "run_command",
+            args: {
+              CommandLine:
+                'agy-fast mcp --cli edit --best-effort --verify "npm run typecheck" --stdin',
+            },
+          },
+        ],
+      }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:30:04Z", content: "{}" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:30:05Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:30:06Z", content: "ok" }),
+      JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T03:30:07Z", content: "ok" }),
+    ];
+
+    await fs.writeFile(path.join(stratifyDir, "main-with.jsonl"), mainWithFast.join("\n") + "\n", "utf8");
+    await fs.writeFile(path.join(stratifyDir, "main-without.jsonl"), mainWithoutFast.join("\n") + "\n", "utf8");
+    await fs.writeFile(path.join(stratifyDir, "subagent.jsonl"), researchSubagent.join("\n") + "\n", "utf8");
+    await fs.writeFile(path.join(stratifyDir, "swarm.jsonl"), swarmWorker.join("\n") + "\n", "utf8");
+
+    const split = await analyzePathsByUsage([stratifyDir]);
+    assert.equal(split.overall.sessions, 4);
+    assert.equal(split.overall.mainSessions, 2);
+    assert.equal(split.overall.subagentSessions, 1);
+    assert.equal(split.overall.swarmWorkerSessions, 1);
+
+    // Main WITH agy-fast: 5 agy-fast calls packing 3 + 2 + 5 + 5 + 1 = 16 ops (3.20x avg) in 3 turns -> 1.88 turns/10 ops
+    assert.ok(split.bySessionKind);
+    assert.equal(split.bySessionKind.main.overall.sessions, 2);
+    assert.equal(split.bySessionKind.main.withAgyFast.sessions, 1);
+    assert.equal(split.bySessionKind.main.withoutAgyFast.sessions, 1);
+    assert.equal(split.bySessionKind.main.withAgyFast.agyFastLogicalOps, 16);
+    assert.equal(split.bySessionKind.main.withAgyFast.totalLogicalOps, 16);
+    assert.equal(split.bySessionKind.main.withAgyFast.avgAgyFastPacking, 3.2);
+    assert.equal(split.bySessionKind.main.withAgyFast.turnsPer10LogicalOps, 1.88);
+    // Main WITHOUT agy-fast: 4 built-in calls (4 ops) in 4 turns -> 10.00 turns/10 ops
+    assert.equal(split.bySessionKind.main.withoutAgyFast.totalLogicalOps, 4);
+    assert.equal(split.bySessionKind.main.withoutAgyFast.turnsPer10LogicalOps, 10);
+
+    // Subagent bucket: 1 session without agy-fast
+    assert.equal(split.bySessionKind.subagent.overall.sessions, 1);
+    assert.equal(split.bySessionKind.subagent.withoutAgyFast.sessions, 1);
+    assert.equal(split.bySessionKind.subagent.withAgyFast.sessions, 0);
+
+    // Swarm bucket: 1 session with 3 --cli calls (2 + 3 + 2 = 7 ops) + 1 read_board = 8 total ops
+    assert.equal(split.bySessionKind.swarm.overall.sessions, 1);
+    assert.equal(split.bySessionKind.swarm.withAgyFast.agyCliCalls, 3);
+    assert.equal(split.bySessionKind.swarm.withAgyFast.agyFastLogicalOps, 7);
+    assert.equal(split.bySessionKind.swarm.withAgyFast.totalLogicalOps, 8);
+
+    // Verify markdown renders session types, logical ops, turns/10 ops, and Main Sessions Only apples-to-apples table
+    const md = formatUsageSplitMarkdown(split);
+    assert.match(md, /\| Session types \(main \/ subagent \/ swarm\) \| 2 \/ 1 \/ 1 \| 1 \/ 1 \/ 0 \| 1 \/ 0 \/ 1 \| - \|/);
+    assert.match(md, /\| Logical ops \(agy-fast avg packing\) \| 30 \(agy-fast: 23, 2\.88x avg\) \| 6 \| 24 \(agy-fast: 23, 2\.88x avg\) \| - \|/);
+    assert.match(md, /## Main Sessions Only \(Apples-to-Apples\)/);
+    assert.match(md, /\| LLM turns \/ 10 logical ops \| 3\.50 \| 10\.00 \| 1\.88 \| -81\.2% \|/);
+
+    // Verify CLI --split-usage --json emits bySessionKind end-to-end
+    const splitCliJson = JSON.parse(
+      execFileSync(process.execPath, [BENCHMARK_CLI, "analyze", stratifyDir, "--split-usage", "--json"], {
+        encoding: "utf8",
+      }),
+    );
+    assert.equal(splitCliJson.overall.totalLogicalOps, 30);
+    assert.equal(splitCliJson.bySessionKind.main.withAgyFast.avgAgyFastPacking, 3.2);
+    assert.equal(splitCliJson.bySessionKind.subagent.withoutAgyFast.sessions, 1);
+    assert.equal(splitCliJson.bySessionKind.swarm.withAgyFast.agyCliCalls, 3);
+
+    // Verify --since slicing preserves main vs subagent classification
+    const slicedSubagent = filterStepsByTime(
+      parseTranscriptJsonl(researchSubagent.join("\n")),
+      Date.parse("2026-11-26T03:20:01Z"),
+    );
+    assert.equal(classifySessionKind(slicedSubagent), "subagent");
+
+    // Verify linear-time --cli tokenizer never backtracks on huge pathological command strings
+    const pathologicalCmd = `FOO=1 ${"a ".repeat(20_000)}--cli check "${"x".repeat(10_000)}"`;
+    const t0 = Date.now();
+    const pathoMetrics = analyzeTranscriptSessions([
+      [
+        {
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T03:35:00Z",
+          output_tokens: 10,
+          tool_calls: [{ name: "run_command", args: { CommandLine: pathologicalCmd } }],
+        },
+      ],
+    ]);
+    assert.ok(Date.now() - t0 < 500, "CLI tokenizer should stay linear on large inputs");
+    assert.equal(pathoMetrics.agyCliCalls, 0);
+    assert.equal(pathoMetrics.runCommandCalls, 1);
+
+    // Background task notification (sender=.../task-1) without USER_INPUT must NOT misclassify as subagent
+    const bgTaskOnly = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-26T03:40:00Z",
+          content: "[Message] timestamp=2026-11-26T03:40:00Z sender=conv-1/task-1 content=done",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T03:40:02Z",
+          output_tokens: 50,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+    assert.equal(classifySessionKind(bgTaskOnly), "main");
+  });
+
+  it("rejects JSON array lines as malformed JSONL and discovers all GEMINI_HOME brain surfaces", async () => {
+    const regDir = path.join(tmpDir, "parser-and-gemini-home");
+    await fs.mkdir(regDir, { recursive: true });
+
+    const arrayOnlyFile = path.join(regDir, "arrays-only.jsonl");
+    await fs.writeFile(arrayOnlyFile, "[]\n[1, 2, 3]\n", "utf8");
+    const skipped: SkippedTranscriptFile[] = [];
+    const loaded = await loadSessionsFromFiles([arrayOnlyFile], { skippedFiles: skipped });
+    assert.equal(loaded.length, 0);
+    assert.equal(skipped.length, 1);
+    assert.match(skipped[0]!.reason, /corrupted JSONL \(0 valid steps, 2 malformed lines\)/);
+
+    // GEMINI_HOME discovers antigravity, antigravity-acp, antigravity-cli, and antigravity-ide brains
+    const isoHome = path.join(tmpDir, "iso-empty-home");
+    const isoGemini = path.join(tmpDir, "iso-gemini-home");
+    const surfaces = ["antigravity", "antigravity-acp", "antigravity-cli", "antigravity-ide"];
+    for (const surface of surfaces) {
+      const logDir = path.join(isoGemini, surface, "brain", `${surface}-1`, ".system_generated", "logs");
+      await fs.mkdir(logDir, { recursive: true });
+      await fs.writeFile(
+        path.join(logDir, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T04:00:00Z",
+          output_tokens: 25,
+          tool_calls: [],
+        }) + "\n",
+        "utf8",
+      );
+    }
+    const isoEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: isoHome,
+      USERPROFILE: isoHome,
+      GEMINI_HOME: isoGemini,
+    };
+    delete isoEnv.ANTIGRAVITY_APP_DATA_DIR;
+    const out = JSON.parse(
+      execFileSync(process.execPath, [BENCHMARK_CLI, "analyze", "--local", "--json"], {
+        encoding: "utf8",
+        env: isoEnv,
+      }),
+    );
+    assert.equal(out.sessions, 4);
+    assert.equal(out.totalOutputTokens, 100);
+
+    // --cli slice --symbol / positional path::sym ops counting and MCP symbols ops counting
+    const sliceSymDir = path.join(tmpDir, "slice-symbol-ops");
+    await fs.mkdir(sliceSymDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sliceSymDir, "session.jsonl"),
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T05:00:00Z",
+          content: "<USER_REQUEST>Inspect symbols</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T05:00:01Z",
+          input_tokens: 4_000,
+          cache_read_tokens: 10_000,
+          output_tokens: 150,
+          tool_calls: [
+            {
+              name: "mcp_agy-fast_fast_read_slices",
+              args: { symbols: ["src/a.ts::foo,bar"] },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "agy-fast-mcp --cli slice --symbol src/a.ts::foo,bar src/b.ts#baz src/c.ts:1-10",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T05:00:02Z", content: "ok" }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T05:00:03Z", content: "ok" }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const symReport = await analyzePathsByUsage([sliceSymDir]);
+    // MCP call packs 2 ops (foo, bar); CLI slice packs 2 (--symbol) + 1 (#baz) + 1 (lineRange) = 4 ops -> total 6
+    assert.equal(symReport.overall.agyFastLogicalOps, 6);
+    assert.equal(symReport.overall.agyCliCalls, 1);
+    assert.equal(symReport.overall.agyFastToolCalls.read_slices, 2);
   });
 });

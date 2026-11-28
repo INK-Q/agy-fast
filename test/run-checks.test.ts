@@ -7,10 +7,12 @@ import {
   buildPowerShellUtf8Command,
   decodeProcessOutput,
   execBinaryAsync,
+  extractExplicitWindowsPowerShellInvocation,
   formatPowerShellCommand,
   needsPowerShellOnWindows,
   parseWindowsCodePage,
   resetWindowsShellCache,
+  resolveExplicitWindowsPowerShellExecPath,
   resolveWindowsPowerShell,
   unwrapTrivialWindowsPowerShellCommand,
   withNonInteractiveGitEnv,
@@ -808,6 +810,31 @@ describe("run_checks", () => {
       assert.match(res.text, /CALL_ONE[\r\n]+CALL_TWO/);
     });
 
+    it("executes explicit powershell -Command scripts directly with -NoProfile and UTF-8 OutputEncoding on Windows", async () => {
+      const res = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "explicit-ps-double-quoted",
+            command:
+              'powershell -Command "Write-Output \'✔ 🚀 中文\'; Get-Item package.json | Select-Object -ExpandProperty Name"',
+          },
+          {
+            name: "explicit-ps-single-quoted-pipe",
+            command:
+              "powershell -Command 'Write-Output \"single-pipe-ok\" | ForEach-Object { $_ }'",
+          },
+        ],
+      });
+      assert.equal(res.isError, false);
+      assert.match(res.text, /Checks: 2\/2 passed/);
+      assert.match(res.text, /✔ 🚀 中文/);
+      assert.match(res.text, /package\.json/);
+      assert.match(res.text, /single-pipe-ok/);
+      assert.doesNotMatch(res.text, /\uFFFD/);
+      assert.doesNotMatch(res.text, /Set-PSReadLineOption/);
+    });
+
     it("falls back cleanly without crashing when taskkill is unavailable on command timeout", async () => {
       const savedEnv = { ...process.env };
       const savedPath = process.env.PATH;
@@ -981,5 +1008,107 @@ describe("run_checks", () => {
     const missingCmd = await runChecks({ commands: [{ command: "   " }] });
     assert.equal(missingCmd.isError, true);
     assert.match(missingCmd.text, /\nExample: \{"commands":/);
+  });
+
+  it("extracts standalone explicit Windows powershell/pwsh -Command wrappers while preserving outer chains and custom flags", () => {
+    assert.deepEqual(
+      extractExplicitWindowsPowerShellInvocation(
+        'powershell -Command "Get-ChildItem | Select-Object -First 5"',
+      ),
+      {
+        requestedBin: "powershell.exe",
+        script: "Get-ChildItem | Select-Object -First 5",
+      },
+    );
+    assert.deepEqual(
+      extractExplicitWindowsPowerShellInvocation(
+        "pwsh.exe -NoLogo -NoP -c 'git status; npm test'",
+      ),
+      {
+        requestedBin: "pwsh",
+        script: "git status; npm test",
+      },
+    );
+    assert.deepEqual(
+      extractExplicitWindowsPowerShellInvocation("powershell.exe -Command Get-Date"),
+      {
+        requestedBin: "powershell.exe",
+        script: "Get-Date",
+      },
+    );
+
+    const mustReturnNull = [
+      'powershell -Command "git status" && echo done',
+      'powershell -Command "Get-Date" | findstr 2026',
+      'powershell -ExecutionPolicy Bypass -Command "git status"',
+      "powershell -File build.ps1",
+      "powershell -EncodedCommand Z2l0IHN0YXR1cw==",
+      'powershell -WorkingDirectory C:\\repo -Command "git status"',
+      'powershell -Command "echo %USERPROFILE%"',
+      'powershell -Command "node -e \\"console.log(1)\\""',
+      'powershell -Command "rg foo\\\\"',
+      'powershell -Command "echo a\necho b"',
+      'powershell -NoProfile\n-Command "Get-Date"',
+      'powershell\r\n -Command "Get-Date"',
+      "git status --short",
+    ];
+    for (const cmd of mustReturnNull) {
+      assert.equal(
+        extractExplicitWindowsPowerShellInvocation(cmd),
+        null,
+        `Expected null for: ${cmd}`,
+      );
+    }
+  });
+
+  it("deduplicates concurrent legacy powershell.exe path probes and caches null when absent", async () => {
+    resetWindowsShellCache();
+    try {
+      await resolveWindowsPowerShell(async (bin) => bin === "pwsh");
+      let legacyProbes = 0;
+      const mockLegacyProbe = async (bin: "pwsh" | "powershell.exe") => {
+        legacyProbes++;
+        await new Promise((r) => setTimeout(r, 20));
+        return bin === "powershell.exe"
+          ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+          : null;
+      };
+      const [first, second] = await Promise.all([
+        resolveExplicitWindowsPowerShellExecPath("powershell.exe", mockLegacyProbe),
+        resolveExplicitWindowsPowerShellExecPath("powershell.exe", mockLegacyProbe),
+      ]);
+      assert.equal(
+        first,
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      );
+      assert.equal(second, first);
+      assert.equal(legacyProbes, 1);
+
+      const cached = await resolveExplicitWindowsPowerShellExecPath(
+        "powershell.exe",
+        mockLegacyProbe,
+      );
+      assert.equal(cached, first);
+      assert.equal(legacyProbes, 1);
+
+      resetWindowsShellCache();
+      await resolveWindowsPowerShell(async (bin) => bin === "pwsh");
+      let absentProbes = 0;
+      const mockAbsentProbe = async () => {
+        absentProbes++;
+        return null;
+      };
+      assert.equal(
+        await resolveExplicitWindowsPowerShellExecPath("powershell.exe", mockAbsentProbe),
+        null,
+      );
+      assert.equal(
+        await resolveExplicitWindowsPowerShellExecPath("powershell.exe", mockAbsentProbe),
+        null,
+      );
+      assert.equal(absentProbes, 1);
+    } finally {
+      resetWindowsShellCache();
+    }
   });
 });

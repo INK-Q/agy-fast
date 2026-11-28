@@ -151,12 +151,12 @@ On short turns (<500 output tokens), a cache miss adds **+3.0 s** to median late
 
 | Finding | `agy-fast` Solution | Implementation Summary |
 | :--- | :--- | :--- |
-| Finding 4: 46.3% of shell calls are read-only searches and git checks | **`batch_search` (MCP tool 1)** | Runs up to 20 mixed `text`, `regex`, `glob`, and read-only `git` queries concurrently in one call. Uses `rg` (2.1 ms cold start) with automatic pure-Node.js fallback, strict read-only git allowlist/flag validation, and total output budgets. |
-| Findings 2, 3, 4: 52.5% of `edit_file` calls are same-file splits; edit and verify take separate turns | **`apply_edits` (MCP tool 2)** | Applies multiple non-contiguous edits across multiple files atomically (validates every file and edit in memory before touching disk; preserves CRLF, file permissions, and symlinks; supports line-range narrowing and optional inline `verify` command). |
-| Finding 5: `read_file` accounts for 81.9% of returned context bytes | **`read_slices` (MCP tool 3)** | Extracts multi-language symbol outlines (with line spans) and batch-reads exact line ranges across multiple files in one call under a strict character budget. Keeps built-in `read_file` for 1–4 small files (<300 lines) where the local allowlist is already ~7 ms. |
-| Findings 2, 4, 6: Sequential check commands and verbose pass logs | **`run_checks` (MCP tool 4)** | Executes multiple build/typecheck/lint/test commands concurrently with bounded concurrency, timeouts, ANSI stripping, 1-line pass summaries, and filtered error extraction on failure. |
+| Finding 4: 46.3% of shell calls are read-only searches and git checks | **`batch_search` (MCP tool 1)** | Runs up to 20 mixed `text`, `regex`, `glob`, `fuzzy`, and read-only `git` queries concurrently in one call. Uses `rg` (2.1 ms cold start) with automatic pure-Node.js fallback, strict read-only git allowlist/flag validation, and a hard `<=8.8 KB` UTF-8 inline cap. |
+| Findings 2, 3, 4: 52.5% of `edit_file` calls are same-file splits; edit and verify take separate turns | **`apply_edits` (MCP tool 2)** | Applies multiple non-contiguous edits across up to 50 files atomically (or per-file atomic via `bestEffort: true` with closest-line/drifted-line recovery hints; preserves CRLF, file permissions, and symlinks; supports line-range narrowing and optional inline `verify` command). |
+| Finding 5: `read_file` accounts for 81.9% of returned context bytes | **`quick_outline` & `read_slices` (MCP tools 3 & 4)** | Extracts multi-language symbol outlines across 15 formats (TS/JS, HTML/Vue/Svelte, CSS/SCSS/Less, Python, Godot GDScript, Go, Rust, C/C++/Java/Kotlin/C#/Swift, Shell, Markdown, JSON/YAML) for up to 40 files per call (`quick_outline` uses a flat `paths` array; `read_slices` also piggybacks tiny targeted slices under `<=8.8 KB`). Keeps parallel built-in `read_file` for small files (<300 lines) and known line ranges where the local allowlist is already ~7 ms (`46 KB/call`). |
+| Findings 2, 4, 6: Sequential check commands and verbose pass logs | **`run_checks` (MCP tool 5)** | Executes up to 12 independent build/typecheck/lint/test commands concurrently with bounded concurrency, shared timeout budgets, ANSI stripping, Windows wrapper unwrapping, 1-line pass summaries in `compact` mode, and Head-Tail error folding on failure. |
 | Finding 4: 49.2 s average cold-start exploration in turns 1–3 | **`SessionStart` snapshot hook** | Runs once at session start (~35–50 ms) to inject a <=1.5 KB repository snapshot (git branch, uncommitted changes, last 3 commits, 2-level layout, detected project scripts). Positioned at session start so prompt caching reuses it on every turn. Zero per-tool hooks (`PreToolUse`/`PostToolUse`). |
-| Findings 1, 4: Excess turns and lazy-loaded MCP schema-read overhead | **4 combined tools + inline schemas in `rules/AGENTS.md`** | Limits MCP registration to 4 compact tools (`agy-fast_fast`) and inlines their concise parameter signatures in `rules/AGENTS.md` (~2.2 KB) so the agent invokes `call_mcp_tool` directly without spending a turn reading `<tool>.json` files. |
+| Findings 1, 4: Excess turns and lazy-loaded MCP schema-read overhead | **5 compact tools + eager loading + inline schemas in `rules/AGENTS.md`** | Exposes 5 compact composite tools (`<=1280 B` per-tool schema under `agy-fast_fast` with `"eager": true` for zero-lookup direct calls on eager hosts) and inlines quick schemas in `rules/AGENTS.md` (`~8.5 KB`) so lazy hosts also skip spending a turn reading `<tool>.json` files. |
 
 ### 4.3 Runtime and Distribution Design
 
@@ -188,6 +188,7 @@ Relative to the 55-session single-agent baseline (mean 39.4 turns / 79.2 tool ca
 node dist/benchmark.mjs analyze /path/to/transcripts
 node dist/benchmark.mjs analyze --local
 node dist/benchmark.mjs analyze --local --recent 10
+node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --split-usage
 
 # Compare before vs. after transcripts on the same benchmark tasks
 node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./after/transcript.jsonl

@@ -1348,4 +1348,184 @@ describe("read_slices", () => {
       await fs.rm(bareDir, { recursive: true, force: true });
     }
   });
+
+  it("reads symbol bodies directly via symbols shorthand, object form, nested Python depth, and Rust :: normalization", async () => {
+    const symDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-symbols-"));
+    try {
+      await fs.writeFile(
+        path.join(symDir, "service.py"),
+        [
+          "def health():",
+          "    return 'ok'",
+          "",
+          "class ItemService:",
+          "    def get(self, item_id):",
+          "        return item_id",
+          "",
+          "class Outer:",
+          "    class Inner:",
+          "        def run(self):",
+          "            return 99",
+          "",
+          "        def sibling(self):",
+          "            return 100",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      await fs.writeFile(
+        path.join(symDir, "multi.ts"),
+        [
+          "class A {",
+          "  run() { return 1; }",
+          "}",
+          "class B {",
+          "  run() { return 2; }",
+          "}",
+          "class C {",
+          "  run() { return 3; }",
+          "}",
+          "class D {",
+          "  run() { return 4; }",
+          "}",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      await fs.writeFile(
+        path.join(symDir, "lib.rs"),
+        [
+          "pub struct Foo;",
+          "impl Foo {",
+          "  pub fn bar(&self) -> usize { 1 }",
+          "}",
+          "impl<T> Boxed<T> {",
+          "  pub fn get(&self) -> usize { 2 }",
+          "}",
+          "impl Display for Foo {",
+          "  fn fmt(&self) -> usize { 3 }",
+          "}",
+          "mod utils {",
+          "  pub fn helper() -> usize { 4 }",
+          "}",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      // 1. Nested Python classes get monotonic depth (0 -> 1 -> 2) and qualify Outer.Inner.run cleanly
+      const pyText = await fs.readFile(path.join(symDir, "service.py"), "utf8");
+      const pySyms = extractSymbols("service.py", pyText);
+      const pyByName = new Map(pySyms.map((s) => [s.name, s]));
+      assert.equal(pyByName.get("Outer")?.depth, 0);
+      assert.equal(pyByName.get("Inner")?.depth, 1);
+      assert.equal(pyByName.get("run")?.depth, 2);
+      assert.equal(pyByName.get("sibling")?.depth, 2);
+
+      // 2. Shorthand multi-symbol, Class.method, and Outer.Inner.method qualification
+      const multiSym = await runReadSlices({
+        cwd: symDir,
+        symbols: ["service.py::health,ItemService.get,Outer.Inner.run", "service.py#Inner.sibling"],
+      });
+      assert.equal(multiSym.isError, false);
+      assert.match(multiSym.text, /## Symbols: service\.py/);
+      assert.match(multiSym.text, /--- \[function\] health L1-L2/);
+      assert.match(multiSym.text, /--- \[method\] ItemService\.get L5-L6/);
+      assert.match(multiSym.text, /--- \[method\] Outer\.Inner\.run L10-L11/);
+      assert.match(multiSym.text, /--- \[method\] Outer\.Inner\.sibling L13-L14/);
+
+      // 3. Object form with case-insensitive fallback + NOT FOUND diagnostics
+      const objRes = await runReadSlices({
+        cwd: symDir,
+        symbols: [{ path: "service.py", names: ["OUTER.INNER.RUN", "missing_fn"] }],
+      });
+      assert.equal(objRes.isError, false);
+      assert.match(objRes.text, /--- \[method\] Outer\.Inner\.run L10-L11/);
+      assert.match(objRes.text, /--- Symbol 'missing_fn' NOT FOUND ---/);
+      assert.match(objRes.text, /Available symbols:.*health\(L1\).*Outer\.Inner\.run\(L10\)/);
+
+      // 4. Rust :: container qualification works seamlessly for impl, impl<T>, trait impl, and mod
+      const rustSym = await runReadSlices({
+        cwd: symDir,
+        symbols: [
+          "lib.rs::Foo::bar,Boxed::get,Foo::fmt,utils::helper",
+          "lib.rs::Foo.bar",
+        ],
+      });
+      assert.equal(rustSym.isError, false);
+      assert.match(rustSym.text, /--- \[fn\] Foo\.bar L3-L3/);
+      assert.match(rustSym.text, /--- \[fn\] Boxed\.get L6-L6/);
+      assert.match(rustSym.text, /--- \[fn\] Foo\.fmt L9-L9/);
+      assert.match(rustSym.text, /--- \[fn\] utils\.helper L12-L12/);
+
+      // 5. Ambiguous unqualified hits cap at 3 blocks with omission counter
+      const ambRes = await runReadSlices({
+        cwd: symDir,
+        symbols: ["multi.ts::run"],
+      });
+      assert.equal(ambRes.isError, false);
+      assert.match(ambRes.text, /\.\.\. \(\+1 more matches for 'run'\)/);
+
+      // 6. Bare single-string coercion for `symbols` and object `names`
+      const bareSym = await runReadSlices({
+        cwd: symDir,
+        symbols: "service.py::health" as unknown as string[],
+      });
+      assert.equal(bareSym.isError, false);
+      assert.match(bareSym.text, /--- \[function\] health L1-L2/);
+
+      const bareObjNames = await runReadSlices({
+        cwd: symDir,
+        symbols: [{ path: "service.py", names: "health" as unknown as string[] }],
+      });
+      assert.equal(bareObjNames.isError, false);
+      assert.match(bareObjNames.text, /--- \[function\] health L1-L2/);
+
+      // 7. Windows drive path splits on first `::`
+      const winSym = await runReadSlices({
+        cwd: symDir,
+        symbols: ["C:\\nonexistent-agy-dir\\sample.py::foo"],
+      });
+      assert.equal(winSym.isError, false);
+      assert.match(winSym.text, /## Symbols:.*sample\.py\nERROR:/);
+
+      // 8. Corrupted literals & malformed inputs preserve circuit breaker and example hint
+      for (const lit of ["true", "false", "null"]) {
+        const litRes = await runReadSlices({ cwd: symDir, symbols: lit as unknown as string[] });
+        assert.equal(litRes.isError, true);
+        assert.match(litRes.text, /serialization corruption detected/i);
+      }
+      const nestedNull = await runReadSlices({
+        cwd: symDir,
+        symbols: [{ path: "service.py", names: [null as unknown as string] }],
+      });
+      assert.equal(nestedNull.isError, true);
+      assert.match(nestedNull.text, /serialization corruption detected/i);
+
+      const badShorthand = await runReadSlices({
+        cwd: symDir,
+        symbols: ["service.py"],
+      });
+      assert.equal(badShorthand.isError, true);
+      const exMatch = badShorthand.text.match(/\nExample: (\{.*\})$/);
+      assert.ok(exMatch, badShorthand.text);
+      assert.deepEqual(JSON.parse(exMatch[1]!), { symbols: ["src/app.ts::main,MyClass.run"] });
+
+      // 9. Budget overflow triggers slice truncation tip and honors byte cap
+      await fs.writeFile(
+        path.join(symDir, "huge.py"),
+        "def big():\n" + Array.from({ length: 80 }, (_, idx) => `    x_${idx} = "${"v".repeat(30)}"`).join("\n") + "\n",
+        "utf8",
+      );
+      const capped = await runReadSlices({
+        cwd: symDir,
+        symbols: ["huge.py::big"],
+        maxChars: 1000,
+      });
+      assert.equal(capped.isError, false);
+      assert.match(capped.text, /use parallel read_file\(StartLine, EndLine\)/);
+      assert.ok(Buffer.byteLength(capped.text, "utf8") <= 8800);
+    } finally {
+      await fs.rm(symDir, { recursive: true, force: true });
+    }
+  });
 });

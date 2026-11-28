@@ -58,7 +58,7 @@ export function formatCliUsage(): string {
     "",
     "Commands (aliases):",
     "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
-    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  slice   | read_slices   <path:start-end | path::sym1,sym2...> [--outline <file>] [--symbol <path::sym>] [--cwd <dir>]",
     "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
     "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
@@ -66,7 +66,7 @@ export function formatCliUsage(): string {
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
     "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
-    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--diff] [--verify <cmd>] (JSON via --json or stdin)",
     "",
     "JSON input (works for every command using the exact MCP tool schema):",
     "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
@@ -278,6 +278,7 @@ const VALUE_LONG_FLAGS = new Set([
   "--context",
   "--max-results",
   "--outline",
+  "--symbol",
   "--concurrency",
   "--timeout",
   "--verify",
@@ -299,6 +300,7 @@ interface ParsedCliOptions {
   trailingSearchMods: SearchQueryModifiers;
   // slice flags
   outlineFiles: string[];
+  symbolSpecs: string[];
   // check flags
   outputMode?: "compact" | "full";
   concurrency?: number;
@@ -306,6 +308,7 @@ interface ParsedCliOptions {
   // edit flags
   bestEffort?: boolean;
   dryRun?: boolean;
+  diff?: boolean;
   verify?: string;
   verifyTimeoutSec?: number;
   maxVerifyChars?: number;
@@ -320,6 +323,7 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     implicitTypeQueryIndices: new Set<number>(),
     trailingSearchMods: {},
     outlineFiles: [],
+    symbolSpecs: [],
   };
   let pendingMods: SearchQueryModifiers = {};
   let pendingType: SearchQuery["type"] | undefined;
@@ -481,6 +485,10 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         opts.outlineFiles.push(consumeValue());
         continue;
       }
+      if (arg === "--symbol" || arg === "-s") {
+        opts.symbolSpecs.push(consumeValue());
+        continue;
+      }
     } else if (tool === "run_checks") {
       if (arg === "--compact") {
         opts.outputMode = "compact";
@@ -513,6 +521,10 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
       }
       if (arg === "--dry-run") {
         opts.dryRun = true;
+        continue;
+      }
+      if (arg === "--diff") {
+        opts.diff = true;
         continue;
       }
       if (arg === "--verify") {
@@ -585,7 +597,8 @@ export async function runAgyFastCli(
   const hasShorthandArgs =
     opts.positionals.length > 0 ||
     opts.searchQueries.length > 0 ||
-    opts.outlineFiles.length > 0;
+    opts.outlineFiles.length > 0 ||
+    opts.symbolSpecs.length > 0;
 
   let jsonInput: Record<string, unknown> | null = null;
   try {
@@ -668,16 +681,33 @@ export async function runAgyFastCli(
         ...(opts.maxChars !== undefined ? { maxChars: opts.maxChars } : {}),
       };
     } else {
-      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+      const autoSymbols: string[] = [...opts.symbolSpecs];
+      const lineRanges: string[] = [];
+      for (const pos of opts.positionals) {
+        if (
+          pos.includes("::") ||
+          (pos.includes("#") && !/:\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pos))
+        ) {
+          autoSymbols.push(pos);
+        } else {
+          lineRanges.push(pos);
+        }
+      }
+      if (
+        lineRanges.length === 0 &&
+        opts.outlineFiles.length === 0 &&
+        autoSymbols.length === 0
+      ) {
         stderr.write(
-          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n",
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), symbol specs (e.g. src/a.ts::fn), --outline <file>, --symbol <path::sym>, or JSON input.\n",
         );
         return 1;
       }
       payload = {
         cwd: effectiveCwd,
         ...(opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {}),
-        ...(opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {}),
+        ...(autoSymbols.length > 0 ? { symbols: autoSymbols } : {}),
+        ...(lineRanges.length > 0 ? { lineRanges } : {}),
         ...(opts.maxChars !== undefined ? { maxChars: opts.maxChars } : {}),
       };
     }
@@ -699,6 +729,7 @@ export async function runAgyFastCli(
       cwd: effectiveCwd,
       ...(opts.bestEffort !== undefined ? { bestEffort: opts.bestEffort } : {}),
       ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+      ...(opts.diff !== undefined ? { diff: opts.diff } : {}),
       ...(opts.verify !== undefined ? { verify: opts.verify } : {}),
       ...(opts.verifyTimeoutSec !== undefined
         ? { verifyTimeoutSec: opts.verifyTimeoutSec }

@@ -109,6 +109,7 @@ export const TOOL_VALIDATION_EXAMPLES = {
     '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
   read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
   read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_symbols: '{"symbols":["src/app.ts::main,MyClass.run"]}',
   quick_outline: '{"paths":["src/app.ts"]}',
   run_checks: '{"commands":[{"name":"test","command":"npm test"}]}',
 } as const;

@@ -2,8 +2,8 @@
 
 
 // src/session-start.ts
-import { promises as fs3 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs4 } from "node:fs";
+import path6 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/utils/output-filter.ts
@@ -1065,14 +1065,25 @@ async function boundedRealpath(p, deadlineMs) {
   const res = await raceWithDeadline(fs.realpath(p), deadlineMs);
   return res.ok ? res.value : p;
 }
-async function isHomeOrSystemRoot(workspaceDir, deadlineMs) {
+async function isHomeOrSystemRoot(workspaceDir, deadlineMs, env = process.env) {
   const resolved = path3.resolve(workspaceDir);
   if (path3.parse(resolved).root === resolved) return true;
   if (isSystemUserParentPath(resolved)) return true;
+  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path3.isAbsolute(p);
+  const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
   const homeCandidates = /* @__PURE__ */ new Set();
-  for (const cand of [os2.homedir(), process.env.HOME, process.env.USERPROFILE]) {
-    if (cand && cand.trim()) {
+  for (const cand of [env.HOME, env.USERPROFILE, driveHome]) {
+    if (typeof cand === "string" && cand.trim() && isFullAbsPath(cand.trim())) {
       homeCandidates.add(path3.resolve(cand.trim()));
+    }
+  }
+  if (homeCandidates.size === 0 || env === process.env) {
+    try {
+      const osHome = os2.homedir();
+      if (osHome && isFullAbsPath(osHome)) {
+        homeCandidates.add(path3.resolve(osHome));
+      }
+    } catch {
     }
   }
   const resolvedKey = normalizePathForCompare(resolved);
@@ -1573,11 +1584,177 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   return assembled;
 }
 
-// src/utils/updater-core.ts
-import { spawn as spawn2 } from "node:child_process";
-import { promises as fs2 } from "node:fs";
+// src/utils/session-workspace.ts
+import fs2 from "node:fs";
 import os3 from "node:os";
 import path4 from "node:path";
+function isFullAbsolutePath(dirPath) {
+  return process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(dirPath) : path4.isAbsolute(dirPath);
+}
+function canonicalizeDirSync(dirPath) {
+  const resolved = path4.resolve(dirPath);
+  try {
+    return typeof fs2.realpathSync.native === "function" ? fs2.realpathSync.native(resolved) : fs2.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+function isSameOrSubdir(candidate, root) {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
+  const normRoot = caseInsensitive ? root.toLowerCase() : root;
+  const rel = path4.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path4.sep}`) && !path4.isAbsolute(rel);
+}
+function isInstalledPluginPath(dirPath) {
+  const posix = dirPath.replace(/\\/g, "/");
+  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
+    posix
+  );
+}
+function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.env, options = {}) {
+  const allowLinkedDevCheckout = options.allowLinkedDevCheckout === true;
+  const resolvedCandidate = path4.resolve(candidateDir);
+  const canonCandidate = canonicalizeDirSync(resolvedCandidate);
+  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
+    if (typeof envRoot === "string" && envRoot.trim()) {
+      const trimmedEnvRoot = envRoot.trim();
+      const resolvedEnvRoot = path4.resolve(trimmedEnvRoot);
+      const canonEnvRoot = canonicalizeDirSync(resolvedEnvRoot);
+      if (isSameOrSubdir(canonCandidate, canonEnvRoot)) {
+        if (!allowLinkedDevCheckout) {
+          return trimmedEnvRoot;
+        }
+        const isDevCheckout = fs2.existsSync(
+          path4.join(canonEnvRoot, "src", "mcp-server.ts")
+        );
+        if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
+          return trimmedEnvRoot;
+        }
+      }
+    }
+  }
+  const resolvedScriptRoot = path4.resolve(scriptPluginRoot);
+  const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
+  if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
+    const isRuntimeOnlyInstall = fs2.existsSync(path4.join(canonScriptRoot, "plugin.json")) && !fs2.existsSync(path4.join(canonScriptRoot, "src", "mcp-server.ts"));
+    if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
+      return scriptPluginRoot;
+    }
+  }
+  return null;
+}
+function isPluginInstallDir(candidateDir, scriptPluginRoot, env = process.env, options = {}) {
+  return detectPluginInstallDir(candidateDir, scriptPluginRoot, env, options) !== null;
+}
+function resolveHomeFromEnv(env) {
+  const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
+  for (const cand of [env.HOME, env.USERPROFILE, driveHome]) {
+    if (typeof cand === "string" && cand.trim() && isFullAbsolutePath(cand.trim())) {
+      return path4.resolve(cand.trim());
+    }
+  }
+  try {
+    const osHome = os3.homedir();
+    if (osHome && isFullAbsolutePath(osHome)) {
+      return path4.resolve(osHome);
+    }
+  } catch {
+  }
+  return "";
+}
+function expandLeadingTilde(rawPath, env) {
+  if (rawPath === "~") {
+    return resolveHomeFromEnv(env) || rawPath;
+  }
+  if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
+    const home = resolveHomeFromEnv(env);
+    return home ? path4.join(home, rawPath.slice(2)) : rawPath;
+  }
+  return rawPath;
+}
+function isExistingDirectorySync(dirPath) {
+  try {
+    return fs2.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function collectExplicitWorkspaceCandidates(payload) {
+  const lists = [
+    payload.workspacePaths,
+    payload.workspace_paths,
+    payload.workspaceRoots,
+    payload.workspace_roots
+  ];
+  const out = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (typeof item === "string" && item.trim()) {
+        out.push(item.trim());
+      }
+    }
+  }
+  return out;
+}
+async function resolveSessionWorkspaceDir(payload, scriptPluginRoot, env = process.env) {
+  const rawExplicit = collectExplicitWorkspaceCandidates(payload);
+  const validExplicitRoots = [];
+  for (const item of rawExplicit) {
+    const expanded = expandLeadingTilde(item, env);
+    if (!isFullAbsolutePath(expanded)) continue;
+    const resolved = path4.resolve(expanded);
+    if (isExistingDirectorySync(resolved)) {
+      validExplicitRoots.push(resolved);
+    }
+  }
+  let primaryWorkspace = "";
+  let primaryIsHomeOrRoot = false;
+  let nonHomeExplicitRoots = [];
+  if (validExplicitRoots.length > 0) {
+    const homeFlags = await Promise.all(
+      validExplicitRoots.map((root) => isHomeOrSystemRoot(root, void 0, env))
+    );
+    nonHomeExplicitRoots = validExplicitRoots.filter((_, idx) => !homeFlags[idx]);
+    if (nonHomeExplicitRoots.length > 0) {
+      primaryWorkspace = nonHomeExplicitRoots[0];
+      primaryIsHomeOrRoot = false;
+    } else {
+      primaryWorkspace = validExplicitRoots[0];
+      primaryIsHomeOrRoot = true;
+    }
+  }
+  const rawCwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const expandedCwd = rawCwd ? expandLeadingTilde(rawCwd, env) : "";
+  const resolvedCwd = expandedCwd && isFullAbsolutePath(expandedCwd) ? path4.resolve(expandedCwd) : "";
+  const validCwd = resolvedCwd && isExistingDirectorySync(resolvedCwd) && !isPluginInstallDir(resolvedCwd, scriptPluginRoot, env, {
+    allowLinkedDevCheckout: true
+  }) ? resolvedCwd : "";
+  if (primaryWorkspace && validCwd) {
+    if (await isHomeOrSystemRoot(validCwd, void 0, env)) {
+      return primaryWorkspace;
+    }
+    if (primaryIsHomeOrRoot) {
+      return validCwd;
+    }
+    const canonCwd = canonicalizeDirSync(validCwd);
+    for (const root of nonHomeExplicitRoots) {
+      if (isSameOrSubdir(canonCwd, canonicalizeDirSync(root))) {
+        return validCwd;
+      }
+    }
+    return primaryWorkspace;
+  }
+  return primaryWorkspace || validCwd;
+}
+
+// src/utils/updater-core.ts
+import crypto from "node:crypto";
+import { spawn as spawn2 } from "node:child_process";
+import { promises as fs3, realpathSync } from "node:fs";
+import os4 from "node:os";
+import path5 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
@@ -1589,18 +1766,62 @@ function getHomeDir(env = process.env, platform = process.platform) {
     if (driveHome) return driveHome;
     const home = env.HOME?.trim();
     if (home) return home;
-    return os3.homedir();
+    return os4.homedir();
   }
-  return env.HOME?.trim() || env.USERPROFILE?.trim() || os3.homedir();
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os4.homedir();
 }
-function getUpdaterPaths(env = process.env) {
+function canonicalizePathForStateKey(targetPath, platform = process.platform) {
+  const resolved = path5.resolve(targetPath);
+  const tail = [];
+  let cur = resolved;
+  let canonical = resolved;
+  while (true) {
+    try {
+      const real = typeof realpathSync.native === "function" ? realpathSync.native(cur) : realpathSync(cur);
+      canonical = tail.length > 0 ? path5.join(real, ...tail.reverse()) : real;
+      break;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        canonical = resolved;
+        break;
+      }
+      const parent = path5.dirname(cur);
+      if (parent === cur) {
+        canonical = resolved;
+        break;
+      }
+      tail.push(path5.basename(cur));
+      cur = parent;
+    }
+  }
+  const normalized = path5.resolve(canonical);
+  return platform === "win32" || platform === "darwin" ? normalized.toLowerCase() : normalized;
+}
+function getUpdaterPaths(env = process.env, pluginDir) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const cacheDir = custom ? path4.resolve(custom) : path4.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  const cacheDir = custom ? path5.resolve(custom) : path5.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  let stateDir = cacheDir;
+  if (!custom && pluginDir && pluginDir.trim()) {
+    const defaultGlobalPluginDir = path5.join(
+      getHomeDir(env),
+      ".gemini",
+      "config",
+      "plugins",
+      "agy-fast"
+    );
+    const canonPlugin = canonicalizePathForStateKey(pluginDir);
+    const canonDefault = canonicalizePathForStateKey(defaultGlobalPluginDir);
+    if (canonPlugin !== canonDefault) {
+      const installKey = crypto.createHash("sha256").update(canonPlugin).digest("hex").slice(0, 16);
+      stateDir = path5.join(cacheDir, "installs", installKey);
+    }
+  }
   return {
     cacheDir,
-    stateFile: path4.join(cacheDir, "update-state.json"),
-    configFile: path4.join(cacheDir, "config.json"),
-    lockFile: path4.join(cacheDir, "update.lock")
+    stateFile: path5.join(stateDir, "update-state.json"),
+    configFile: path5.join(cacheDir, "config.json"),
+    lockFile: path5.join(stateDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -1644,7 +1865,7 @@ function parseUpdateChannel(raw) {
 }
 async function readJsonFile(filePath) {
   try {
-    const raw = await fs2.readFile(filePath, "utf8");
+    const raw = await fs3.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
@@ -1655,17 +1876,17 @@ async function readJsonFile(filePath) {
 }
 var tmpWriteSeq = 0;
 async function writeJsonAtomically(filePath, data) {
-  await fs2.mkdir(path4.dirname(filePath), { recursive: true });
+  await fs3.mkdir(path5.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
-  await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+  await fs3.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
-    await fs2.rename(tmpPath, filePath);
+    await fs3.rename(tmpPath, filePath);
   } catch {
     try {
-      await fs2.copyFile(tmpPath, filePath);
+      await fs3.copyFile(tmpPath, filePath);
     } finally {
-      await fs2.rm(tmpPath, { force: true }).catch(() => {
+      await fs3.rm(tmpPath, { force: true }).catch(() => {
       });
     }
   }
@@ -1674,12 +1895,12 @@ async function readUpdaterConfig(env = process.env) {
   const paths = getUpdaterPaths(env);
   return await readJsonFile(paths.configFile) ?? {};
 }
-async function readUpdateState(env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function readUpdateState(env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   return await readJsonFile(paths.stateFile) ?? {};
 }
-async function writeUpdateState(patch, env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function writeUpdateState(patch, env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   const existing = await readJsonFile(paths.stateFile) ?? {};
   const merged = { ...existing, ...patch };
   await writeJsonAtomically(paths.stateFile, merged);
@@ -1717,7 +1938,7 @@ async function resolveUpdaterSettings(env = process.env) {
 }
 async function readInstalledVersion(pluginDir) {
   const manifest = await readJsonFile(
-    path4.join(pluginDir, "plugin.json")
+    path5.join(pluginDir, "plugin.json")
   );
   if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
     return manifest.version.trim();
@@ -1736,15 +1957,15 @@ function shouldTriggerBackgroundCheck(state, nowMs, intervalMs) {
   return true;
 }
 async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = process.env) {
-  const state = await readUpdateState(env);
+  const state = await readUpdateState(env, pluginDir);
   if (state.lastAppliedVersion && state.lastAppliedVersion === currentVersion && state.lastAppliedFrom && state.lastAppliedFrom !== currentVersion && state.notifiedAppliedVersion !== currentVersion) {
-    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env).catch(
+    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env, pluginDir).catch(
       () => {
       }
     );
     return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
   }
-  const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
+  const installerPath = path5.join(pluginDir, "scripts", "install.mjs");
   const isManualInstall = state.availableInstallKind === "symlink" || state.availableInstallKind === "dev-source" || state.availableInstallKind === "git-dirty";
   if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0) {
     if (state.skippedVersion === state.availableVersion || state.notifiedAvailableVersion === state.availableVersion) {
@@ -1752,7 +1973,8 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     }
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
-      env
+      env,
+      pluginDir
     ).catch(() => {
     });
     const ver = state.availableVersion;
@@ -1766,7 +1988,8 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
   if (!state.availableVersion && state.availableCommit && state.availableCommit !== state.lastAppliedCommit && state.notifiedAvailableCommit !== state.availableCommit) {
     await writeUpdateState(
       { notifiedAvailableCommit: state.availableCommit },
-      env
+      env,
+      pluginDir
     ).catch(() => {
     });
     const refLabel = state.availableRef || "main";
@@ -1781,7 +2004,7 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
   return null;
 }
 function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
-  const updaterPath = path4.join(pluginDir, "dist", "updater.mjs");
+  const updaterPath = path5.join(pluginDir, "dist", "updater.mjs");
   try {
     const child = spawn2(
       process.execPath,
@@ -1801,15 +2024,6 @@ function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
 }
 
 // src/session-start.ts
-function firstNonEmptyPath(list) {
-  if (!Array.isArray(list)) return "";
-  for (const item of list) {
-    if (typeof item === "string" && item.trim()) {
-      return item.trim();
-    }
-  }
-  return "";
-}
 var MAX_STDIN_BYTES = 256 * 1024;
 var MAX_SNAPSHOT_BYTES = 1500;
 async function readStdin(timeoutMs = 1500) {
@@ -1912,7 +2126,15 @@ async function main() {
       writeAndExit("{}\n");
       return;
     }
-    const workspaceDir = typeof payload.cwd === "string" && payload.cwd.trim() || firstNonEmptyPath(payload.workspacePaths) || firstNonEmptyPath(payload.workspace_paths) || firstNonEmptyPath(payload.workspaceRoots) || firstNonEmptyPath(payload.workspace_roots);
+    const pluginDir = path6.resolve(
+      path6.dirname(fileURLToPath(import.meta.url)),
+      ".."
+    );
+    const workspaceDir = await resolveSessionWorkspaceDir(
+      payload,
+      pluginDir,
+      process.env
+    );
     if (!workspaceDir) {
       writeAndExit("{}\n");
       return;
@@ -1928,27 +2150,28 @@ async function main() {
     }
     let updateNotice = null;
     try {
-      const pluginDir = path5.resolve(
-        path5.dirname(fileURLToPath(import.meta.url)),
-        ".."
-      );
       const settings = await resolveUpdaterSettings();
       if (settings.mode !== "off") {
         const [currentVersion, state] = await Promise.all([
           readInstalledVersion(pluginDir),
-          readUpdateState()
+          readUpdateState(process.env, pluginDir)
         ]);
         updateNotice = await consumeSnapshotUpdateNotice(
           pluginDir,
-          currentVersion
+          currentVersion,
+          process.env
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
-          const updaterPath = path5.join(pluginDir, "dist", "updater.mjs");
-          const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
+          const updaterPath = path6.join(pluginDir, "dist", "updater.mjs");
+          const hasUpdater = await fs4.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
-            await writeUpdateState({
-              lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
-            }).catch(() => {
+            await writeUpdateState(
+              {
+                lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
+              },
+              process.env,
+              pluginDir
+            ).catch(() => {
             });
             spawnBackgroundUpdateCheck(pluginDir);
           }

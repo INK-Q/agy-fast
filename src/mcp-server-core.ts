@@ -19,6 +19,11 @@ import {
   type ReadSlicesInput,
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
+import {
+  canonicalizeDirSync,
+  detectPluginInstallDir,
+  isFullAbsolutePath,
+} from "./utils/session-workspace.js";
 
 const SERVER_VERSION = "0.3.2";
 const DEFAULT_PLUGIN_ROOT = path.resolve(
@@ -287,36 +292,6 @@ export function printMcpServerHelp(): void {
   );
 }
 
-function canonicalizeDir(dirPath: string): string {
-  const resolved = path.resolve(dirPath);
-  try {
-    return typeof fs.realpathSync.native === "function"
-      ? fs.realpathSync.native(resolved)
-      : fs.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-function isSameOrSubdir(candidate: string, root: string): boolean {
-  const caseInsensitive =
-    process.platform === "win32" || process.platform === "darwin";
-  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
-  const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path.relative(normRoot, normCandidate);
-  return (
-    rel === "" ||
-    (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
-  );
-}
-
-function isInstalledPluginPath(dirPath: string): boolean {
-  const posix = dirPath.replace(/\\/g, "/");
-  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
-    posix,
-  );
-}
-
 function isSameDir(a: string, b: string): boolean {
   const caseInsensitive =
     process.platform === "win32" || process.platform === "darwin";
@@ -330,14 +305,10 @@ function detectNonWorkspaceCwd(
   env: NodeJS.ProcessEnv,
   currentCwd: string,
 ): { dir: string; place: string } | null {
-  const canonCwd = canonicalizeDir(currentCwd);
+  const canonCwd = canonicalizeDirSync(currentCwd);
   if (path.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const isFullAbsPath = (p: string): boolean =>
-    process.platform === "win32"
-      ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p)
-      : path.isAbsolute(p);
   const driveHome =
     process.platform === "win32" &&
     typeof env.HOMEDRIVE === "string" &&
@@ -348,17 +319,17 @@ function detectNonWorkspaceCwd(
       : "";
   const homes = [env.HOME, env.USERPROFILE, driveHome]
     .map((h) => (typeof h === "string" ? h.trim() : ""))
-    .filter((h) => h && isFullAbsPath(h));
+    .filter((h) => h && isFullAbsolutePath(h));
   if (homes.length === 0 && env === process.env) {
     try {
       const osHome = os.homedir();
-      if (isFullAbsPath(osHome)) homes.push(osHome);
+      if (isFullAbsolutePath(osHome)) homes.push(osHome);
     } catch {
       // No home directory to compare against
     }
   }
   for (const home of homes) {
-    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+    if (home && isSameDir(canonCwd, canonicalizeDirSync(home))) {
       return { dir: canonCwd, place: "the home directory" };
     }
   }
@@ -370,28 +341,7 @@ function detectPluginInstallCwd(
   currentCwd: string,
   scriptPluginRoot: string,
 ): string | null {
-  const canonCwd = canonicalizeDir(currentCwd);
-
-  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
-    if (typeof envRoot === "string" && envRoot.trim()) {
-      const canonEnvRoot = canonicalizeDir(envRoot.trim());
-      if (isSameOrSubdir(canonCwd, canonEnvRoot)) {
-        return envRoot.trim();
-      }
-    }
-  }
-
-  const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
-  if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
-    const isRuntimeOnlyInstall =
-      fs.existsSync(path.join(canonScriptRoot, "plugin.json")) &&
-      !fs.existsSync(path.join(canonScriptRoot, "src", "mcp-server.ts"));
-    if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
-      return scriptPluginRoot;
-    }
-  }
-
-  return null;
+  return detectPluginInstallDir(currentCwd, scriptPluginRoot, env);
 }
 
 function buildApplyEditsToolDefinition(
@@ -433,7 +383,7 @@ function buildApplyEditsToolDefinition(
         },
       };
 
-  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files per file, gives closest lines, skips verify on failure. dryRun validates only. verify cmd in cwd after writes (60s/4000 chars, ${MCP_CALL_BUDGET_SEC}s max). diff adds +-2-line diff. 8800B UTF-8 max. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
 
   return {
     name: "apply_edits",
@@ -447,6 +397,7 @@ function buildApplyEditsToolDefinition(
         edits: editsSchema,
         dryRun: { type: "boolean" },
         bestEffort: { type: "boolean" },
+        diff: { type: "boolean" },
         verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",
@@ -668,7 +619,7 @@ export function createAgyFastServer(
     applySchemaCompat({
       name: "read_slices",
       description:
-        "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40), symbol bodies, + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). symbols: 'path::sym1,Cls.m'; lineRanges: 'path:start-end,s2-e2'; slices: 1-based [start,end]. maxChars 8500; 8800B cap.",
       inputSchema: {
         type: "object",
         properties: {
@@ -676,6 +627,11 @@ export function createAgyFastServer(
           outlines: {
             type: "array",
             maxItems: 40,
+            items: { type: "string" },
+          },
+          symbols: {
+            type: "array",
+            maxItems: 30,
             items: { type: "string" },
           },
           slices: {

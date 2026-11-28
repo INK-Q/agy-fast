@@ -159,7 +159,7 @@ node scripts/install.mjs install --project /path/to/your-repo
 | **原生插件清单** | [`plugin.json`](plugin.json) | 符合官方规范的元数据，通过 `agy plugin validate --strict` 零警告校验 |
 | **本地常驻 MCP 服务** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 常驻本地进程，在 `agy-fast_fast` 下以急加载（`"eager": true`）暴露 5 个强类型合并工具 |
 | **会话启动快照钩子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 仅在 `SessionStart` 运行一次（`~35–50 ms`，内置 `250 ms` 扫描熔断与系统/用户目录黑名单），注入 `≤1.5 KB` 项目/Git/目录快照 |
-| **工具路由与卫生规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 `6.5 KB` 精简路由规则，内联参数签名（支持自定义 `rules/AGENTS.local.md`，需带 `trigger: always_on` frontmatter，更新与重装自动保留） |
+| **工具路由与卫生规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 `8.5 KB` 精简路由规则，内联参数签名（支持自定义 `rules/AGENTS.local.md`，需带 `trigger: always_on` frontmatter，更新与重装自动保留） |
 | **后台自动更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 4 小时分离式后台检查，先暂存执行 MCP 冒烟校验再原子替换 |
 | **离线基准测试工具** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | 本地解析 `transcript.jsonl` 并输出单次指标或前后 A/B 对比 |
 
@@ -218,6 +218,11 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | 同轮多处/跨文件编辑，或“编辑 + 校验” | **`apply_edits`** | 原子或 `bestEffort` 落盘 + 可选内联 `verify` |
 | 执行 ≥2 条独立构建、检查、测试或诊断命令 | **`run_checks`** | 受控并发执行，头尾折叠提取核心报错与测试汇总 |
 
+> [!NOTE]
+> **Antigravity 急加载：** Antigravity 是一等插件目标——`agy-fast` 为其提供 `hooks.json` 钩子、`rules/AGENTS.md` 规则、安装脚本与零延迟自动更新器。急加载模式下，宿主会为每次 `mcp_agy-fast_fast_*` 调用注入必填参数 `toolSummary`（详见 [`rules/AGENTS.md` Quick Schemas](rules/AGENTS.md)）；该注入是 Antigravity 急加载行为——懒加载 `call_mcp_tool` 调用与独立 MCP 宿主不受影响。请附带该参数（一段简短的调用目的说明），否则首轮调用会直接报 `missing property 'toolSummary'`。
+>
+> **标准 MCP 宿主（Codex、Claude Code 等）：** 通过 `npx -y agy-fast mcp`（或 `node <插件目录>/scripts/install.mjs mcp`）自助挂载同一服务，并通过 `npx -y agy-fast mcp-config --rules` 输出宿主无关的路由规则（或参见 Quick Start 的独立 MCP 小节）——无需手动接线 `dist/mcp-server.mjs`——并可选传 `--tools`（工具子集）与/或 `--schema-compat=minimal`（适配严格 JSON Schema 子集宿主；运行时校验不受影响）。
+
 ### 1. `batch_search` — 并发代码检索、模糊路径与只读 Git 查询
 - **单次最多 20 条混合查询**：支持 `text`、`regex`、`glob`、`fuzzy` 与只读 `git`（`status`、`diff`、`log`、`show`、`branch`、`rev-parse`、`ls-files`、`blame`、`shortlog`、`describe`、`tag --list`、`remote -v`），并支持按条传入 `path` 跨目录/跨仓库查询。
 - **精细控制**：支持 `fileType`（如 `typescript`、`python`、`gdscript`）与 `glob` 过滤、`outputMode`（`content` | `files_with_matches` | `count`）、跨行匹配 `multiline: true`（此时 `count` 统计逐文件匹配次数）、`type: "fuzzy"` 忽略大小写模糊路径查找以及 `glob` 的 `sortBy: "mtime"` 最新修改优先排序。
@@ -275,14 +280,15 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **健康检查** *（Node 版本、`rg`、MCP 实时握手、`SessionStart` 延迟、严格清单校验）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor` |
 | **仅检查更新** *（不修改文件）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check` |
 | **立即更新并自检** *（先暂存冒烟校验再替换）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
+| **交互式更新 / 跳过指定版本** *（`[y]es/[n]o/[s]kip`，传 `none` 清除）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --prompt` *（或 `update --skip-version <ver\|none>`）* |
 | **配置自动更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
-| **切换 MCP 工具加载模式** *（`eager` \| `lazy`，自动更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
+| **切换 MCP 加载模式 / 编辑参数格式** *（`--tool-loading eager\|lazy`、`--edits-format auto\|array\|string`，自动更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` *（或 `config --edits-format array`）* |
 | **CLI 直调模式** *（供 Swarm Worker 及无 MCP 环境通过 `run_command` 调用）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
 | **独立 MCP Stdio 服务** *（供标准 MCP 客户端挂载；透传 `--tools`、`--schema-compat=minimal`、`--cli`）* | `npx -y agy-fast mcp` *（或 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp`）* |
 | **生成 MCP 配置 / 通用规则** *（`--host mcp-only\|json\|generic\|antigravity`、`--tools`、`--rules`）* | `npx -y agy-fast mcp-config --rules` *（或 `node .../scripts/install.mjs mcp-config`）* |
 | **一键干净卸载** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
-> 在本地克隆目录中，也可直接使用 `./install.sh <子命令>`（macOS/Linux）或 `.\install.ps1 <子命令>`（Windows）执行上述全部子命令。
+> 在本地克隆目录中，也可直接使用 `./install.sh <子命令>`（macOS/Linux）或 `.\install.ps1 <子命令>`（Windows）执行相同的插件管理子命令（`doctor`、`update`、`config`、`uninstall`）。
 
 ### 零启动延迟的后台自动更新
 
@@ -296,9 +302,11 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | 环境变量 | 可选值 / 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `AGY_FAST_AUTO_UPDATE` | `auto` *（默认）* \| `notify` \| `off` | 覆盖已保存的自动更新模式 |
-| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *（默认；`1..720`）* | 后台检查间隔（小时） |
+| `AGY_FAST_UPDATE_INTERVAL_HOURS` | `4` *（默认；`0.01..720`；CLI `--interval` 为 `1..720`）* | 后台检查间隔（小时） |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *（默认）* \| `main` | 跟踪稳定发版标签或 `main` 分支 |
 | `AGY_FAST_REPO` | Git 仓库地址 | 自定义镜像或 Fork 仓库地址 |
+| `AGY_FAST_TOOL_LOADING` | `eager` *（默认）* \| `lazy` | 覆盖安装/更新时写入 `mcp_config.json` 的 MCP 工具加载模式（亦支持 `config --tool-loading`） |
+| `AGY_FAST_CACHE_DIR` | 目录路径 *（默认 `~/.gemini/cache/agy-fast`）* | 覆盖本地缓存目录（存放 `config.json`、更新状态与锁文件） |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（默认）* \| `array` \| `string` | 控制 `apply_edits.edits` 参数格式策略（`auto` 在支持 `"eager": true` 的 CLI ≥1.5.8、桌面端 2.0、IDE 与第三方客户端统一走省 token 的强类型原生数组，在旧版懒加载 CLI 1.5.0–1.5.7 自动切换为 JSON 数组字符串以防 `[]` 丢参；服务端始终同时兼容两种格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手动覆盖自动探测到的 Antigravity 宿主端类型与版本 |
 | `AGY_FAST_TOOLS` | 逗号分隔工具名 *（默认全部 5 个）* | 仅暴露指定的 MCP 工具子集（亦支持 `--tools <列表>`） |
@@ -344,7 +352,7 @@ npm install
 npm run typecheck   # TypeScript 严格类型检查
 npm run build       # 使用 esbuild 打包 src/*.ts -> dist/*.mjs
 npm test            # 运行单元测试、MCP 协议测试、Hook 测试、基准测试与安装器测试
-npm run bench:stress # 运行 12 场景端到端压测与性能基准套件
+npm run bench:stress # 运行 11 场景端到端压测与性能基准套件（传 --real-repo=<path> 可启用第 12 实仓场景）
 npm run validate    # 运行 `agy plugin validate --strict .`
 ```
 

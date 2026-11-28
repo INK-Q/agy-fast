@@ -115,8 +115,10 @@ async function discoverLocalBrainDirs(
   // Also discover brains under an explicit isolated GEMINI_HOME or ANTIGRAVITY_APP_DATA_DIR
   const envGeminiHome = env.GEMINI_HOME?.trim();
   if (envGeminiHome) {
+    await addIfExistingDir(path.join(envGeminiHome, "antigravity", "brain"));
     await addIfExistingDir(path.join(envGeminiHome, "antigravity-acp", "brain"));
     await addIfExistingDir(path.join(envGeminiHome, "antigravity-cli", "brain"));
+    await addIfExistingDir(path.join(envGeminiHome, "antigravity-ide", "brain"));
   }
   const envAppDataDir = env.ANTIGRAVITY_APP_DATA_DIR?.trim();
   if (envAppDataDir) {

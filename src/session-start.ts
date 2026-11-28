@@ -8,6 +8,7 @@ import {
   resolveHostCompat,
 } from "./utils/host-compat.js";
 import { buildWorkspaceSnapshot } from "./utils/snapshot.js";
+import { resolveSessionWorkspaceDir } from "./utils/session-workspace.js";
 import {
   consumeSnapshotUpdateNotice,
   readInstalledVersion,
@@ -32,16 +33,6 @@ interface SessionStartPayload {
   model_name?: string;
   hookEventName?: string;
   hook_event_name?: string;
-}
-
-function firstNonEmptyPath(list: unknown): string {
-  if (!Array.isArray(list)) return "";
-  for (const item of list) {
-    if (typeof item === "string" && item.trim()) {
-      return item.trim();
-    }
-  }
-  return "";
 }
 
 const MAX_STDIN_BYTES = 256 * 1024;
@@ -163,12 +154,15 @@ async function main(): Promise<void> {
       return;
     }
 
-    const workspaceDir =
-      (typeof payload.cwd === "string" && payload.cwd.trim()) ||
-      firstNonEmptyPath(payload.workspacePaths) ||
-      firstNonEmptyPath(payload.workspace_paths) ||
-      firstNonEmptyPath(payload.workspaceRoots) ||
-      firstNonEmptyPath(payload.workspace_roots);
+    const pluginDir = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+    );
+    const workspaceDir = await resolveSessionWorkspaceDir(
+      payload,
+      pluginDir,
+      process.env,
+    );
 
     if (!workspaceDir) {
       writeAndExit("{}\n");
@@ -188,19 +182,16 @@ async function main(): Promise<void> {
 
     let updateNotice: string | null = null;
     try {
-      const pluginDir = path.resolve(
-        path.dirname(fileURLToPath(import.meta.url)),
-        "..",
-      );
       const settings = await resolveUpdaterSettings();
       if (settings.mode !== "off") {
         const [currentVersion, state] = await Promise.all([
           readInstalledVersion(pluginDir),
-          readUpdateState(),
+          readUpdateState(process.env, pluginDir),
         ]);
         updateNotice = await consumeSnapshotUpdateNotice(
           pluginDir,
           currentVersion,
+          process.env,
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
           const updaterPath = path.join(pluginDir, "dist", "updater.mjs");
@@ -209,9 +200,13 @@ async function main(): Promise<void> {
             .then(() => true)
             .catch(() => false);
           if (hasUpdater) {
-            await writeUpdateState({
-              lastCheckAttemptAt: new Date().toISOString(),
-            }).catch(() => {});
+            await writeUpdateState(
+              {
+                lastCheckAttemptAt: new Date().toISOString(),
+              },
+              process.env,
+              pluginDir,
+            ).catch(() => {});
             spawnBackgroundUpdateCheck(pluginDir);
           }
         }

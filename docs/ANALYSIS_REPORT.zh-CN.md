@@ -153,12 +153,12 @@ Antigravity 在工具执行前会先运行本地规则检查（耗时 10~80 微�
 
 | 发现的问题 | `agy-fast` 对应方案 | 技术实现要点 |
 | :--- | :--- | :--- |
-| 问题 4：46.3% 的 `run_command` 为只读搜索与 git 查询，且连续单命令轮次多 | **`batch_search`（MCP 工具 1）** | 单次调用接收最多 20 条混合查询（`text`、`regex`、`glob`、只读 `git`），进程内 `Promise.all` 并发执行；优先调用本地 `rg`（2.1ms 启动），无 `rg` 时自动回退 Node.js 并发遍历；对 `git` 实施严格只读白名单与参数校验；统一按字符预算截断。 |
-| 问题 2、3、4：52.5% 的 `edit_file` 为同轮同文件拆分，触发线性串行审查与流式等待；编辑与校验分离 | **`apply_edits`（MCP 工具 2）** | 单次调用完成单文件多处或跨文件修改，支持指定行号范围、保留 CRLF 换行、保留文件权限与软链接；先在内存中校验全部匹配与重叠冲突（全部通过才写入磁盘，任一失败则 0 文件修改）；支持可选内联 `verify` 命令，修改完成后立即校验并返回精简结果。 |
-| 问题 5：`read_file` 占工具返回体积 81.9%，引发大上下文与重复分段重读 | **`read_slices`（MCP 工具 3）** | 一次调用同时支持提取多语言顶层符号大纲（TS/JS、Python、Go、Rust、C/Java/Kotlin/C#/Swift、Shell、Markdown、JSON/YAML 的起止行号）和批量按精确行段读取多文件片段；内置总字符预算。中小整文件（<300 行）继续沿用本地白名单内置 `read_file`。 |
-| 问题 2、4、6：构建/类型检查/测试多条命令串行运行且输出冗长 | **`run_checks`（MCP 工具 4）** | 在本地并发池中同时执行多项检查命令并控制超时；默认 `compact` 模式在命令通过时仅输出 1 行摘要，失败时清除 ANSI 控制符并提取报错行及尾部日志。 |
+| 问题 4：46.3% 的 `run_command` 为只读搜索与 git 查询，且连续单命令轮次多 | **`batch_search`（MCP 工具 1）** | 单次调用接收最多 20 条混合查询（`text`、`regex`、`glob`、`fuzzy`、只读 `git`），进程内 `Promise.all` 并发执行；优先调用本地 `rg`（2.1ms 启动），无 `rg` 时自动回退 Node.js 并发遍历；对 `git` 实施严格只读白名单与参数校验；死守 `≤8.8 KB` UTF-8 内联上限。 |
+| 问题 2、3、4：52.5% 的 `edit_file` 为同轮同文件拆分，触发线性串行审查与流式等待；编辑与校验分离 | **`apply_edits`（MCP 工具 2）** | 单次调用完成单文件多处或最多 50 个文件的跨文件修改，支持指定行号范围、保留 CRLF 换行、保留文件权限与软链接；默认全内存校验后原子落盘，或通过 `bestEffort: true` 按文件原子提交并返回最相近行/漂移行提示；支持可选内联 `verify` 命令，修改完成后立即校验并返回精简结果。 |
+| 问题 5：`read_file` 占工具返回体积 81.9%，引发大上下文与重复分段重读 | **`quick_outline` 与 `read_slices`（MCP 工具 3、4）** | 支持 15 种格式（TS/JS、HTML/Vue/Svelte、CSS/SCSS/Less、Python、Godot GDScript、Go、Rust、C/C++/Java/Kotlin/C#/Swift、Shell、Markdown、JSON/YAML）多语言符号大纲提取，单次最多 40 个文件（`quick_outline` 采用扁平 `paths` 数组；`read_slices` 可在 `≤8.8 KB` 预算内顺带读取少量小切片）。小文件（<300 行）与已知行号区间继续并行调用本地白名单内置 `read_file`（`~7 ms`、单次 `46 KB`）。 |
+| 问题 2、4、6：构建/类型检查/测试多条命令串行运行且输出冗长 | **`run_checks`（MCP 工具 5）** | 在本地并发池中同时执行最多 12 条独立检查命令并控制共享超时预算；自动清理 ANSI 控制符并透明解包 Windows 冗余 PowerShell 包装；默认 `compact` 模式在命令通过时仅输出 1 行摘要，失败时采用头尾折叠保留首条根因与末尾汇总。 |
 | 问题 4：会话前 3 轮平均消耗 49.2 秒用于初始目录与状态探索 | **`SessionStart` 一次性快照钩子** | 会话启动时运行单文件脚本（实测耗时约 35~50ms），注入不超过 1.5 KB 的仓库结构快照（git 分支、未提交修改、最近 3 条提交、2 层目录树、构建脚本清单）。位于会话最前端，后续轮次持续命中提示词缓存。绝不注册 `PreToolUse`/`PostToolUse` 以避免每步额外延迟。 |
-| 问题 1、4：单工具串行轮次过多，且延迟加载 MCP 工具首次需额外读取 schema 文件 | **精简 4 工具 + `rules/AGENTS.md` 内联参数签名** | 仅暴露 4 个合并操作工具（`agy-fast_fast`），并在约 2.2 KB 的 `rules/AGENTS.md` 中直接提供 4 个工具的简明参数签名与调用路由，使模型首轮即可直接调用 `call_mcp_tool`，免去先读 `.json` 定义文件的额外轮次。 |
+| 问题 1、4：单工具串行轮次过多，且延迟加载 MCP 工具首次需额外读取 schema 文件 | **精简 5 工具 + 急加载 + `rules/AGENTS.md` 内联参数签名** | 在 `agy-fast_fast` 下暴露 5 个单工具 Schema `≤1280 B` 的合并工具（支持 `"eager": true` 急加载直调），并在约 `8.5 KB` 的 `rules/AGENTS.md` 中内联简明参数签名与路由规则，使旧版懒加载宿主同样免去先读 `<tool>.json` 的额外轮次。 |
 
 ### 4.3 技术栈选择依据
 
@@ -190,6 +190,7 @@ Antigravity 在工具执行前会先运行本地规则检查（耗时 10~80 微�
 node dist/benchmark.mjs analyze /path/to/transcripts
 node dist/benchmark.mjs analyze --local
 node dist/benchmark.mjs analyze --local --recent 10
+node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --split-usage
 
 # 对同一任务在启用插件前后的轨迹做 A/B 指标对比
 node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./after/transcript.jsonl

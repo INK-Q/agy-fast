@@ -385,6 +385,11 @@ describe("MCP Stdio Server end-to-end", () => {
         );
       }
       const applyTool = tools.find((t) => t.name === "apply_edits")!;
+      assert.deepEqual(
+        (applyTool.inputSchema as { properties?: Record<string, unknown> }).properties?.diff,
+        { type: "boolean" },
+        `apply_edits (${mode} mode) must expose optional boolean 'diff' within <= 1280B budget`,
+      );
       if (mode === "array") {
         assert.doesNotMatch(
           applyTool.description,
@@ -1045,6 +1050,102 @@ describe("MCP Stdio Server end-to-end", () => {
       const emptyRootCall = emptyRootsLines.find((l) => l.id === 2);
       assert.equal(emptyRootCall?.result?.isError, true);
       assert.match(emptyRootCall?.result?.content?.[0]?.text ?? "", /'cwd' is required.*plugin directory/i);
+
+      // 4. `install.mjs install --link` (`PLUGIN_ROOT` symlinked to a dev checkout containing
+      //    `src/mcp-server.ts`) still fails closed when omitted/relative cwd is passed without
+      //    roots/list — both when spawned from the symlink AND when `process.cwd()` resolves
+      //    to the physical `<dev-checkout>` path (POSIX getcwd behavior).
+      const fakeDevCheckout = path.join(fakeRoot, "dev-checkout");
+      const linkedPluginDir = path.join(fakeRoot, ".gemini", "config", "plugins", "agy-fast-linked");
+      await fs.mkdir(path.join(fakeDevCheckout, "src"), { recursive: true });
+      await fs.mkdir(path.join(fakeDevCheckout, "dist"), { recursive: true });
+      await fs.copyFile(path.resolve(process.cwd(), "plugin.json"), path.join(fakeDevCheckout, "plugin.json"));
+      await fs.writeFile(path.join(fakeDevCheckout, "src", "mcp-server.ts"), "export {};\n", "utf8");
+      await fs.copyFile(MCP_SERVER_SCRIPT, path.join(fakeDevCheckout, "dist", "mcp-server.mjs"));
+      let createdDevLink = false;
+      try {
+        await fs.symlink(
+          fakeDevCheckout,
+          linkedPluginDir,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        createdDevLink = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EPERM") throw err;
+      }
+      if (createdDevLink) {
+        for (const spawnCwd of [linkedPluginDir, fakeDevCheckout]) {
+          const linkRes = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+            (resolve, reject) => {
+              const child = spawn(
+                process.execPath,
+                [path.join(linkedPluginDir, "dist", "mcp-server.mjs")],
+                {
+                  cwd: spawnCwd,
+                  stdio: ["pipe", "pipe", "pipe"],
+                  windowsHide: true,
+                  env: buildCleanServerEnv({ PLUGIN_ROOT: linkedPluginDir }),
+                },
+              );
+              let stdout = "";
+              let stderr = "";
+              child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+              child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+              child.on("error", reject);
+              child.on("close", (code) => resolve({ code, stdout, stderr }));
+              for (const m of [
+                {
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "initialize",
+                  params: {
+                    protocolVersion: "2025-11-25",
+                    capabilities: {},
+                    clientInfo: { name: "hub", version: "2.35.2" },
+                  },
+                },
+                { jsonrpc: "2.0", method: "notifications/initialized" },
+                {
+                  jsonrpc: "2.0",
+                  id: 2,
+                  method: "tools/call",
+                  params: {
+                    name: "apply_edits",
+                    arguments: {
+                      dryRun: true,
+                      edits: [{ path: "rogue.txt", create: "nope" }],
+                    },
+                  },
+                },
+                {
+                  jsonrpc: "2.0",
+                  id: 3,
+                  method: "tools/call",
+                  params: {
+                    name: "apply_edits",
+                    arguments: {
+                      cwd: "src",
+                      edits: [{ path: "rogue.txt", create: "nope" }],
+                    },
+                  },
+                },
+              ]) {
+                child.stdin.write(`${JSON.stringify(m)}\n`);
+              }
+              child.stdin.end();
+            },
+          );
+          assert.equal(linkRes.code, 0, `stderr (${spawnCwd}): ${linkRes.stderr}`);
+          const linkLines = linkRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+          const omittedResp = linkLines.find((l) => l.id === 2);
+          assert.equal(omittedResp?.result?.isError, true, `Expected omitted cwd to fail for ${spawnCwd}`);
+          assert.match(omittedResp?.result?.content?.[0]?.text ?? "", /'cwd' is required.*plugin directory/i);
+          const relativeResp = linkLines.find((l) => l.id === 3);
+          assert.equal(relativeResp?.result?.isError, true, `Expected relative cwd to fail for ${spawnCwd}`);
+          assert.match(relativeResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path/i);
+          await assert.rejects(fs.access(path.join(fakeDevCheckout, "rogue.txt")));
+        }
+      }
     } finally {
       await fs.rm(fakeRoot, { recursive: true, force: true });
     }
