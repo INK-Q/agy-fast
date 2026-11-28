@@ -1061,6 +1061,7 @@ function splitLongFlag(raw, valueFlags) {
 var CLI_CHECK_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--output-mode",
   "--concurrency",
@@ -1160,6 +1161,7 @@ var CLI_SEARCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
   ...CLI_SEARCH_QUERY_FLAGS,
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--type",
   "--path",
@@ -1175,6 +1177,7 @@ var CLI_SEARCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
 var CLI_EDIT_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--verify",
   "--verify-timeout",
@@ -1183,11 +1186,12 @@ var CLI_EDIT_VALUE_FLAGS = /* @__PURE__ */ new Set([
 var CLI_SLICE_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
+  "--from-file",
   "--json",
   "--outline",
   "-o"
 ]);
-var CLI_OUTLINE_VALUE_FLAGS = /* @__PURE__ */ new Set(["--cwd", "--max-chars", "--json"]);
+var CLI_OUTLINE_VALUE_FLAGS = /* @__PURE__ */ new Set(["--cwd", "--max-chars", "--from-file", "--json"]);
 function countCliLogicalOps(inv, runChecksInfo) {
   const { tool, args } = inv;
   if (tool === "run_checks") {
