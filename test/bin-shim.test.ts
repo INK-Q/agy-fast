@@ -70,10 +70,27 @@ function runShimCommand(
   args: string[],
   env: NodeJS.ProcessEnv,
 ): { status: number; stdout: string; stderr: string } {
+  if (IS_WIN) {
+    const quoteWin = (s: string) => `"${s.replace(/"/g, '""')}"`;
+    const cmdLine = [quoteWin(command), ...args.map(quoteWin)].join(" ");
+    const res = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${cmdLine}"`], {
+      env,
+      encoding: "utf8",
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
+    if (res.error) {
+      throw res.error;
+    }
+    return {
+      status: res.status ?? 1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+    };
+  }
   const res = spawnSync(command, args, {
     env,
     encoding: "utf8",
-    shell: IS_WIN,
     windowsHide: true,
   });
   if (res.error) {
@@ -158,7 +175,7 @@ describe("installer --bin-shim", () => {
     const home = path.join(tmpRoot, "case-custom-dir-home");
     const customBin = path.join(tmpRoot, "custom bin dir", "nested");
     const pluginDir1 = path.join(tmpRoot, "case-custom-plugin-1");
-    const pluginDir2 = path.join(tmpRoot, "case-custom-plugin-2");
+    const pluginDir2 = path.join(tmpRoot, "case custom plugin 2");
     await fs.mkdir(home, { recursive: true });
 
     const env = makeIsolatedEnv(home);
@@ -209,6 +226,7 @@ describe("installer --bin-shim", () => {
       { env, encoding: "utf8" },
     );
     const cliShim = path.join(customBin, shimFileName("agy-fast"));
+    const mcpShim = path.join(customBin, shimFileName("agy-fast-mcp"));
     if (!IS_WIN) {
       assert.equal(
         await fs.realpath(cliShim),
@@ -222,6 +240,10 @@ describe("installer --bin-shim", () => {
     const res = runShimCommand(cliShim, ["--help"], env);
     assert.equal(res.status, 0, res.stderr);
     assert.match(res.stdout, /agy-fast installer/);
+
+    const mcpRes = runShimCommand(mcpShim, ["--cli", "--help"], env);
+    assert.equal(mcpRes.status, 0, mcpRes.stderr);
+    assert.match(mcpRes.stdout, /agy-fast direct CLI mode/);
   });
 
   it("prints a non-fatal actionable hint without modifying shell rc files when no user PATH bin dir exists", async () => {
