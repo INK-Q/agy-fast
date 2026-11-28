@@ -734,4 +734,107 @@ describe("output-filter", () => {
     assert.equal(crossFoldMeta.collapsedLines, 0);
     assert.match(crossFoldMeta.text, /PASS src\/a0\.test\.ts ✕ note/);
   });
+
+  it("folds pytest dot and verbose parametrized passing lines and preserves generalized root-cause headers", () => {
+    // 1. Verbose PASSED lines (including spaced & nested `[...]` params and domain words) fold cleanly,
+    //    while failures or lines containing PASSED outside the verdict remain untouched
+    const verboseMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "tests/test_api.py::test_parse[hello world] PASSED [ 10%]",
+        "tests/test_api.py::TestSuite::test_ok[a b c] PASSED [ 20%]",
+        "tests/test_error_handling.py::test_timeout[items=[1, 2]] PASSED [ 30%]",
+        "tests/test_ok.py::test_basic PASSED [ 40%]",
+        "tests/test_api.py::test_parse[hello world] FAILED - expected PASSED",
+        "FAILED tests/test_api.py::test_parse[bad] - AssertionError: PASSED",
+        ...Array.from({ length: 16 }, (_, i) => `trailing summary context ${i}`),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2000,
+    });
+    assert.equal(verboseMeta.collapsedLines, 4);
+    assert.match(verboseMeta.text, /test_parse\[hello world\] FAILED - expected PASSED/);
+    assert.match(verboseMeta.text, /FAILED tests\/test_api\.py::test_parse\[bad\]/);
+
+    // 2. Dot-progress files with 1-2+ dots and domain-word filenames (e.g. test_error_*.py) fold cleanly,
+    //    while mixed/failed dot markers (..F., .E) are never folded
+    const dotMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "tests/test_a.py . [ 10%]",
+        "tests/test_b.py .. [ 20%]",
+        "tests/test_error_handling.py .... [ 50%]",
+        "tests/test_timeout_retry.py .. [ 75%]",
+        "tests/test_mixed.py ..F. [ 85%]",
+        "tests/test_err.py .E [ 95%]",
+        ...Array.from({ length: 16 }, (_, i) => `dot summary tail ${i}`),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2000,
+    });
+    assert.equal(dotMeta.collapsedLines, 4);
+    assert.doesNotMatch(dotMeta.text, /test_error_handling\.py \.\.\.\./);
+    assert.match(dotMeta.text, /test_mixed\.py \.\.F\./);
+    assert.match(dotMeta.text, /test_err\.py \.E/);
+
+    // 3. Tight budget keeps generalized pytest root-cause headers (assert, builtin, dotted, custom *Error/*Exception)
+    for (const rootLine of [
+      "E       assert 1 == 2",
+      "E   FileNotFoundError: missing.json",
+      "E   pydantic.ValidationError: 1 validation issue",
+      "E   CustomDomainError: bad state",
+    ]) {
+      const tightRoot = formatCompactCommandOutputWithMeta({
+        stdout: [
+          ...Array.from({ length: 10 }, (_, i) => `tests/test_ok.py::test_ok_${i} PASSED [ 10%]`),
+          ...Array.from({ length: 15 }, (_, i) => `unmatched setup detail ${i}`),
+          "    def test_case():",
+          rootLine,
+          ...Array.from({ length: 60 }, (_, i) => `cascade traceback detail ${i} ${"z".repeat(30)}`),
+          "FAILED tests/test_auth.py::test_token - assertion summary",
+        ].join("\n"),
+        stderr: "",
+        exitCode: 1,
+        timedOut: false,
+        maxChars: 900,
+      });
+      assert.equal(tightRoot.truncated, true);
+      assert.ok(tightRoot.text.includes(rootLine), `Missing root-cause line: ${rootLine}\n${tightRoot.text}`);
+      assert.match(tightRoot.text, /FAILED tests\/test_auth\.py::test_token/);
+    }
+
+    // 4. Lowercase prose starting with `e  assert` is NOT promoted as a pytest E root-cause header
+    const lowerE = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "e   assert lowercase prose should not capture block",
+        ...Array.from({ length: 10 }, (_, i) => `filler line ${i} ${"x".repeat(40)}`),
+        "E   ValueError: real uppercase pytest error",
+        ...Array.from({ length: 20 }, (_, i) => `tail line ${i}`),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 500,
+    });
+    assert.doesNotMatch(lowerE.text, /e\s+assert lowercase prose/);
+    assert.match(lowerE.text, /E\s+ValueError: real uppercase pytest error/);
+
+    // 5. Adversarial unbalanced bracket line stays strictly linear-time
+    const start = performance.now();
+    const adv = formatCompactCommandOutputWithMeta({
+      stdout: [
+        `tests/test_adv.py::test_x[${"[a".repeat(15_000)} PASSED`,
+        ...Array.from({ length: 16 }, (_, i) => `adv tail ${i}`),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 1000,
+    });
+    const elapsedMs = performance.now() - start;
+    assert.ok(elapsedMs < 200, `Expected linear-time < 200ms, took ${elapsedMs.toFixed(1)}ms`);
+    assert.equal(adv.collapsedLines, 0);
+  });
 });
