@@ -677,12 +677,13 @@ export async function runAgyFastCli(
     return 1;
   }
 
+  const fromFileBaseDir = opts.cwd ? resolvePath(opts.cwd, defaultCwd) : defaultCwd;
   let jsonInput: Record<string, unknown> | null = null;
   try {
     if (opts.fromFile !== undefined) {
       jsonInput = await readJsonPayloadFromFile(
         opts.fromFile,
-        opts.cwd ?? defaultCwd,
+        fromFileBaseDir,
         tool,
       );
     } else if (opts.jsonRaw !== undefined) {
@@ -703,7 +704,7 @@ export async function runAgyFastCli(
 
   let effectiveCwd: string;
   if (opts.cwd !== undefined) {
-    effectiveCwd = opts.cwd;
+    effectiveCwd = fromFileBaseDir;
   } else if (
     jsonInput &&
     Object.prototype.hasOwnProperty.call(jsonInput, "cwd") &&
@@ -713,7 +714,7 @@ export async function runAgyFastCli(
       stderr.write("Error: 'cwd' in JSON input must be a non-empty string.\n");
       return 1;
     }
-    effectiveCwd = jsonInput.cwd;
+    effectiveCwd = resolvePath(jsonInput.cwd, defaultCwd);
   } else {
     effectiveCwd = defaultCwd;
   }
@@ -858,6 +859,11 @@ export async function runAgyFastCli(
   return shouldCliExitNonZero(tool, result) ? 1 : 0;
 }
 
+// Anchored prefix matcher for real batch_search [git] failures; excludes arbitrary
+// "ERROR: ..." lines so healthy `git log --format=%s` subjects still exit 0.
+const GIT_QUERY_ERROR_LINE_RE =
+  /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|Query 'pattern' must be |multiline must be |Invalid |Unsupported |Unterminated quote in git query|Empty git query\.|Git (?:query must start with |subcommand ')|Shell operator '|Flag '|Expected commit ref |Positional (?:branch|tag) argument|Mutating |Remote target '|git (?:query timed out|execution error:|exited with code )|fatal:|error:|usage: git |致命错误：|错误：|用法：git )/;
+
 export function shouldCliExitNonZero(
   tool: CliCanonicalTool,
   result: { text: string; isError: boolean },
@@ -885,9 +891,7 @@ export function shouldCliExitNonZero(
     return sections.every(
       (sec) =>
         /^## Query \d+ \[(?:text|regex|glob|fuzzy)\] [^\n]*\nERROR: /.test(sec) ||
-        /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|git (?:query timed out|execution error:|exited with code )|Flag '|Mutating |Invalid |Unsupported |fatal:|error:)/.test(
-          sec,
-        ),
+        GIT_QUERY_ERROR_LINE_RE.test(sec),
     );
   }
   return false;

@@ -9933,12 +9933,13 @@ async function runAgyFastCli(argv, io = {}) {
     );
     return 1;
   }
+  const fromFileBaseDir = opts.cwd ? resolvePath(opts.cwd, defaultCwd) : defaultCwd;
   let jsonInput = null;
   try {
     if (opts.fromFile !== void 0) {
       jsonInput = await readJsonPayloadFromFile(
         opts.fromFile,
-        opts.cwd ?? defaultCwd,
+        fromFileBaseDir,
         tool
       );
     } else if (opts.jsonRaw !== void 0) {
@@ -9959,13 +9960,13 @@ async function runAgyFastCli(argv, io = {}) {
   }
   let effectiveCwd;
   if (opts.cwd !== void 0) {
-    effectiveCwd = opts.cwd;
+    effectiveCwd = fromFileBaseDir;
   } else if (jsonInput && Object.prototype.hasOwnProperty.call(jsonInput, "cwd") && jsonInput.cwd !== void 0) {
     if (typeof jsonInput.cwd !== "string" || !jsonInput.cwd.trim()) {
       stderr.write("Error: 'cwd' in JSON input must be a non-empty string.\n");
       return 1;
     }
-    effectiveCwd = jsonInput.cwd;
+    effectiveCwd = resolvePath(jsonInput.cwd, defaultCwd);
   } else {
     effectiveCwd = defaultCwd;
   }
@@ -10099,6 +10100,7 @@ async function runAgyFastCli(argv, io = {}) {
 `);
   return shouldCliExitNonZero(tool, result) ? 1 : 0;
 }
+var GIT_QUERY_ERROR_LINE_RE = /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|Query 'pattern' must be |multiline must be |Invalid |Unsupported |Unterminated quote in git query|Empty git query\.|Git (?:query must start with |subcommand ')|Shell operator '|Flag '|Expected commit ref |Positional (?:branch|tag) argument|Mutating |Remote target '|git (?:query timed out|execution error:|exited with code )|fatal:|error:|usage: git |致命错误：|错误：|用法：git )/;
 function shouldCliExitNonZero(tool, result) {
   if (result.isError) return true;
   if (tool === "run_checks") {
@@ -10118,9 +10120,7 @@ function shouldCliExitNonZero(tool, result) {
     const sections = result.text.split(/(?=(?:^|\n)## Query \d+ \[)/).map((s) => s.replace(/^\n+/, "")).filter((s) => /^## Query \d+ \[/.test(s));
     if (sections.length === 0) return false;
     return sections.every(
-      (sec) => /^## Query \d+ \[(?:text|regex|glob|fuzzy)\] [^\n]*\nERROR: /.test(sec) || /^## Query \d+ \[git\] [^\n]*\nERROR: (?:Path does not exist:|git (?:query timed out|execution error:|exited with code )|Flag '|Mutating |Invalid |Unsupported |fatal:|error:)/.test(
-        sec
-      )
+      (sec) => /^## Query \d+ \[(?:text|regex|glob|fuzzy)\] [^\n]*\nERROR: /.test(sec) || GIT_QUERY_ERROR_LINE_RE.test(sec)
     );
   }
   return false;

@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -582,5 +582,197 @@ describe("agy-fast --cli direct runner", () => {
     assert.equal(openPipeSearch.code, 1);
     assert.match(openPipeSearch.stderr, /requires at least one query/);
     assert.ok(Date.now() - startedOpenPipeAt < 3000);
+  });
+
+  it("exits non-zero on real [git] validation/exec errors while preserving commit-subject false-positive guard", async () => {
+    // End-to-end subprocess checks for real git validation failures
+    const gitPushRes = await runCliSubprocess(["search", "--git", "push"], { cwd: tmpDir });
+    assert.equal(gitPushRes.code, 1);
+    assert.match(
+      gitPushRes.stdout,
+      /## Query 1 \[git\] push\nERROR: Git subcommand 'push' is not allowed/,
+    );
+
+    const gitQuoteRes = await runCliSubprocess(["search", "--git", 'log "unterminated'], {
+      cwd: tmpDir,
+    });
+    assert.equal(gitQuoteRes.code, 1);
+    assert.match(gitQuoteRes.stdout, /ERROR: Unterminated quote in git query/);
+
+    const gitEmptyRes = await runCliSubprocess(["search", "--git", "   "], { cwd: tmpDir });
+    assert.equal(gitEmptyRes.code, 1);
+    assert.match(gitEmptyRes.stdout, /ERROR: Empty git query\./);
+
+    const gitLeadFlagRes = await runCliSubprocess(["search", "--git", "-c core.pager=sh status"], {
+      cwd: tmpDir,
+    });
+    assert.equal(gitLeadFlagRes.code, 1);
+    assert.match(gitLeadFlagRes.stdout, /ERROR: Git query must start with a read-only subcommand/);
+
+    const gitShellOpRes = await runCliSubprocess(["search", "--git", "status && diff"], {
+      cwd: tmpDir,
+    });
+    assert.equal(gitShellOpRes.code, 1);
+    assert.match(gitShellOpRes.stdout, /ERROR: Shell operator '&&' is not supported/);
+
+    const gitBranchPosRes = await runCliSubprocess(["search", "--git", "branch new-branch"], {
+      cwd: tmpDir,
+    });
+    assert.equal(gitBranchPosRes.code, 1);
+    assert.match(gitBranchPosRes.stdout, /ERROR: Positional branch argument/);
+
+    // Real git repository: healthy commit subject starting with "ERROR: " exits 0, real git errors exit 1
+    const gitRepo = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-cli-git-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: gitRepo });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: gitRepo });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: gitRepo });
+      await fs.writeFile(path.join(gitRepo, "README.md"), "hello\n", "utf8");
+      execFileSync("git", ["add", "."], { cwd: gitRepo });
+      execFileSync("git", ["commit", "-q", "-m", "ERROR: retry handler"], { cwd: gitRepo });
+
+      const noisySubjectRes = await runCliSubprocess(
+        ["search", "--git", "log -n 1 --format=%s"],
+        { cwd: gitRepo },
+      );
+      assert.equal(noisySubjectRes.code, 0, noisySubjectRes.stderr);
+      assert.match(noisySubjectRes.stdout, /ERROR: retry handler/);
+
+      const blameUsageRes = await runCliSubprocess(["search", "--git", "blame"], { cwd: gitRepo });
+      assert.equal(blameUsageRes.code, 1);
+
+      const badGitFlagRes = await runCliSubprocess(
+        ["search", "--git", "log --definitely-not-a-git-flag"],
+        { cwd: gitRepo },
+      );
+      assert.equal(badGitFlagRes.code, 1);
+    } finally {
+      await fs.rm(gitRepo, { recursive: true, force: true });
+    }
+
+    // Comprehensive unit coverage of every [git] error prefix in batch-search.ts
+    const realGitErrors = [
+      "Git subcommand 'push' is not allowed in batch_search",
+      "Unterminated quote in git query",
+      "Empty git query. Example: 'status --short' or 'log -n 5 --oneline'",
+      "Git query must start with a read-only subcommand (got '-c')",
+      "Shell operator '&&' is not supported in git queries",
+      "Expected commit ref after commit filter flag (got '-D')",
+      "Remote target 'https://example.com/repo.git' must be a configured remote name",
+      "Flag '-v' is not allowed in read-only git status query",
+      "Positional branch argument 'evil' is only allowed with --list in read-only mode",
+      "Positional tag arguments are only allowed with --list in read-only mode",
+      "Mutating git remote subcommand 'add' is not allowed",
+      "usage: git blame [<options>]",
+      "Path does not exist: missing-subdir",
+      "git query timed out",
+      "git execution error: spawn git ENOENT",
+      "git exited with code 128",
+      "fatal: bad revision 'nope'",
+      "error: unknown switch 'x'",
+      "Query 'pattern' must be a non-empty string",
+      "multiline must be a boolean",
+      "Invalid outputMode",
+      "Unsupported query type: bogus",
+    ];
+    for (const msg of realGitErrors) {
+      assert.equal(
+        shouldCliExitNonZero("batch_search", {
+          text: `## Query 1 [git] test\nERROR: ${msg}`,
+          isError: false,
+        }),
+        true,
+        `Expected shouldCliExitNonZero=true for: ${msg}`,
+      );
+    }
+
+    for (const subject of [
+      "ERROR: something",
+      "ERROR: retry handler",
+      "ERROR: simulate noisy commit subject",
+      "ERROR: invalid lowercase prefix without colon",
+      "ERROR: fatal crash without colon",
+    ]) {
+      assert.equal(
+        shouldCliExitNonZero("batch_search", {
+          text: `## Query 1 [git] log -n 1 --format=%s\n${subject}`,
+          isError: false,
+        }),
+        false,
+        `Expected shouldCliExitNonZero=false for commit subject: ${subject}`,
+      );
+    }
+  });
+
+  it("resolves --from-file and tool cwd relative to resolvePath(opts.cwd, defaultCwd) when defaultCwd !== process.cwd()", async () => {
+    assert.notEqual(path.resolve(tmpDir), path.resolve(process.cwd()));
+
+    const relDir = "rel-cwd-proj";
+    const subRoot = path.join(tmpDir, relDir);
+    await fs.mkdir(path.join(subRoot, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(subRoot, "src", "item.ts"),
+      "export const state = 'BEFORE';\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(subRoot, "edit-payload.json"),
+      JSON.stringify({
+        edits: [
+          {
+            path: "src/item.ts",
+            hunks: [{ target: "BEFORE", replacement: "AFTER" }],
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(subRoot, "search-payload.json"),
+      JSON.stringify({
+        queries: [{ type: "text", pattern: "AFTER", path: "src" }],
+      }),
+      "utf8",
+    );
+
+    const makeStreams = () => {
+      const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+      stdin.isTTY = true;
+      stdin.end();
+      const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      stdout.on("data", (d) => stdoutChunks.push(d.toString("utf8")));
+      stderr.on("data", (d) => stderrChunks.push(d.toString("utf8")));
+      return {
+        stdin,
+        stdout,
+        stderr,
+        getStdout: () => stdoutChunks.join(""),
+        getStderr: () => stderrChunks.join(""),
+      };
+    };
+
+    const editIo = makeStreams();
+    const editCode = await runAgyFastCli(
+      ["edit", "--cwd", relDir, "--from-file", "edit-payload.json"],
+      { cwd: tmpDir, stdin: editIo.stdin, stdout: editIo.stdout, stderr: editIo.stderr },
+    );
+    assert.equal(editCode, 0, editIo.getStderr() || editIo.getStdout());
+    assert.match(editIo.getStdout(), /Applied edits to 1 file/);
+    assert.equal(
+      await fs.readFile(path.join(subRoot, "src", "item.ts"), "utf8"),
+      "export const state = 'AFTER';\n",
+    );
+
+    const searchIo = makeStreams();
+    const searchCode = await runAgyFastCli(
+      ["search", `--cwd=${relDir}`, "--from-file=search-payload.json"],
+      { cwd: tmpDir, stdin: searchIo.stdin, stdout: searchIo.stdout, stderr: searchIo.stderr },
+    );
+    assert.equal(searchCode, 0, searchIo.getStderr() || searchIo.getStdout());
+    assert.match(searchIo.getStdout(), /src\/item\.ts/);
+    assert.match(searchIo.getStdout(), /state = 'AFTER'/);
   });
 });
