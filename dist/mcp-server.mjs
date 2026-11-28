@@ -1191,10 +1191,12 @@ async function walkFiles(rootDir, options = {}) {
   const maxDirs = options.maxDirs !== void 0 && Number.isFinite(options.maxDirs) && options.maxDirs > 0 ? Math.max(1, Math.trunc(options.maxDirs)) : null;
   const files = [];
   let truncated = false;
+  let filesTruncated = false;
   let timedOut = false;
   let dirsTruncated = false;
   let visitedDirs = 0;
   const MAX_CONCURRENT_READDIRS = 16;
+  const DEFAULT_BATCH_SIZE = 8;
   let activeReaddirs = 0;
   const waitQueue = [];
   const drainWaiters = () => {
@@ -1207,7 +1209,7 @@ async function walkFiles(rootDir, options = {}) {
     truncated = true;
     drainWaiters();
   };
-  const withinBudget = () => {
+  const canStartRead = () => {
     if (truncated) return false;
     if (deadline !== null && Date.now() >= deadline) {
       timedOut = true;
@@ -1216,30 +1218,56 @@ async function walkFiles(rootDir, options = {}) {
     }
     return true;
   };
+  const stoppedStatus = () => {
+    if (filesTruncated) return "stopped";
+    if (timedOut) return "timed_out";
+    if (dirsTruncated) return "dirs_limit";
+    return "stopped";
+  };
+  const computeBatchSize = () => {
+    if (maxDirs === null) return DEFAULT_BATCH_SIZE;
+    const remaining = maxDirs - visitedDirs - waitQueue.length;
+    return Math.min(
+      DEFAULT_BATCH_SIZE,
+      Math.max(1, Math.floor(remaining / DEFAULT_BATCH_SIZE))
+    );
+  };
   const timeoutTimer = timeoutMs !== null ? setTimeout(() => {
-    timedOut = true;
-    markTruncated();
+    if (!truncated) {
+      timedOut = true;
+      markTruncated();
+    }
   }, timeoutMs) : null;
   timeoutTimer?.unref();
   const readDirBounded = async (dir) => {
-    if (!withinBudget()) return null;
+    if (!canStartRead()) return { status: stoppedStatus() };
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      return { status: "dirs_limit" };
+    }
     while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
       await new Promise((resolve) => waitQueue.push(resolve));
-      if (!withinBudget()) return null;
+      if (!canStartRead()) return { status: stoppedStatus() };
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        return { status: "dirs_limit" };
+      }
     }
-    if (!withinBudget()) return null;
+    if (!canStartRead()) return { status: stoppedStatus() };
     if (maxDirs !== null && visitedDirs >= maxDirs) {
-      dirsTruncated = true;
-      markTruncated();
-      return null;
+      return { status: "dirs_limit" };
     }
     visitedDirs++;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      drainWaiters();
+    }
     activeReaddirs++;
     try {
-      return await fs.readdir(dir, { withFileTypes: true });
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      return { status: "scanned", entries };
+    } catch {
+      return { status: "error" };
     } finally {
       activeReaddirs--;
-      if (truncated) {
+      if (truncated || maxDirs !== null && visitedDirs >= maxDirs) {
         drainWaiters();
       } else {
         const next = waitQueue.shift();
@@ -1248,14 +1276,14 @@ async function walkFiles(rootDir, options = {}) {
     }
   };
   const scanDir = async (dir, relDir) => {
-    if (!withinBudget()) return { localFiles: [], subdirs: [] };
-    let entries;
-    try {
-      entries = await readDirBounded(dir);
-    } catch {
-      return { localFiles: [], subdirs: [] };
+    const readRes = await readDirBounded(dir);
+    if (readRes.status !== "scanned") {
+      return { status: readRes.status, localFiles: [], subdirs: [] };
     }
-    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
+    if (filesTruncated) {
+      return { status: "stopped", localFiles: [], subdirs: [] };
+    }
+    const entries = readRes.entries;
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
     const localFiles = [];
     const subdirs = [];
@@ -1275,34 +1303,78 @@ async function walkFiles(rootDir, options = {}) {
         localFiles.push(relPosix);
       }
     }
-    return { localFiles, subdirs };
+    return { status: "scanned", localFiles, subdirs };
   };
   async function visit(dir, relDir, depth, prefetched) {
-    if (!withinBudget() || depth > maxDepth) return;
-    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
-    if (!withinBudget()) return;
-    for (const relPosix of localFiles) {
-      if (files.length >= maxFiles) {
+    if (depth > maxDepth) return true;
+    if (!prefetched) {
+      if (!canStartRead()) return false;
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        dirsTruncated = true;
         markTruncated();
-        return;
+        return false;
+      }
+    }
+    const res = await (prefetched ?? scanDir(dir, relDir));
+    if (res.status === "dirs_limit") {
+      dirsTruncated = true;
+      markTruncated();
+      return false;
+    }
+    if (res.status === "timed_out") {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    if (res.status === "stopped") {
+      return false;
+    }
+    if (res.status === "error") {
+      return true;
+    }
+    for (const relPosix of res.localFiles) {
+      if (files.length >= maxFiles) {
+        filesTruncated = true;
+        markTruncated();
+        return false;
       }
       files.push(relPosix);
     }
-    if (depth >= maxDepth || subdirs.length === 0) return;
-    const batchSize = 8;
-    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
-      const slice = subdirs.slice(i, i + batchSize);
+    if (depth >= maxDepth || res.subdirs.length === 0) return true;
+    for (let i = 0; i < res.subdirs.length; ) {
+      if (!canStartRead()) return false;
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        dirsTruncated = true;
+        markTruncated();
+        return false;
+      }
+      const batchSize = computeBatchSize();
+      const slice = res.subdirs.slice(i, i + batchSize);
+      i += slice.length;
       const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      let completedInSlice = 0;
       try {
-        for (let j = 0; j < slice.length && withinBudget(); j++) {
-          await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
+        for (let j = 0; j < slice.length; j++) {
+          if (filesTruncated) return false;
+          const completed = await visit(
+            slice[j].abs,
+            slice[j].rel,
+            depth + 1,
+            prefetches[j]
+          );
+          if (!completed) return false;
+          completedInSlice = j + 1;
         }
+      } catch (err) {
+        markTruncated();
+        throw err;
       } finally {
-        if (truncated) {
+        if (completedInSlice < prefetches.length) {
           await Promise.allSettled(prefetches);
         }
       }
     }
+    return true;
   }
   try {
     await visit(rootDir, "", 0);
