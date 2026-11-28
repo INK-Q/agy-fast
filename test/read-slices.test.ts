@@ -1348,4 +1348,86 @@ describe("read_slices", () => {
       await fs.rm(bareDir, { recursive: true, force: true });
     }
   });
+
+  it("extracts Python Flask/FastAPI route, dataclass, and fixture metadata safely across comments and string literals", async () => {
+    const pyDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-py-routes-"));
+    try {
+      await fs.writeFile(
+        path.join(pyDir, "routes.py"),
+        [
+          "from dataclasses import dataclass",
+          "import pytest",
+          "",
+          "@app.route('/api/items', methods=['GET', 'POST'])",
+          "def list_items():",
+          "    return []",
+          "",
+          "@app.route(",
+          "    '/api/inline-comment',  # don't change (v1)",
+          "    methods=('PUT', 'DELETE'),  # trailing )",
+          ")  # after closing paren @dataclass",
+          "def update_inline():",
+          "    return True",
+          "",
+          "@app.route(rule='/api/rule', methods=['PATCH'])",
+          "def patch_rule():",
+          "    return {}",
+          "",
+          "@app.route(methods=['POST'], rule='/api/reordered')",
+          "def reordered_rule():",
+          "    return {}",
+          "",
+          "@router.post('/items', dependencies=[Depends(load(path='/wrong'))])",
+          "async def create_item():",
+          "    return {}",
+          "",
+          "@router.api_route(path='/v2/items', methods=['GET'])",
+          "def get_v2():",
+          "    return {}",
+          "",
+          "@dataclass(frozen=True)",
+          "class ItemModel:",
+          "    name: str",
+          "",
+          "@pytest.fixture(scope='module')",
+          "def sample_item():",
+          "    return ItemModel('ok')",
+          "",
+          "# @app.get('/ignored')",
+          "@other  # not @dataclass",
+          "@deprecated(\"use @app.get('/v2') and @pytest.fixture\")",
+          "def plain():",
+          "    return 42",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const content = await fs.readFile(path.join(pyDir, "routes.py"), "utf8");
+      const syms = extractSymbols("routes.py", content);
+      const byName = new Map(syms.map((s) => [s.name, s]));
+      assert.equal(byName.get("list_items")?.detail, "(route GET|POST /api/items)");
+      assert.equal(byName.get("update_inline")?.detail, "(route PUT|DELETE /api/inline-comment)");
+      assert.equal(byName.get("patch_rule")?.detail, "(route PATCH /api/rule)");
+      assert.equal(byName.get("reordered_rule")?.detail, "(route POST /api/reordered)");
+      assert.equal(byName.get("create_item")?.detail, "(route POST /items)");
+      assert.equal(byName.get("get_v2")?.detail, "(route GET /v2/items)");
+      assert.equal(byName.get("ItemModel")?.detail, "(@dataclass)");
+      assert.equal(byName.get("sample_item")?.detail, "(@pytest.fixture)");
+      assert.equal(byName.get("plain")?.detail, undefined);
+
+      const outRes = await runReadSlices({ cwd: pyDir, outlines: ["routes.py"] });
+      assert.equal(outRes.isError, false);
+      assert.match(outRes.text, /\[function\] list_items \(route GET\|POST \/api\/items\)/);
+      assert.match(outRes.text, /\[function\] update_inline \(route PUT\|DELETE \/api\/inline-comment\)/);
+      assert.match(outRes.text, /\[function\] patch_rule \(route PATCH \/api\/rule\)/);
+      assert.match(outRes.text, /\[function\] reordered_rule \(route POST \/api\/reordered\)/);
+      assert.match(outRes.text, /\[function\] create_item \(route POST \/items\)/);
+      assert.match(outRes.text, /\[function\] get_v2 \(route GET \/v2\/items\)/);
+      assert.match(outRes.text, /\[class\] ItemModel \(@dataclass\)/);
+      assert.match(outRes.text, /\[function\] sample_item \(@pytest\.fixture\)/);
+      assert.match(outRes.text, /\[function\] plain\s*$/m);
+    } finally {
+      await fs.rm(pyDir, { recursive: true, force: true });
+    }
+  });
 });
