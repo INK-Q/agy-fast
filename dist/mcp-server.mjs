@@ -4,8 +4,8 @@
 
 // src/tools/apply-edits.ts
 import { isUtf8 } from "node:buffer";
-import { promises as fs2 } from "node:fs";
-import path3 from "node:path";
+import { promises as fs3 } from "node:fs";
+import path4 from "node:path";
 
 // src/utils/arg-validation.ts
 function isPlainObject(value) {
@@ -2255,13 +2255,359 @@ function formatCompactCommandOutputWithMeta(params) {
     params.maxChars
   );
 }
-function formatCompactCommandOutput(params) {
-  return formatCompactCommandOutputWithMeta(params).text;
-}
 function getTailLines(text, count) {
   if (!text) return "";
   const lines = text.split("\n");
   return lines.slice(-count).join("\n");
+}
+
+// src/utils/spill.ts
+import crypto from "node:crypto";
+import fs2 from "node:fs";
+import os3 from "node:os";
+import path3 from "node:path";
+var SPILL_MAX_FILE_BYTES = 2 * 1024 * 1024;
+var SPILL_MAX_FILES = 20;
+var SPILL_TTL_MS = 24 * 60 * 60 * 1e3;
+var SPILL_DEFAULT_MIN_BODY_CHARS = 400;
+var SPILL_DEFAULT_MIN_BODY_BYTES = 400;
+var SPILL_HARD_MIN_CONTENT_BYTES = 120;
+var SPILL_MAX_FOOTER_SHARE = 0.35;
+var SPILL_FILENAME_RE = /^spill-\d+-[a-z0-9_-]+-[0-9a-f]+\.txt$/;
+var DISABLED_VALUES = /* @__PURE__ */ new Set(["0", "off", "false", "no"]);
+function getEnvValue(env, key, platform = process.platform) {
+  const direct = env[key];
+  if (direct !== void 0) return direct;
+  if (platform === "win32") {
+    const lower = key.toLowerCase();
+    for (const [k, v] of Object.entries(env)) {
+      if (k.toLowerCase() === lower) return v;
+    }
+  }
+  return void 0;
+}
+function isSpillEnabled(env = process.env, platform = process.platform) {
+  const raw = getEnvValue(env, "AGY_FAST_SPILL", platform)?.trim().toLowerCase();
+  if (!raw) return true;
+  return !DISABLED_VALUES.has(raw);
+}
+function getPrivateHomeDir(env = process.env, platform = process.platform) {
+  if (platform === "win32") {
+    const userProfile = getEnvValue(env, "USERPROFILE", platform)?.trim();
+    if (userProfile) return userProfile;
+    const drive = getEnvValue(env, "HOMEDRIVE", platform);
+    const homePath = getEnvValue(env, "HOMEPATH", platform);
+    const driveHome = drive && homePath ? `${drive}${homePath}`.trim() : "";
+    if (driveHome) return driveHome;
+    const home = getEnvValue(env, "HOME", platform)?.trim();
+    if (home) return home;
+  } else {
+    const home = env.HOME?.trim() || env.USERPROFILE?.trim();
+    if (home) return home;
+  }
+  try {
+    const fallback = os3.homedir()?.trim();
+    return fallback || null;
+  } catch {
+    return null;
+  }
+}
+function hasUnsafeControlChars(p) {
+  return p.includes("\n") || p.includes("\r") || p.includes("\0");
+}
+function resolveSpillPaths(env = process.env, platform = process.platform) {
+  const customCache = getEnvValue(env, "AGY_FAST_CACHE_DIR", platform)?.trim();
+  if (customCache) {
+    if (hasUnsafeControlChars(customCache)) return null;
+    const cacheDir2 = path3.resolve(customCache);
+    const spillDir2 = path3.join(cacheDir2, "spills");
+    return { cacheDir: cacheDir2, spillDir: spillDir2, strictDirs: [cacheDir2, spillDir2] };
+  }
+  const geminiHome = getEnvValue(env, "GEMINI_HOME", platform)?.trim();
+  if (geminiHome) {
+    if (hasUnsafeControlChars(geminiHome)) return null;
+    const base2 = path3.resolve(geminiHome);
+    const cacheParent2 = path3.join(base2, "cache");
+    const cacheDir2 = path3.join(cacheParent2, "agy-fast");
+    const spillDir2 = path3.join(cacheDir2, "spills");
+    return { cacheDir: cacheDir2, spillDir: spillDir2, strictDirs: [base2, cacheParent2, cacheDir2, spillDir2] };
+  }
+  const home = getPrivateHomeDir(env, platform);
+  if (!home || hasUnsafeControlChars(home)) return null;
+  const base = path3.join(path3.resolve(home), ".gemini");
+  const cacheParent = path3.join(base, "cache");
+  const cacheDir = path3.join(cacheParent, "agy-fast");
+  const spillDir = path3.join(cacheDir, "spills");
+  return { cacheDir, spillDir, strictDirs: [cacheParent, cacheDir, spillDir] };
+}
+function formatSpillByteSize(bytes) {
+  const safe = Number.isFinite(bytes) && bytes > 0 ? Math.trunc(bytes) : 0;
+  if (safe < 1024) return `${safe} B`;
+  if (safe < 1024 * 1024) return `${(safe / 1024).toFixed(1)} KB`;
+  return `${(safe / (1024 * 1024)).toFixed(2)} MB`;
+}
+function formatSpillFooter(filePath, byteLength) {
+  return `
+... [Full output saved: ${filePath} (${formatSpillByteSize(byteLength)}); inspect with read_file(StartLine, EndLine) or batch_search]`;
+}
+function capSpillContent(rawContent, maxBytes = SPILL_MAX_FILE_BYTES) {
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.trunc(maxBytes) : SPILL_MAX_FILE_BYTES;
+  const originalBytes = Buffer.byteLength(rawContent, "utf8");
+  if (originalBytes <= limit) {
+    return { payload: rawContent, bytes: originalBytes, originalBytes, capped: false };
+  }
+  const capNote = `
+... [spill capped at 2 MiB; original ${originalBytes} bytes]
+`;
+  const noteBytes = Buffer.byteLength(capNote, "utf8");
+  if (limit <= noteBytes) {
+    const sliced2 = sliceUtf8Bytes(rawContent, limit);
+    return {
+      payload: sliced2,
+      bytes: Buffer.byteLength(sliced2, "utf8"),
+      originalBytes,
+      capped: true
+    };
+  }
+  const sliced = sliceUtf8Bytes(rawContent, limit - noteBytes);
+  const payload = `${sliced}${capNote}`;
+  return {
+    payload,
+    bytes: Buffer.byteLength(payload, "utf8"),
+    originalBytes,
+    capped: true
+  };
+}
+function isOwnedByCurrentUser(st, platform) {
+  if (platform === "win32") return true;
+  if (typeof process.getuid !== "function") return true;
+  return st.uid === process.getuid();
+}
+function verifyRealDir(dirPath, platform, checkOwner) {
+  try {
+    const st = fs2.lstatSync(dirPath);
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    if (checkOwner && !isOwnedByCurrentUser(st, platform)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function ensureSafeSpillDir(paths, platform) {
+  const { cacheDir, spillDir, strictDirs } = paths;
+  const strictSet = new Set(strictDirs);
+  for (const dir of strictDirs) {
+    try {
+      const st = fs2.lstatSync(dir);
+      if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      if (!isOwnedByCurrentUser(st, platform)) return null;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT") return null;
+    }
+  }
+  const missing = [];
+  let cur = spillDir;
+  while (true) {
+    try {
+      const st = fs2.lstatSync(cur);
+      if (strictSet.has(cur)) {
+        if (st.isSymbolicLink() || !st.isDirectory() || !isOwnedByCurrentUser(st, platform)) {
+          return null;
+        }
+      } else {
+        const resolvedStat = fs2.statSync(cur);
+        if (!resolvedStat.isDirectory()) return null;
+      }
+      break;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT") return null;
+      missing.push(cur);
+      const parent = path3.dirname(cur);
+      if (parent === cur) return null;
+      cur = parent;
+    }
+  }
+  for (let i = missing.length - 1; i >= 0; i--) {
+    const dir = missing[i];
+    try {
+      fs2.mkdirSync(dir, { mode: 448 });
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "EEXIST") return null;
+    }
+    if (!verifyRealDir(dir, platform, true)) return null;
+    if (platform !== "win32") {
+      try {
+        fs2.chmodSync(dir, 448);
+      } catch {
+        return null;
+      }
+    }
+  }
+  for (const dir of strictDirs) {
+    if (!verifyRealDir(dir, platform, true)) return null;
+  }
+  if (platform !== "win32") {
+    try {
+      fs2.chmodSync(spillDir, 448);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const realCache = fs2.realpathSync(cacheDir);
+    const realSpill = fs2.realpathSync(spillDir);
+    if (path3.dirname(realSpill) !== realCache || path3.basename(realSpill) !== "spills") {
+      return null;
+    }
+    if (!verifyRealDir(realSpill, platform, true)) return null;
+    return realSpill;
+  } catch {
+    return null;
+  }
+}
+function rotateSpillFiles(spillDir, keepFileName, nowMs = Date.now(), maxFiles = SPILL_MAX_FILES, ttlMs = SPILL_TTL_MS) {
+  try {
+    const names = fs2.readdirSync(spillDir);
+    const cutoffMs = nowMs - ttlMs;
+    const survivors = [];
+    for (const name of names) {
+      if (!SPILL_FILENAME_RE.test(name)) continue;
+      const fullPath = path3.join(spillDir, name);
+      let st;
+      try {
+        st = fs2.lstatSync(fullPath);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink() || !st.isFile()) continue;
+      if (name !== keepFileName && st.mtimeMs < cutoffMs) {
+        try {
+          fs2.unlinkSync(fullPath);
+        } catch {
+        }
+        continue;
+      }
+      survivors.push({ name, fullPath, mtimeMs: st.mtimeMs });
+    }
+    const limit = Math.max(1, Math.trunc(maxFiles));
+    if (survivors.length <= limit) return;
+    survivors.sort((a, b) => {
+      if (a.name === keepFileName && b.name !== keepFileName) return -1;
+      if (b.name === keepFileName && a.name !== keepFileName) return 1;
+      if (b.mtimeMs !== a.mtimeMs) return b.mtimeMs - a.mtimeMs;
+      return b.name > a.name ? 1 : b.name < a.name ? -1 : 0;
+    });
+    for (let i = limit; i < survivors.length; i++) {
+      const target = survivors[i];
+      if (target.name === keepFileName) continue;
+      try {
+        fs2.unlinkSync(target.fullPath);
+      } catch {
+      }
+    }
+  } catch {
+  }
+}
+function buildSpillFileName(tool, timestampMs, randomHex) {
+  const safeTs = Math.max(0, Math.trunc(timestampMs));
+  return `spill-${safeTs}-${tool}-${randomHex}.txt`;
+}
+function writeExclusiveSpillFile(realSpillDir, tool, timestampMs, initialRandomHex, payload, platform) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const randHex = attempt === 0 ? initialRandomHex : crypto.randomBytes(6).toString("hex");
+    const fileName = buildSpillFileName(tool, timestampMs, randHex);
+    const realTarget = path3.join(realSpillDir, fileName);
+    let fd;
+    try {
+      fd = fs2.openSync(realTarget, "wx", 384);
+      fs2.writeFileSync(fd, payload, "utf8");
+      if (platform !== "win32") {
+        fs2.fchmodSync(fd, 384);
+      }
+      fs2.closeSync(fd);
+      fd = void 0;
+      return fileName;
+    } catch (err) {
+      const code = err?.code;
+      if (fd !== void 0) {
+        try {
+          fs2.closeSync(fd);
+        } catch {
+        }
+        fd = void 0;
+        try {
+          fs2.unlinkSync(realTarget);
+        } catch {
+        }
+      }
+      if (code === "EEXIST") continue;
+      return null;
+    } finally {
+      if (fd !== void 0) {
+        try {
+          fs2.closeSync(fd);
+        } catch {
+        }
+      }
+    }
+  }
+  return null;
+}
+function reserveSpill(options) {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  if (!isSpillEnabled(env, platform)) return null;
+  const paths = resolveSpillPaths(env, platform);
+  if (!paths) return null;
+  const capped = capSpillContent(options.rawContent, SPILL_MAX_FILE_BYTES);
+  const nowMs = options.nowMs !== void 0 && Number.isFinite(options.nowMs) ? Math.max(0, Math.trunc(options.nowMs)) : Date.now();
+  const initialRandomHex = crypto.randomBytes(6).toString("hex");
+  const candidateName = buildSpillFileName(options.tool, nowMs, initialRandomHex);
+  const candidatePath = path3.join(paths.spillDir, candidateName);
+  const candidateFooter = formatSpillFooter(candidatePath, capped.bytes);
+  const footerChars = candidateFooter.length;
+  const footerBytes = Buffer.byteLength(candidateFooter, "utf8");
+  const minBodyChars = Math.max(
+    SPILL_HARD_MIN_CONTENT_BYTES,
+    options.minBodyChars ?? SPILL_DEFAULT_MIN_BODY_CHARS
+  );
+  const minBodyBytes = Math.max(
+    SPILL_HARD_MIN_CONTENT_BYTES,
+    options.minBodyBytes ?? SPILL_DEFAULT_MIN_BODY_BYTES
+  );
+  const maxFooterShare = options.maxFooterShare ?? SPILL_MAX_FOOTER_SHARE;
+  if (options.availableBodyChars - footerChars < minBodyChars || options.availableBodyBytes - footerBytes < minBodyBytes || footerChars > Math.floor(options.totalMaxChars * maxFooterShare) || footerBytes > Math.floor(options.totalMaxBytes * maxFooterShare)) {
+    return null;
+  }
+  let committed = false;
+  return {
+    footerChars,
+    footerBytes,
+    commit() {
+      if (committed) return null;
+      committed = true;
+      try {
+        const realSpillDir = ensureSafeSpillDir(paths, platform);
+        if (!realSpillDir) return null;
+        const writtenName = writeExclusiveSpillFile(
+          realSpillDir,
+          options.tool,
+          nowMs,
+          initialRandomHex,
+          capped.payload,
+          platform
+        );
+        if (!writtenName) return null;
+        rotateSpillFiles(realSpillDir, writtenName, nowMs);
+        return formatSpillFooter(path3.join(paths.spillDir, writtenName), capped.bytes);
+      } catch {
+        return null;
+      }
+    }
+  };
 }
 
 // src/tools/apply-edits.ts
@@ -2650,7 +2996,7 @@ function countLines(text) {
 }
 var OVERWRITE_HEADER_PEEK_BYTES = 8192;
 async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
-  const fh = await fs2.open(filePath, "r");
+  const fh = await fs3.open(filePath, "r");
   try {
     const buf = Buffer.allocUnsafe(maxBytes);
     const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
@@ -2677,7 +3023,7 @@ async function readOverwriteOriginal(writeTargetPath, size, relPath) {
       return { ok: false, error: nonTextErr2 };
     }
   }
-  const buffer = await fs2.readFile(writeTargetPath);
+  const buffer = await fs3.readFile(writeTargetPath);
   const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
   if (nonTextErr) {
     return { ok: false, error: nonTextErr };
@@ -2700,20 +3046,20 @@ function isGitInternalPath(filePath, platform = process.platform) {
 }
 async function canonicalizeTargetPath(absPath) {
   try {
-    return await fs2.realpath(absPath);
+    return await fs3.realpath(absPath);
   } catch {
     const trailingSegments = [];
     let current = absPath;
     while (true) {
-      const parent = path3.dirname(current);
+      const parent = path4.dirname(current);
       if (parent === current) {
         return absPath;
       }
-      trailingSegments.push(path3.basename(current));
+      trailingSegments.push(path4.basename(current));
       current = parent;
       try {
-        const realAncestor = await fs2.realpath(current);
-        return path3.join(realAncestor, ...trailingSegments.reverse());
+        const realAncestor = await fs3.realpath(current);
+        return path4.join(realAncestor, ...trailingSegments.reverse());
       } catch {
       }
     }
@@ -2721,17 +3067,17 @@ async function canonicalizeTargetPath(absPath) {
 }
 async function findMissingAncestorDirs(dir) {
   const missing = [];
-  let current = path3.resolve(dir);
+  let current = path4.resolve(dir);
   while (true) {
     try {
-      await fs2.lstat(current);
+      await fs3.lstat(current);
       break;
     } catch (err) {
       if (err?.code !== "ENOENT") {
         break;
       }
       missing.push(current);
-      const parent = path3.dirname(current);
+      const parent = path4.dirname(current);
       if (parent === current) break;
       current = parent;
     }
@@ -2746,7 +3092,7 @@ async function commitPlannedWrites(plans) {
     for (const plan of plans) {
       if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
-      const dir = path3.dirname(target);
+      const dir = path4.dirname(target);
       const missingDirs = await findMissingAncestorDirs(dir);
       for (let i = missingDirs.length - 1; i >= 0; i--) {
         const d = missingDirs[i];
@@ -2755,42 +3101,42 @@ async function commitPlannedWrites(plans) {
           createdDirs.push(d);
         }
       }
-      await fs2.mkdir(dir, { recursive: true });
-      const tmpPath = path3.join(
+      await fs3.mkdir(dir, { recursive: true });
+      const tmpPath = path4.join(
         dir,
         `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
       );
       try {
-        await fs2.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs2.chmod(tmpPath, plan.originalMode);
+          await fs3.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs2.unlink(tmpPath);
+          await fs3.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs2.rename(tmpPath, target);
+        await fs3.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs2.unlink(tmpPath);
+          await fs3.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs2.unlink(target);
+            await fs3.unlink(target);
           } catch {
           }
         }
-        await fs2.writeFile(target, plan.newContent, "utf8");
+        await fs3.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs2.chmod(target, plan.originalMode);
+            await fs3.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -2803,23 +3149,23 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs2.unlink(target).catch(() => {
+          await fs3.unlink(target).catch(() => {
           });
-          await fs2.symlink(item.originalSymlinkTarget, target);
+          await fs3.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs2.writeFile(target, item.originalBuffer);
+          await fs3.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs2.chmod(target, item.originalMode);
+            await fs3.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs2.unlink(target);
+          await fs3.unlink(target);
         }
       } catch {
       }
     }
     for (let i = createdDirs.length - 1; i >= 0; i--) {
       try {
-        await fs2.rmdir(createdDirs[i]);
+        await fs3.rmdir(createdDirs[i]);
       } catch {
       }
     }
@@ -3535,7 +3881,7 @@ async function runApplyEdits(input) {
   if (!input.dryRun && validatedVerify?.cwd) {
     const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
     try {
-      const st = await fs2.stat(resolvedVerifyCwd);
+      const st = await fs3.stat(resolvedVerifyCwd);
       if (!st.isDirectory()) {
         return {
           text: `Validation failed (0 files modified):
@@ -3566,7 +3912,7 @@ async function runApplyEdits(input) {
     }
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
-    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
+    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
     if (entry.hunkAliasErrors && entry.hunkAliasErrors.length > 0) {
       for (const err of entry.hunkAliasErrors) {
         errors.push(`${relPath} hunk #${err.hunkIndex + 1}: ${err.message}`);
@@ -3627,10 +3973,10 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs2.lstat(item.writeTargetPath);
+        const lst = await fs3.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs2.stat(item.writeTargetPath);
+            const st = await fs3.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -3662,7 +4008,7 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs2.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -3671,7 +4017,7 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
             }
           }
         } else {
-          const st = await fs2.stat(item.writeTargetPath);
+          const st = await fs3.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -3893,36 +4239,92 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
       256,
       DEFAULT_INLINE_MAX_BYTES - reservedForApplied - Buffer.byteLength(verifyPrefix, "utf8")
     );
-    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
-    let formatted = renderPreparedCompactCommandOutput(
-      preparedVerify,
-      targetChars
-    ).text;
-    for (let iter = 0; iter < 4; iter++) {
-      const actualBytes = Buffer.byteLength(formatted, "utf8");
-      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
-      targetChars = Math.max(
-        64,
-        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94)
-      );
-      formatted = renderPreparedCompactCommandOutput(
+    const renderVerifyResponse = (bodyCharLimit, bodyByteLimit, totalByteLimit) => {
+      let targetChars = Math.min(bodyCharLimit, bodyByteLimit);
+      let rendered = renderPreparedCompactCommandOutput(
         preparedVerify,
         targetChars
-      ).text;
-    }
-    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
-      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
-    }
-    const verifySection = `${verifyPrefix}${formatted}`;
-    const remainingAppliedBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
-    const appliedSection = compactSummaryLinesToBytes(
-      header,
-      summaryLines,
-      noOpCount,
-      Math.max(64, remainingAppliedBytes)
+      );
+      let formatted = rendered.text;
+      let verifyTruncated = rendered.truncated;
+      for (let iter = 0; iter < 4; iter++) {
+        const actualBytes = Buffer.byteLength(formatted, "utf8");
+        if (actualBytes <= bodyByteLimit || targetChars <= 64) break;
+        targetChars = Math.max(
+          64,
+          Math.floor(targetChars * (bodyByteLimit / actualBytes) * 0.94)
+        );
+        rendered = renderPreparedCompactCommandOutput(
+          preparedVerify,
+          targetChars
+        );
+        formatted = rendered.text;
+        if (rendered.truncated) verifyTruncated = true;
+      }
+      if (Buffer.byteLength(formatted, "utf8") > bodyByteLimit) {
+        formatted = truncateHeadTailWithByteNotice(formatted, bodyByteLimit);
+        verifyTruncated = true;
+      }
+      const verifySection = `${verifyPrefix}${formatted}`;
+      const remainingAppliedBytes = totalByteLimit - Buffer.byteLength(verifySection, "utf8");
+      const appliedSection2 = compactSummaryLinesToBytes(
+        header,
+        summaryLines,
+        noOpCount,
+        Math.max(64, remainingAppliedBytes)
+      );
+      const combined = `${appliedSection2}${verifySection}`;
+      if (Buffer.byteLength(combined, "utf8") <= totalByteLimit) {
+        return { text: combined, appliedSection: appliedSection2, verifyTruncated };
+      }
+      return {
+        text: truncateWithByteNotice(combined, totalByteLimit),
+        appliedSection: appliedSection2,
+        verifyTruncated: true
+      };
+    };
+    const initialVerify = renderVerifyResponse(
+      maxVerifyChars,
+      maxVerifyBodyBytes,
+      DEFAULT_INLINE_MAX_BYTES
     );
-    const combined = `${appliedSection}${verifySection}`;
-    let finalText = Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES);
+    let finalText = initialVerify.text;
+    let appliedSection = initialVerify.appliedSection;
+    if (initialVerify.verifyTruncated) {
+      const rawOut = normalizeTerminalOutput(res.stdout);
+      const rawErr = normalizeTerminalOutput(res.stderr);
+      const rawCombined = [rawOut, rawErr].filter(Boolean).join("\n");
+      const rawVerifyBody = res.error ? `spawn error: ${res.error}` : res.timedOut ? rawCombined ? `TIMED OUT
+${rawCombined}` : "TIMED OUT (no output)" : rawCombined || "(no output)";
+      const rawVerifySpill = `Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
+${rawVerifyBody}
+`;
+      const reservation = reserveSpill({
+        tool: "apply_edits",
+        rawContent: rawVerifySpill,
+        totalMaxChars: Math.min(maxVerifyChars, DEFAULT_INLINE_MAX_BYTES),
+        totalMaxBytes: DEFAULT_INLINE_MAX_BYTES,
+        availableBodyChars: maxVerifyChars,
+        availableBodyBytes: maxVerifyBodyBytes,
+        minBodyChars: 240,
+        minBodyBytes: 240
+      });
+      if (reservation) {
+        const footer = reservation.commit();
+        if (footer) {
+          const reduced = renderVerifyResponse(
+            maxVerifyChars - reservation.footerChars,
+            maxVerifyBodyBytes - reservation.footerBytes,
+            DEFAULT_INLINE_MAX_BYTES - reservation.footerBytes
+          );
+          const withFooter = `${reduced.text}${footer}`;
+          if (Buffer.byteLength(withFooter, "utf8") <= DEFAULT_INLINE_MAX_BYTES) {
+            finalText = withFooter;
+            appliedSection = reduced.appliedSection;
+          }
+        }
+      }
+    }
     if (includeDiff && status === "PASS" && appliedSection === appliedFull) {
       const diffBlocks = plans.map((p) => p.diffText).filter((d) => Boolean(d));
       if (diffBlocks.length > 0) {
@@ -3963,8 +4365,8 @@ ${packedDiff}`,
 }
 
 // src/tools/batch-search.ts
-import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
+import { promises as fs4 } from "node:fs";
+import path5 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -4458,7 +4860,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path4.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   const maxResults = clampInt(query.maxResults, 1, 200, 40);
@@ -4466,7 +4868,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs3.stat(searchRoot);
+  const fileStat = await fs4.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -4480,12 +4882,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path4.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs3.open(searchRoot, "r");
+    const fh = await fs4.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -4512,10 +4914,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const relNative = path4.relative(baseCwd, searchRoot);
+  const relNative = path5.relative(baseCwd, searchRoot);
   const relRoot = toPosixPath(relNative);
-  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path4.isAbsolute(relRoot);
-  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path4.sep}-` : relNative : searchRoot;
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path5.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path5.sep}-` : relNative : searchRoot;
   const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
   const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
@@ -4651,9 +5053,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path4.relative(baseCwd, path4.resolve(baseCwd, rawFile));
-    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path4.sep}`) && !path4.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path4.sep}-` : chosenPath;
+    const rel = path5.relative(baseCwd, path5.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path5.sep}`) && !path5.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -4888,12 +5290,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs3.stat(searchRoot);
+  const stat = await fs4.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   let discoveryBudgetExceeded = false;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
+    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
@@ -4925,12 +5327,12 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     if (walked.timedOut || walked.dirsTruncated) {
       discoveryBudgetExceeded = true;
     }
-    const rootRel = toPosixPath(path4.relative(baseCwd, searchRoot));
+    const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
     const useFastPrefix = Boolean(
-      rootRel === "" || !rootRel.startsWith("..") && !path4.isAbsolute(rootRel)
+      rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
     );
     targetFiles = walked.files.map((rel) => {
-      const abs = path4.join(searchRoot, rel);
+      const abs = path5.join(searchRoot, rel);
       const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
       return { abs, rel: displayRel };
     });
@@ -5000,9 +5402,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
     const results = await Promise.all(
       batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
-          const st = await fs3.stat(absFile);
+          const st = await fs4.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs3.readFile(absFile);
+          const buf = await fs4.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
@@ -5134,13 +5536,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path4.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs3.lstat(path4.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -5178,8 +5580,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
-    const rel = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
-    const base = path4.basename(searchRoot);
+    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
+    const base = path5.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -5248,7 +5650,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path4.relative(baseCwd, path4.resolve(baseCwd, file))) || path4.basename(file);
+  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const pattern = query.pattern.trim();
@@ -5265,7 +5667,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
     timeoutMs: walkRemainingMs,
     maxDirs: budget.walkMaxDirs
   });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path4.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const budgetHit = Boolean(walked.timedOut || walked.dirsTruncated);
   if (matches.length === 0) {
@@ -5891,12 +6293,12 @@ async function executeSingleQuery(query, index, baseCwd, useRg, budget) {
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs3.stat(searchRoot);
+      targetStat = await fs4.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path4.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd, budget);
       return { header, text: `${header}
 ${out}` };
@@ -6027,7 +6429,7 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs3.stat(baseCwd);
+    const st = await fs4.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -6054,41 +6456,72 @@ async function runBatchSearch(input, options = {}) {
   const separator = "\n\n";
   const rawSections = executed.map((e) => e.text);
   const joined = rawSections.join(separator);
+  const joinedBytes = Buffer.byteLength(joined, "utf8");
   const sepChars = separator.length * Math.max(0, rawSections.length - 1);
   const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, rawSections.length - 1);
-  const overChars = joined.length > maxChars;
-  const overBytes = Buffer.byteLength(joined, "utf8") > maxBytes;
-  let finalSections = rawSections;
-  if (overChars || overBytes) {
-    const rawCharLens = rawSections.map((s) => s.length);
-    const rawByteLens = rawSections.map((s) => Buffer.byteLength(s, "utf8"));
-    const byteBudgets = overBytes ? computeWaterFillBudgets(rawByteLens, Math.max(0, maxBytes - sepBytes)) : rawByteLens.map(() => maxBytes);
-    const charBudgets = overChars ? computeWaterFillBudgets(rawCharLens, Math.max(0, maxChars - sepChars)) : computeWaterFillBudgets(
-      rawCharLens.map(
-        (len, idx) => rawByteLens[idx] > byteBudgets[idx] ? maxChars : len
-      ),
-      Math.max(0, maxChars - sepChars)
-    );
-    finalSections = executed.map((ex, idx) => {
-      const charBudget = charBudgets[idx] ?? 0;
-      const byteBudget = byteBudgets[idx] ?? 0;
-      if (!ex.contentResult || rawCharLens[idx] <= charBudget && rawByteLens[idx] <= byteBudget) {
-        return ex.text;
-      }
-      const budgeted = formatBudgetedContentSection({
-        header: ex.header,
-        files: ex.contentResult.files,
-        totalMatches: ex.contentResult.totalMatches,
-        maxResultsTruncated: ex.contentResult.truncated,
-        contextLines: ex.contentResult.contextLines,
-        charBudget,
-        byteBudget
+  const rawCharLens = rawSections.map((s) => s.length);
+  const rawByteLens = rawSections.map((s) => Buffer.byteLength(s, "utf8"));
+  const renderFittedSections = (targetMaxChars, targetMaxBytes) => {
+    const overChars = joined.length > targetMaxChars;
+    const overBytes = joinedBytes > targetMaxBytes;
+    let finalSections = rawSections;
+    if (overChars || overBytes) {
+      const byteBudgets = overBytes ? computeWaterFillBudgets(rawByteLens, Math.max(0, targetMaxBytes - sepBytes)) : rawByteLens.map(() => targetMaxBytes);
+      const charBudgets = overChars ? computeWaterFillBudgets(rawCharLens, Math.max(0, targetMaxChars - sepChars)) : computeWaterFillBudgets(
+        rawCharLens.map(
+          (len, idx) => rawByteLens[idx] > byteBudgets[idx] ? targetMaxChars : len
+        ),
+        Math.max(0, targetMaxChars - sepChars)
+      );
+      finalSections = executed.map((ex, idx) => {
+        const charBudget = charBudgets[idx] ?? 0;
+        const byteBudget = byteBudgets[idx] ?? 0;
+        if (!ex.contentResult || rawCharLens[idx] <= charBudget && rawByteLens[idx] <= byteBudget) {
+          return ex.text;
+        }
+        const budgeted = formatBudgetedContentSection({
+          header: ex.header,
+          files: ex.contentResult.files,
+          totalMatches: ex.contentResult.totalMatches,
+          maxResultsTruncated: ex.contentResult.truncated,
+          contextLines: ex.contentResult.contextLines,
+          charBudget,
+          byteBudget
+        });
+        return budgeted ?? ex.text;
       });
-      return budgeted ?? ex.text;
+    }
+    return fitSectionsToByteBudget(finalSections, targetMaxChars, targetMaxBytes, separator);
+  };
+  const initialText = renderFittedSections(maxChars, maxBytes);
+  const wasTruncated = joined.length > maxChars || joinedBytes > maxBytes || initialText !== joined;
+  if (wasTruncated) {
+    const spillContent = joined.endsWith("\n") ? joined : `${joined}
+`;
+    const reservation = reserveSpill({
+      tool: "batch_search",
+      rawContent: spillContent,
+      totalMaxChars: maxChars,
+      totalMaxBytes: maxBytes,
+      availableBodyChars: Math.max(0, maxChars - sepChars),
+      availableBodyBytes: Math.max(0, maxBytes - sepBytes)
     });
+    if (reservation) {
+      const footer = reservation.commit();
+      if (footer) {
+        const reducedText = renderFittedSections(
+          maxChars - reservation.footerChars,
+          maxBytes - reservation.footerBytes
+        );
+        const withFooter = `${reducedText}${footer}`;
+        if (withFooter.length <= maxChars && Buffer.byteLength(withFooter, "utf8") <= maxBytes) {
+          return { text: withFooter, isError: false };
+        }
+      }
+    }
   }
   return {
-    text: fitSectionsToByteBudget(finalSections, maxChars, maxBytes, separator),
+    text: initialText,
     isError: false
   };
 }
@@ -6108,7 +6541,7 @@ function clampInt(val, min, max, fallback = min) {
 }
 
 // src/tools/read-slices.ts
-import path5 from "node:path";
+import path6 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -8126,7 +8559,7 @@ function extractSfcSymbols(lines, mode) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path5.extname(filePath).toLowerCase();
+  const ext = path6.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -8601,7 +9034,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
+        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -8642,7 +9075,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
+        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -8836,7 +9269,7 @@ async function runQuickOutline(input) {
 }
 
 // src/tools/run-checks.ts
-import { promises as fs4 } from "node:fs";
+import { promises as fs5 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -8920,7 +9353,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs5.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -8955,7 +9388,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs4.stat(cmdCwd);
+        const st = await fs5.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -9013,15 +9446,6 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
   const separator = "\n\n";
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - separator.length);
-  const bodyByteBudget = maxBytes !== void 0 ? Math.max(
-    0,
-    maxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8")
-  ) : bodyBudget;
-  const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
-  const totalSepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
-  const availChars = Math.max(0, bodyBudget - totalSepChars);
-  const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
   const capCmdDisplay = (cmd, maxCmdChars, maxCmdBytes) => {
     if (cmd.length <= maxCmdChars && Buffer.byteLength(cmd, "utf8") <= maxCmdBytes) {
       return cmd;
@@ -9030,7 +9454,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const byteCap = Math.max(8, maxCmdBytes - 3);
     return `${sliceUtf8Bytes(sliceSafeChars(cmd, charCap), byteCap)}...`;
   };
-  const formatNotRunBlock = (spec) => {
+  const formatNotRunBlock = (spec, availChars) => {
     const baseHeader = `## [NOT RUN] ${spec.name}`;
     const notRunBudgetTotal = failedCount > 0 ? Math.min(availChars, Math.floor(availChars * 0.35)) : availChars;
     const perNotRunShare = Math.floor(
@@ -9075,94 +9499,42 @@ $ ${cmd}
 $ ${displayCmd}
 `;
   };
-  let blocks;
-  if (outputMode === "full") {
-    const rawEntries = outcomes.map(({ spec, result, passed }) => {
-      if (!result) {
-        const block = formatNotRunBlock(spec);
-        return {
-          notRun: true,
-          block,
-          charSize: block.length,
-          byteSize: Buffer.byteLength(block, "utf8")
-        };
-      }
-      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
-      const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
-      const fullPrefix = `${headerLine}
+  const fullPreparedEntries = outputMode === "full" ? outcomes.map(({ spec, result, passed }) => {
+    if (!result) {
+      return { notRun: true, spec };
+    }
+    const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
+    const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
+    const fullPrefix = `${headerLine}
 $ ${spec.command}
 `;
-      const combined = [
-        normalizeTerminalOutput(result.stdout),
-        normalizeTerminalOutput(result.stderr)
-      ].filter(Boolean).join("\n");
-      const rawBody = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
-      const fullBlock = `${fullPrefix}${rawBody}`;
-      return {
-        notRun: false,
-        spec,
-        headerLine,
-        fullPrefix,
-        rawBody,
-        fullBlock,
-        charSize: fullBlock.length,
-        byteSize: Buffer.byteLength(fullBlock, "utf8")
-      };
-    });
-    const fullCharBudgets = computeWaterFillBudgets(
-      rawEntries.map((e) => e.charSize),
-      availChars
-    );
-    const fullByteBudgets = computeWaterFillBudgets(
-      rawEntries.map((e) => e.byteSize),
-      availBytes
-    );
-    blocks = rawEntries.map((entry, idx) => {
-      if (entry.notRun) return entry.block;
-      const charShare = fullCharBudgets[idx] ?? 0;
-      const byteShare = fullByteBudgets[idx] ?? 0;
-      if (entry.charSize <= charShare && entry.byteSize <= byteShare) {
-        return entry.fullBlock;
-      }
-      const prefix = formatCmdHeaderPrefix(
-        entry.headerLine,
-        entry.spec.command,
-        charShare,
-        byteShare
-      );
-      const allowedChars = Math.max(0, charShare - prefix.length);
-      const allowedBytes = Math.max(
-        0,
-        byteShare - Buffer.byteLength(prefix, "utf8")
-      );
-      let body = entry.rawBody;
-      if (Buffer.byteLength(body, "utf8") > allowedBytes) {
-        body = truncateHeadTailWithByteNotice(body, allowedBytes);
-      }
-      if (body.length > allowedChars) {
-        body = truncateHeadTailWithNotice(body, allowedChars);
-      }
-      return `${prefix}${body}`;
-    });
-  } else {
-    blocks = new Array(outcomes.length);
-    const passEntries = [];
-    const failEntries = [];
-    let notRunChars = 0;
-    let notRunBytes = 0;
-    let passChars = 0;
-    let passBytes = 0;
+    const combined = [
+      normalizeTerminalOutput(result.stdout),
+      normalizeTerminalOutput(result.stderr)
+    ].filter(Boolean).join("\n");
+    const rawBody = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+    const fullBlock = `${fullPrefix}${rawBody}`;
+    return {
+      notRun: false,
+      spec,
+      headerLine,
+      fullPrefix,
+      rawBody,
+      fullBlock,
+      charSize: fullBlock.length,
+      byteSize: Buffer.byteLength(fullBlock, "utf8")
+    };
+  }) : null;
+  let compactPassPrepared = null;
+  let compactFailPrepared = null;
+  if (outputMode !== "full") {
+    compactPassPrepared = [];
+    compactFailPrepared = [];
     for (let i = 0; i < outcomes.length; i++) {
       const { spec, result, passed } = outcomes[i];
-      if (!result) {
-        const block = formatNotRunBlock(spec);
-        blocks[i] = block;
-        notRunChars += block.length;
-        notRunBytes += Buffer.byteLength(block, "utf8");
-        continue;
-      }
+      if (!result) continue;
       if (passed) {
-        const body = formatCompactCommandOutput({
+        const meta = formatCompactCommandOutputWithMeta({
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.exitCode,
@@ -9171,11 +9543,14 @@ $ ${spec.command}
           maxChars: 300
         });
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
-        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
-        blocks[i] = fullBlock;
-        passChars += fullBlock.length;
-        passBytes += Buffer.byteLength(fullBlock, "utf8");
-        passEntries.push({ index: i, compactHeader, body, fullBlock });
+        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${meta.text}`;
+        compactPassPrepared.push({
+          index: i,
+          compactHeader,
+          body: meta.text,
+          fullBlock,
+          truncated: meta.truncated
+        });
         continue;
       }
       const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
@@ -9191,192 +9566,330 @@ $ ${spec.command}
         timedOut: result.timedOut,
         error: result.error
       });
-      const pass1Ceiling = Math.max(
-        bodyBudget,
-        prepared.bodyText.length + 256
-      );
-      const pass1Body = renderPreparedCompactCommandOutput(
-        prepared,
-        pass1Ceiling
-      ).text;
-      failEntries.push({
+      const pass1Ceiling = Math.max(maxChars, prepared.bodyText.length + 256);
+      const pass1Meta = renderPreparedCompactCommandOutput(prepared, pass1Ceiling);
+      compactFailPrepared.push({
         index: i,
         spec,
         badgeLine,
         header,
         prepared,
-        pass1Body,
-        pass1Block: `${header}${pass1Body}`
+        pass1Body: pass1Meta.text,
+        pass1Block: `${header}${pass1Meta.text}`,
+        pass1Truncated: pass1Meta.truncated
       });
     }
-    if (failEntries.length > 0) {
-      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
-      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
-      const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
-      const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
-      if (passEntries.length > 0) {
-        const totalFailDemandChars = failEntries.reduce(
-          (sum, f) => sum + f.pass1Block.length,
-          0
+  }
+  const renderOutput = (targetMaxChars, targetMaxBytes) => {
+    const bodyBudget = Math.max(0, targetMaxChars - summaryHeader.length - separator.length);
+    const bodyByteBudget = Math.max(
+      0,
+      targetMaxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8")
+    );
+    const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
+    const totalSepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
+    const availChars = Math.max(0, bodyBudget - totalSepChars);
+    const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
+    let truncated = false;
+    let blocks;
+    if (outputMode === "full" && fullPreparedEntries) {
+      const rawEntries = fullPreparedEntries.map((entry) => {
+        if (entry.notRun) {
+          const block = formatNotRunBlock(entry.spec, availChars);
+          return {
+            notRun: true,
+            block,
+            charSize: block.length,
+            byteSize: Buffer.byteLength(block, "utf8")
+          };
+        }
+        return entry;
+      });
+      const fullCharBudgets = computeWaterFillBudgets(
+        rawEntries.map((e) => e.charSize),
+        availChars
+      );
+      const fullByteBudgets = computeWaterFillBudgets(
+        rawEntries.map((e) => e.byteSize),
+        availBytes
+      );
+      blocks = rawEntries.map((entry, idx) => {
+        if (entry.notRun) return entry.block;
+        const charShare = fullCharBudgets[idx] ?? 0;
+        const byteShare = fullByteBudgets[idx] ?? 0;
+        if (entry.charSize <= charShare && entry.byteSize <= byteShare) {
+          return entry.fullBlock;
+        }
+        truncated = true;
+        const prefix = formatCmdHeaderPrefix(
+          entry.headerLine,
+          entry.spec.command,
+          charShare,
+          byteShare
         );
-        const totalFailDemandBytes = failEntries.reduce(
-          (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
-          0
+        const allowedChars = Math.max(0, charShare - prefix.length);
+        const allowedBytes = Math.max(
+          0,
+          byteShare - Buffer.byteLength(prefix, "utf8")
         );
-        const maxFailCeilingChars = Math.floor(availAfterNotRunChars * 0.85);
-        const maxFailCeilingBytes = Math.floor(availAfterNotRunBytes * 0.85);
-        const failFloorChars = Math.min(
-          maxFailCeilingChars,
-          Math.max(
-            failEntries.reduce(
-              (sum, f) => sum + Math.min(f.header.length, 120) + Math.min(f.pass1Body.length, 160),
-              0
-            ),
-            Math.floor(availAfterNotRunChars * 0.6)
-          )
-        );
-        const failFloorBytes = Math.min(
-          maxFailCeilingBytes,
-          Math.max(
-            failEntries.reduce(
-              (sum, f) => sum + Math.min(Buffer.byteLength(f.header, "utf8"), 120) + Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
-              0
-            ),
-            Math.floor(availAfterNotRunBytes * 0.6)
-          )
-        );
-        const desiredFailChars = Math.min(totalFailDemandChars, failFloorChars);
-        const desiredFailBytes = Math.min(totalFailDemandBytes, failFloorBytes);
-        if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
-          const passPoolChars = Math.max(
-            0,
-            availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars)
-          );
-          const passPoolBytes = Math.max(
-            0,
-            availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes)
-          );
-          const passCharShares = computeWaterFillBudgets(
-            passEntries.map((p) => p.fullBlock.length),
-            passPoolChars
-          );
-          const passByteShares = computeWaterFillBudgets(
-            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
-            passPoolBytes
-          );
-          passChars = 0;
-          passBytes = 0;
-          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
-            const p = passEntries[pIdx];
-            const shareChars = passCharShares[pIdx] ?? 0;
-            const shareBytes = passByteShares[pIdx] ?? 0;
-            let shrunk = p.fullBlock;
-            if (shrunk.length > shareChars || Buffer.byteLength(shrunk, "utf8") > shareBytes) {
-              const noCmd = `${p.compactHeader}: ${p.body}`;
-              if (noCmd.length <= shareChars && Buffer.byteLength(noCmd, "utf8") <= shareBytes) {
-                shrunk = noCmd;
-              } else {
-                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
-                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
-                const bodyBytesAvail = shareBytes - hdrBytes - 2;
-                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
-                  const trimmedBody = sliceUtf8Bytes(
-                    sliceSafeChars(p.body, bodyCharsAvail - 3),
-                    bodyBytesAvail - 3
-                  );
-                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
-                } else if (p.compactHeader.length <= shareChars && hdrBytes <= shareBytes) {
-                  shrunk = p.compactHeader;
-                } else {
-                  shrunk = sliceUtf8Bytes(
-                    sliceSafeChars(p.compactHeader, shareChars),
-                    shareBytes
-                  );
-                }
-              }
-            }
-            blocks[p.index] = shrunk;
-            passChars += shrunk.length;
-            passBytes += Buffer.byteLength(shrunk, "utf8");
-          }
+        let body = entry.rawBody;
+        if (Buffer.byteLength(body, "utf8") > allowedBytes) {
+          body = truncateHeadTailWithByteNotice(body, allowedBytes);
+        }
+        if (body.length > allowedChars) {
+          body = truncateHeadTailWithNotice(body, allowedChars);
+        }
+        return `${prefix}${body}`;
+      });
+    } else {
+      blocks = new Array(outcomes.length);
+      const passEntries = compactPassPrepared ?? [];
+      const failEntries = compactFailPrepared ?? [];
+      let notRunChars = 0;
+      let notRunBytes = 0;
+      let passChars = 0;
+      let passBytes = 0;
+      for (let i = 0; i < outcomes.length; i++) {
+        const { spec, result } = outcomes[i];
+        if (!result) {
+          const block = formatNotRunBlock(spec, availChars);
+          blocks[i] = block;
+          notRunChars += block.length;
+          notRunBytes += Buffer.byteLength(block, "utf8");
         }
       }
-      const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
-      const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
-      const charBlockBudgets = computeWaterFillBudgets(
-        failEntries.map((entry) => entry.pass1Block.length),
-        failPoolChars
-      );
-      const byteBlockBudgets = computeWaterFillBudgets(
-        failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
-        failPoolBytes
-      );
-      for (let j = 0; j < failEntries.length; j++) {
-        const entry = failEntries[j];
-        const blockCharBudget = charBlockBudgets[j] ?? 0;
-        const blockByteBudget = byteBlockBudgets[j] ?? 0;
-        const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
-        const effectiveHeader = formatCmdHeaderPrefix(
-          entry.badgeLine,
-          entry.spec.command,
-          blockCharBudget,
-          blockByteBudget
-        );
-        const headerChars = effectiveHeader.length;
-        const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
-        const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
-        const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
-        if (entry.pass1Body.length <= allowedBodyChars && pass1BodyBytes <= allowedBodyBytes) {
-          blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
-          continue;
-        }
-        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
-        let targetChars = Math.min(
-          allowedBodyChars,
-          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar))
-        );
-        let compactedBody = targetChars > 0 ? renderPreparedCompactCommandOutput(entry.prepared, targetChars).text : "";
-        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
-          const curBytes = Buffer.byteLength(compactedBody, "utf8");
-          if (curBytes <= allowedBodyBytes) break;
-          const basisChars = Math.min(targetChars, compactedBody.length);
-          if (basisChars <= 1) {
-            targetChars = 1;
-            compactedBody = renderPreparedCompactCommandOutput(entry.prepared, 1).text;
-            break;
-          }
-          targetChars = Math.max(
-            1,
-            Math.min(
-              basisChars - 1,
-              Math.floor(basisChars * (allowedBodyBytes / curBytes) * 0.98)
+      for (const p of passEntries) {
+        if (p.truncated) truncated = true;
+        blocks[p.index] = p.fullBlock;
+        passChars += p.fullBlock.length;
+        passBytes += Buffer.byteLength(p.fullBlock, "utf8");
+      }
+      if (failEntries.length > 0) {
+        const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+        const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
+        const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+        const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+        if (passEntries.length > 0) {
+          const totalFailDemandChars = failEntries.reduce(
+            (sum, f) => sum + f.pass1Block.length,
+            0
+          );
+          const totalFailDemandBytes = failEntries.reduce(
+            (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
+            0
+          );
+          const maxFailCeilingChars = Math.floor(availAfterNotRunChars * 0.85);
+          const maxFailCeilingBytes = Math.floor(availAfterNotRunBytes * 0.85);
+          const failFloorChars = Math.min(
+            maxFailCeilingChars,
+            Math.max(
+              failEntries.reduce(
+                (sum, f) => sum + Math.min(f.header.length, 120) + Math.min(f.pass1Body.length, 160),
+                0
+              ),
+              Math.floor(availAfterNotRunChars * 0.6)
             )
           );
-          compactedBody = renderPreparedCompactCommandOutput(
-            entry.prepared,
-            targetChars
-          ).text;
+          const failFloorBytes = Math.min(
+            maxFailCeilingBytes,
+            Math.max(
+              failEntries.reduce(
+                (sum, f) => sum + Math.min(Buffer.byteLength(f.header, "utf8"), 120) + Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
+                0
+              ),
+              Math.floor(availAfterNotRunBytes * 0.6)
+            )
+          );
+          const desiredFailChars = Math.min(totalFailDemandChars, failFloorChars);
+          const desiredFailBytes = Math.min(totalFailDemandBytes, failFloorBytes);
+          if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
+            const passPoolChars = Math.max(
+              0,
+              availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars)
+            );
+            const passPoolBytes = Math.max(
+              0,
+              availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes)
+            );
+            const passCharShares = computeWaterFillBudgets(
+              passEntries.map((p) => p.fullBlock.length),
+              passPoolChars
+            );
+            const passByteShares = computeWaterFillBudgets(
+              passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
+              passPoolBytes
+            );
+            passChars = 0;
+            passBytes = 0;
+            for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
+              const p = passEntries[pIdx];
+              const shareChars = passCharShares[pIdx] ?? 0;
+              const shareBytes = passByteShares[pIdx] ?? 0;
+              let shrunk = p.fullBlock;
+              if (shrunk.length > shareChars || Buffer.byteLength(shrunk, "utf8") > shareBytes) {
+                truncated = true;
+                const noCmd = `${p.compactHeader}: ${p.body}`;
+                if (noCmd.length <= shareChars && Buffer.byteLength(noCmd, "utf8") <= shareBytes) {
+                  shrunk = noCmd;
+                } else {
+                  const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+                  const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+                  const bodyBytesAvail = shareBytes - hdrBytes - 2;
+                  if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+                    const trimmedBody = sliceUtf8Bytes(
+                      sliceSafeChars(p.body, bodyCharsAvail - 3),
+                      bodyBytesAvail - 3
+                    );
+                    shrunk = `${p.compactHeader}: ${trimmedBody}...`;
+                  } else if (p.compactHeader.length <= shareChars && hdrBytes <= shareBytes) {
+                    shrunk = p.compactHeader;
+                  } else {
+                    shrunk = sliceUtf8Bytes(
+                      sliceSafeChars(p.compactHeader, shareChars),
+                      shareBytes
+                    );
+                  }
+                }
+              }
+              blocks[p.index] = shrunk;
+              passChars += shrunk.length;
+              passBytes += Buffer.byteLength(shrunk, "utf8");
+            }
+          }
         }
-        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+        const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+        const charBlockBudgets = computeWaterFillBudgets(
+          failEntries.map((entry) => entry.pass1Block.length),
+          failPoolChars
+        );
+        const byteBlockBudgets = computeWaterFillBudgets(
+          failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
+          failPoolBytes
+        );
+        for (let j = 0; j < failEntries.length; j++) {
+          const entry = failEntries[j];
+          if (entry.pass1Truncated) truncated = true;
+          const blockCharBudget = charBlockBudgets[j] ?? 0;
+          const blockByteBudget = byteBlockBudgets[j] ?? 0;
+          const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
+          const effectiveHeader = formatCmdHeaderPrefix(
+            entry.badgeLine,
+            entry.spec.command,
+            blockCharBudget,
+            blockByteBudget
+          );
+          const headerChars = effectiveHeader.length;
+          const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
+          const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
+          const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
+          if (entry.pass1Body.length <= allowedBodyChars && pass1BodyBytes <= allowedBodyBytes) {
+            blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
+            continue;
+          }
+          truncated = true;
+          const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+          let targetChars = Math.min(
+            allowedBodyChars,
+            Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar))
+          );
+          let compactedBody = targetChars > 0 ? renderPreparedCompactCommandOutput(entry.prepared, targetChars).text : "";
+          for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+            const curBytes = Buffer.byteLength(compactedBody, "utf8");
+            if (curBytes <= allowedBodyBytes) break;
+            const basisChars = Math.min(targetChars, compactedBody.length);
+            if (basisChars <= 1) {
+              targetChars = 1;
+              compactedBody = renderPreparedCompactCommandOutput(entry.prepared, 1).text;
+              break;
+            }
+            targetChars = Math.max(
+              1,
+              Math.min(
+                basisChars - 1,
+                Math.floor(basisChars * (allowedBodyBytes / curBytes) * 0.98)
+              )
+            );
+            compactedBody = renderPreparedCompactCommandOutput(
+              entry.prepared,
+              targetChars
+            ).text;
+          }
+          blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        }
+      }
+    }
+    const nonEmptyBlocks = blocks.filter((b) => b.length > 0);
+    const rawJoined = nonEmptyBlocks.join(separator);
+    const fittedBlocks = fitSectionsToByteBudget(
+      nonEmptyBlocks,
+      bodyBudget,
+      bodyByteBudget,
+      separator,
+      "head-tail"
+    );
+    if (fittedBlocks !== rawJoined) truncated = true;
+    const assembled = `${summaryHeader}${separator}${fittedBlocks}`;
+    let text = truncateWithNotice(assembled, targetMaxChars);
+    if (text !== assembled) truncated = true;
+    const byteCapped = truncateWithByteNotice(text, targetMaxBytes);
+    if (byteCapped !== text) truncated = true;
+    text = byteCapped;
+    return { text, truncated, bodyBudget, bodyByteBudget };
+  };
+  const initial = renderOutput(maxChars, maxBytes);
+  if (initial.truncated) {
+    const spillContent = buildRunChecksSpillContent(summaryHeader, outcomes);
+    const reservation = reserveSpill({
+      tool: "run_checks",
+      rawContent: spillContent,
+      totalMaxChars: maxChars,
+      totalMaxBytes: maxBytes,
+      availableBodyChars: initial.bodyBudget,
+      availableBodyBytes: initial.bodyByteBudget
+    });
+    if (reservation) {
+      const footer = reservation.commit();
+      if (footer) {
+        const reduced = renderOutput(
+          maxChars - reservation.footerChars,
+          maxBytes - reservation.footerBytes
+        );
+        const withFooter = `${reduced.text}${footer}`;
+        if (withFooter.length <= maxChars && Buffer.byteLength(withFooter, "utf8") <= maxBytes) {
+          return { text: withFooter, isError: false };
+        }
       }
     }
   }
-  const nonEmptyBlocks = blocks.filter((b) => b.length > 0);
-  const fittedBlocks = fitSectionsToByteBudget(
-    nonEmptyBlocks,
-    bodyBudget,
-    bodyByteBudget,
-    separator,
-    "head-tail"
-  );
-  let text = truncateWithNotice(
-    `${summaryHeader}${separator}${fittedBlocks}`,
-    maxChars
-  );
-  if (maxBytes !== void 0) {
-    text = truncateWithByteNotice(text, maxBytes);
+  return { text: initial.text, isError: false };
+}
+function buildRunChecksSpillContent(summaryHeader, outcomes) {
+  const sections = [summaryHeader];
+  for (const { spec, result, passed } of outcomes) {
+    if (!result) {
+      sections.push(`## [NOT RUN] ${spec.name}
+$ ${spec.command}`);
+      continue;
+    }
+    const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
+    const headerLine = `## [${badge} ${result.durationMs}ms] ${spec.name}
+$ ${spec.command}`;
+    if (result.error) {
+      sections.push(`${headerLine}
+spawn error: ${result.error}`);
+      continue;
+    }
+    const out = normalizeTerminalOutput(result.stdout);
+    const err = normalizeTerminalOutput(result.stderr);
+    const combined = [out, err].filter(Boolean).join("\n");
+    const body = result.timedOut ? combined ? `TIMED OUT
+${combined}` : "TIMED OUT (no output)" : combined || "(no output)";
+    sections.push(`${headerLine}
+${body}`);
   }
-  return { text, isError: false };
+  return `${sections.join("\n\n")}
+`;
 }
 function clampInt2(val, min, max, fallback) {
   if (typeof val !== "number" && typeof val !== "string") return fallback;
@@ -10012,9 +10525,9 @@ function shouldCliExitNonZero(tool, result) {
 }
 
 // src/mcp-server-core.ts
-import fs7 from "node:fs";
-import os4 from "node:os";
-import path8 from "node:path";
+import fs8 from "node:fs";
+import os5 from "node:os";
+import path9 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/protocol/mcp.ts
@@ -10658,9 +11171,9 @@ ${serialized}`);
 };
 
 // src/utils/host-compat.ts
-import fs5 from "node:fs";
-import os3 from "node:os";
-import path6 from "node:path";
+import fs6 from "node:fs";
+import os4 from "node:os";
+import path7 from "node:path";
 var HOST_COMPAT_RULES = [
   {
     id: "agy-cli-1.5-call-mcp-tool-empty-edits",
@@ -10929,13 +11442,13 @@ function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
-  const cacheDir = custom ? path6.resolve(custom) : path6.join(home, ".gemini", "cache", "agy-fast");
-  return path6.join(cacheDir, "config.json");
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os4.homedir() : env.HOME || env.USERPROFILE || os4.homedir();
+  const cacheDir = custom ? path7.resolve(custom) : path7.join(home, ".gemini", "cache", "agy-fast");
+  return path7.join(cacheDir, "config.json");
 }
 function readSavedEditsFormatSync(env = process.env) {
   try {
-    const raw = fs5.readFileSync(getConfigPath(env), "utf8");
+    const raw = fs6.readFileSync(getConfigPath(env), "utf8");
     const parsed = JSON.parse(raw);
     return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
   } catch {
@@ -10944,8 +11457,8 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/utils/session-workspace.ts
-import fs6 from "node:fs";
-import path7 from "node:path";
+import fs7 from "node:fs";
+import path8 from "node:path";
 
 // src/utils/snapshot.ts
 var SNAPSHOT_COLLAPSE_DIRS = /* @__PURE__ */ new Set([
@@ -10984,12 +11497,12 @@ var MANIFEST_SKIP_SUBDIRS_LOWER = new Set(
 
 // src/utils/session-workspace.ts
 function isFullAbsolutePath(dirPath) {
-  return process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(dirPath) : path7.isAbsolute(dirPath);
+  return process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(dirPath) : path8.isAbsolute(dirPath);
 }
 function canonicalizeDirSync(dirPath) {
-  const resolved = path7.resolve(dirPath);
+  const resolved = path8.resolve(dirPath);
   try {
-    return typeof fs6.realpathSync.native === "function" ? fs6.realpathSync.native(resolved) : fs6.realpathSync(resolved);
+    return typeof fs7.realpathSync.native === "function" ? fs7.realpathSync.native(resolved) : fs7.realpathSync(resolved);
   } catch {
     return resolved;
   }
@@ -10998,8 +11511,8 @@ function isSameOrSubdir(candidate, root) {
   const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
   const normRoot = caseInsensitive ? root.toLowerCase() : root;
-  const rel = path7.relative(normRoot, normCandidate);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${path7.sep}`) && !path7.isAbsolute(rel);
+  const rel = path8.relative(normRoot, normCandidate);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${path8.sep}`) && !path8.isAbsolute(rel);
 }
 function isInstalledPluginPath(dirPath) {
   const posix = dirPath.replace(/\\/g, "/");
@@ -11009,19 +11522,19 @@ function isInstalledPluginPath(dirPath) {
 }
 function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.env, options = {}) {
   const allowLinkedDevCheckout = options.allowLinkedDevCheckout === true;
-  const resolvedCandidate = path7.resolve(candidateDir);
+  const resolvedCandidate = path8.resolve(candidateDir);
   const canonCandidate = canonicalizeDirSync(resolvedCandidate);
   for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
     if (typeof envRoot === "string" && envRoot.trim()) {
       const trimmedEnvRoot = envRoot.trim();
-      const resolvedEnvRoot = path7.resolve(trimmedEnvRoot);
+      const resolvedEnvRoot = path8.resolve(trimmedEnvRoot);
       const canonEnvRoot = canonicalizeDirSync(resolvedEnvRoot);
       if (isSameOrSubdir(canonCandidate, canonEnvRoot)) {
         if (!allowLinkedDevCheckout) {
           return trimmedEnvRoot;
         }
-        const isDevCheckout = fs6.existsSync(
-          path7.join(canonEnvRoot, "src", "mcp-server.ts")
+        const isDevCheckout = fs7.existsSync(
+          path8.join(canonEnvRoot, "src", "mcp-server.ts")
         );
         if (!isDevCheckout || isSameOrSubdir(resolvedCandidate, resolvedEnvRoot) || isInstalledPluginPath(resolvedCandidate)) {
           return trimmedEnvRoot;
@@ -11029,10 +11542,10 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
       }
     }
   }
-  const resolvedScriptRoot = path7.resolve(scriptPluginRoot);
+  const resolvedScriptRoot = path8.resolve(scriptPluginRoot);
   const canonScriptRoot = canonicalizeDirSync(resolvedScriptRoot);
   if (isSameOrSubdir(canonCandidate, canonScriptRoot)) {
-    const isRuntimeOnlyInstall = fs6.existsSync(path7.join(canonScriptRoot, "plugin.json")) && !fs6.existsSync(path7.join(canonScriptRoot, "src", "mcp-server.ts"));
+    const isRuntimeOnlyInstall = fs7.existsSync(path8.join(canonScriptRoot, "plugin.json")) && !fs7.existsSync(path8.join(canonScriptRoot, "src", "mcp-server.ts"));
     if (isInstalledPluginPath(resolvedCandidate) || isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
       return scriptPluginRoot;
     }
@@ -11042,8 +11555,8 @@ function detectPluginInstallDir(candidateDir, scriptPluginRoot, env = process.en
 
 // src/mcp-server-core.ts
 var SERVER_VERSION = "0.3.2";
-var DEFAULT_PLUGIN_ROOT = path8.resolve(
-  path8.dirname(fileURLToPath2(import.meta.url)),
+var DEFAULT_PLUGIN_ROOT = path9.resolve(
+  path9.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
 var ALL_MCP_TOOLS = [
@@ -11243,14 +11756,14 @@ function isSameDir(a, b) {
 }
 function detectNonWorkspaceCwd(env, currentCwd) {
   const canonCwd = canonicalizeDirSync(currentCwd);
-  if (path8.parse(canonCwd).root === canonCwd) {
+  if (path9.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
   const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
   const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsolutePath(h));
   if (homes.length === 0 && env === process.env) {
     try {
-      const osHome = os4.homedir();
+      const osHome = os5.homedir();
       if (isFullAbsolutePath(osHome)) homes.push(osHome);
     } catch {
     }
@@ -11379,11 +11892,11 @@ function createAgyFastServer(options = {}) {
         value: { ...args, cwd: void 0 }
       };
     }
-    if (!path8.isAbsolute(rawCwd) && !isHomePath) {
+    if (!path9.isAbsolute(rawCwd) && !isHomePath) {
       if (defaultCwd) {
         return {
           ok: true,
-          value: { ...args, cwd: path8.resolve(defaultCwd, rawCwd) }
+          value: { ...args, cwd: path9.resolve(defaultCwd, rawCwd) }
         };
       }
       const pluginFallbackDir = detectPluginInstallCwd(
@@ -11425,12 +11938,12 @@ function createAgyFastServer(options = {}) {
       if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
       const trimmed = rawCwd.trim();
       const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
-      return !path8.isAbsolute(trimmed) && !isHome;
+      return !path9.isAbsolute(trimmed) && !isHome;
     },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs7.statSync(candidate).isDirectory()) {
+          if (fs8.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }

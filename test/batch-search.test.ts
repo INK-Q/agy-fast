@@ -1102,6 +1102,9 @@ describe("batch_search", () => {
         await fs.writeFile(path.join(fourDir, name), `${chunks.join("\n")}\n`, "utf8");
       }
 
+      const normalizeSpillPath = (text: string) =>
+        text.replace(/spill-\d+-[a-z0-9_-]+-[0-9a-f]+\.txt/g, "spill-<id>.txt");
+
       const fourQuery = [{ type: "text" as const, pattern: "return ", contextLines: 2, maxResults: 40 }];
       const rgFour = await runBatchSearch({ cwd: fourDir, maxChars: 1200, queries: fourQuery });
       const nodeFour = await runBatchSearch(
@@ -1109,7 +1112,11 @@ describe("batch_search", () => {
         { forceNodeFallback: true },
       );
       assert.equal(rgFour.isError, false);
-      assert.equal(rgFour.text, nodeFour.text, "4-file budgeted output must match between rg and Node fallback");
+      assert.equal(
+        normalizeSpillPath(rgFour.text),
+        normalizeSpillPath(nodeFour.text),
+        "4-file budgeted output must match between rg and Node fallback",
+      );
       assert.ok(rgFour.text.length <= 1200, `Expected <= 1200 chars, got ${rgFour.text.length}`);
       for (const name of ["a.ts", "b.ts", "c.ts", "d.ts"]) {
         assert.ok(rgFour.text.includes(`\n${name}\n`), `Expected ${name} to be shown:\n${rgFour.text}`);
@@ -1144,7 +1151,7 @@ describe("batch_search", () => {
         { cwd: ctxOnlyDir, maxChars: 900, queries: ctxOnlyQuery },
         { forceNodeFallback: true },
       );
-      assert.equal(rgCtxOnly.text, nodeCtxOnly.text);
+      assert.equal(normalizeSpillPath(rgCtxOnly.text), normalizeSpillPath(nodeCtxOnly.text));
       assert.ok(rgCtxOnly.text.length <= 900);
       for (const name of ["f1.ts", "f2.ts", "f3.ts", "f4.ts"]) {
         assert.ok(rgCtxOnly.text.includes(`${name}_m1`), rgCtxOnly.text);
@@ -1171,7 +1178,7 @@ describe("batch_search", () => {
         { cwd: manyFilesDir, maxChars: 1400, queries: manyQuery },
         { forceNodeFallback: true },
       );
-      assert.equal(rgManyTight.text, nodeManyTight.text);
+      assert.equal(normalizeSpillPath(rgManyTight.text), normalizeSpillPath(nodeManyTight.text));
       assert.ok(rgManyTight.text.length <= 1400);
       assert.ok(Buffer.byteLength(rgManyTight.text, "utf8") <= 8_800);
       assert.match(rgManyTight.text, /more files: mod_\d+\.ts \(3\)/);
@@ -1185,7 +1192,7 @@ describe("batch_search", () => {
         { cwd: manyFilesDir, queries: manyQuery },
         { forceNodeFallback: true },
       );
-      assert.equal(rgManyDefault.text, nodeManyDefault.text);
+      assert.equal(normalizeSpillPath(rgManyDefault.text), normalizeSpillPath(nodeManyDefault.text));
       assert.ok(
         Buffer.byteLength(rgManyDefault.text, "utf8") <= 8_800,
         `Expected <= 8800 UTF-8 bytes, got ${Buffer.byteLength(rgManyDefault.text, "utf8")}`,
@@ -1224,7 +1231,11 @@ describe("batch_search", () => {
         { forceNodeFallback: true },
       );
       assert.equal(rgMixed.isError, false);
-      assert.equal(rgMixed.text, nodeMixed.text, "mixed multi-query budgeted output must match between rg and Node fallback");
+      assert.equal(
+        normalizeSpillPath(rgMixed.text),
+        normalizeSpillPath(nodeMixed.text),
+        "mixed multi-query budgeted output must match between rg and Node fallback",
+      );
       assert.ok(rgMixed.text.length <= 2400, `Expected <= 2400 chars, got ${rgMixed.text.length}`);
       assert.ok(Buffer.byteLength(rgMixed.text, "utf8") <= 8_800);
 

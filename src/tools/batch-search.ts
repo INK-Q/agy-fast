@@ -29,6 +29,7 @@ import {
   fitSectionsToByteBudget,
   sliceSafeChars,
 } from "../utils/output-filter.js";
+import { reserveSpill } from "../utils/spill.js";
 
 export type SearchQueryType = "text" | "regex" | "glob" | "fuzzy" | "git";
 
@@ -2588,53 +2589,90 @@ export async function runBatchSearch(
   const separator = "\n\n";
   const rawSections = executed.map((e) => e.text);
   const joined = rawSections.join(separator);
+  const joinedBytes = Buffer.byteLength(joined, "utf8");
   const sepChars = separator.length * Math.max(0, rawSections.length - 1);
   const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, rawSections.length - 1);
+  const rawCharLens = rawSections.map((s) => s.length);
+  const rawByteLens = rawSections.map((s) => Buffer.byteLength(s, "utf8"));
 
-  const overChars = joined.length > maxChars;
-  const overBytes = Buffer.byteLength(joined, "utf8") > maxBytes;
+  const renderFittedSections = (targetMaxChars: number, targetMaxBytes: number): string => {
+    const overChars = joined.length > targetMaxChars;
+    const overBytes = joinedBytes > targetMaxBytes;
 
-  let finalSections = rawSections;
-  if (overChars || overBytes) {
-    const rawCharLens = rawSections.map((s) => s.length);
-    const rawByteLens = rawSections.map((s) => Buffer.byteLength(s, "utf8"));
-    const byteBudgets = overBytes
-      ? computeWaterFillBudgets(rawByteLens, Math.max(0, maxBytes - sepBytes))
-      : rawByteLens.map(() => maxBytes);
-    const charBudgets = overChars
-      ? computeWaterFillBudgets(rawCharLens, Math.max(0, maxChars - sepChars))
-      : computeWaterFillBudgets(
-          rawCharLens.map((len, idx) =>
-            rawByteLens[idx]! > byteBudgets[idx]! ? maxChars : len,
-          ),
-          Math.max(0, maxChars - sepChars),
-        );
+    let finalSections = rawSections;
+    if (overChars || overBytes) {
+      const byteBudgets = overBytes
+        ? computeWaterFillBudgets(rawByteLens, Math.max(0, targetMaxBytes - sepBytes))
+        : rawByteLens.map(() => targetMaxBytes);
+      const charBudgets = overChars
+        ? computeWaterFillBudgets(rawCharLens, Math.max(0, targetMaxChars - sepChars))
+        : computeWaterFillBudgets(
+            rawCharLens.map((len, idx) =>
+              rawByteLens[idx]! > byteBudgets[idx]! ? targetMaxChars : len,
+            ),
+            Math.max(0, targetMaxChars - sepChars),
+          );
 
-    finalSections = executed.map((ex, idx) => {
-      const charBudget = charBudgets[idx] ?? 0;
-      const byteBudget = byteBudgets[idx] ?? 0;
-      if (
-        !ex.contentResult ||
-        (rawCharLens[idx]! <= charBudget && rawByteLens[idx]! <= byteBudget)
-      ) {
-        return ex.text;
-      }
-      const budgeted = formatBudgetedContentSection({
-        header: ex.header,
-        files: ex.contentResult.files,
-        totalMatches: ex.contentResult.totalMatches,
-        maxResultsTruncated: ex.contentResult.truncated,
-        contextLines: ex.contentResult.contextLines,
-        charBudget,
-        byteBudget,
+      finalSections = executed.map((ex, idx) => {
+        const charBudget = charBudgets[idx] ?? 0;
+        const byteBudget = byteBudgets[idx] ?? 0;
+        if (
+          !ex.contentResult ||
+          (rawCharLens[idx]! <= charBudget && rawByteLens[idx]! <= byteBudget)
+        ) {
+          return ex.text;
+        }
+        const budgeted = formatBudgetedContentSection({
+          header: ex.header,
+          files: ex.contentResult.files,
+          totalMatches: ex.contentResult.totalMatches,
+          maxResultsTruncated: ex.contentResult.truncated,
+          contextLines: ex.contentResult.contextLines,
+          charBudget,
+          byteBudget,
+        });
+        return budgeted ?? ex.text;
       });
-      return budgeted ?? ex.text;
+    }
+
+    // Allocate budget fairly across queries via water-filling within targetMaxChars & UTF-8 byte ceiling
+    return fitSectionsToByteBudget(finalSections, targetMaxChars, targetMaxBytes, separator);
+  };
+
+  const initialText = renderFittedSections(maxChars, maxBytes);
+  const wasTruncated =
+    joined.length > maxChars || joinedBytes > maxBytes || initialText !== joined;
+
+  if (wasTruncated) {
+    const spillContent = joined.endsWith("\n") ? joined : `${joined}\n`;
+    const reservation = reserveSpill({
+      tool: "batch_search",
+      rawContent: spillContent,
+      totalMaxChars: maxChars,
+      totalMaxBytes: maxBytes,
+      availableBodyChars: Math.max(0, maxChars - sepChars),
+      availableBodyBytes: Math.max(0, maxBytes - sepBytes),
     });
+    if (reservation) {
+      const footer = reservation.commit();
+      if (footer) {
+        const reducedText = renderFittedSections(
+          maxChars - reservation.footerChars,
+          maxBytes - reservation.footerBytes,
+        );
+        const withFooter = `${reducedText}${footer}`;
+        if (
+          withFooter.length <= maxChars &&
+          Buffer.byteLength(withFooter, "utf8") <= maxBytes
+        ) {
+          return { text: withFooter, isError: false };
+        }
+      }
+    }
   }
 
-  // Allocate budget fairly across queries via water-filling within maxChars & inline UTF-8 byte ceiling
   return {
-    text: fitSectionsToByteBudget(finalSections, maxChars, maxBytes, separator),
+    text: initialText,
     isError: false,
   };
 }

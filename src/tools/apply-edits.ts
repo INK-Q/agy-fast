@@ -22,12 +22,14 @@ import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
   formatExitFailureLabel,
+  normalizeTerminalOutput,
   prepareCompactCommandOutput,
   renderPreparedCompactCommandOutput,
   sliceSafeChars,
   truncateHeadTailWithByteNotice,
   truncateWithByteNotice,
 } from "../utils/output-filter.js";
+import { reserveSpill } from "../utils/spill.js";
 
 export interface EditHunk {
   target: string;
@@ -2159,41 +2161,103 @@ export async function runApplyEdits(
         Buffer.byteLength(verifyPrefix, "utf8"),
     );
 
-    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
-    let formatted = renderPreparedCompactCommandOutput(
-      preparedVerify,
-      targetChars,
-    ).text;
-    for (let iter = 0; iter < 4; iter++) {
-      const actualBytes = Buffer.byteLength(formatted, "utf8");
-      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
-      targetChars = Math.max(
-        64,
-        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94),
-      );
-      formatted = renderPreparedCompactCommandOutput(
+    const renderVerifyResponse = (
+      bodyCharLimit: number,
+      bodyByteLimit: number,
+      totalByteLimit: number,
+    ): { text: string; appliedSection: string; verifyTruncated: boolean } => {
+      let targetChars = Math.min(bodyCharLimit, bodyByteLimit);
+      let rendered = renderPreparedCompactCommandOutput(
         preparedVerify,
         targetChars,
-      ).text;
-    }
-    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
-      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
-    }
+      );
+      let formatted = rendered.text;
+      let verifyTruncated = rendered.truncated;
+      for (let iter = 0; iter < 4; iter++) {
+        const actualBytes = Buffer.byteLength(formatted, "utf8");
+        if (actualBytes <= bodyByteLimit || targetChars <= 64) break;
+        targetChars = Math.max(
+          64,
+          Math.floor(targetChars * (bodyByteLimit / actualBytes) * 0.94),
+        );
+        rendered = renderPreparedCompactCommandOutput(
+          preparedVerify,
+          targetChars,
+        );
+        formatted = rendered.text;
+        if (rendered.truncated) verifyTruncated = true;
+      }
+      if (Buffer.byteLength(formatted, "utf8") > bodyByteLimit) {
+        formatted = truncateHeadTailWithByteNotice(formatted, bodyByteLimit);
+        verifyTruncated = true;
+      }
 
-    const verifySection = `${verifyPrefix}${formatted}`;
-    const remainingAppliedBytes =
-      DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
-    const appliedSection = compactSummaryLinesToBytes(
-      header,
-      summaryLines,
-      noOpCount,
-      Math.max(64, remainingAppliedBytes),
+      const verifySection = `${verifyPrefix}${formatted}`;
+      const remainingAppliedBytes =
+        totalByteLimit - Buffer.byteLength(verifySection, "utf8");
+      const appliedSection = compactSummaryLinesToBytes(
+        header,
+        summaryLines,
+        noOpCount,
+        Math.max(64, remainingAppliedBytes),
+      );
+      const combined = `${appliedSection}${verifySection}`;
+      if (Buffer.byteLength(combined, "utf8") <= totalByteLimit) {
+        return { text: combined, appliedSection, verifyTruncated };
+      }
+      return {
+        text: truncateWithByteNotice(combined, totalByteLimit),
+        appliedSection,
+        verifyTruncated: true,
+      };
+    };
+
+    const initialVerify = renderVerifyResponse(
+      maxVerifyChars,
+      maxVerifyBodyBytes,
+      DEFAULT_INLINE_MAX_BYTES,
     );
-    const combined = `${appliedSection}${verifySection}`;
-    let finalText =
-      Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES
-        ? combined
-        : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES);
+    let finalText = initialVerify.text;
+    let appliedSection = initialVerify.appliedSection;
+
+    if (initialVerify.verifyTruncated) {
+      const rawOut = normalizeTerminalOutput(res.stdout);
+      const rawErr = normalizeTerminalOutput(res.stderr);
+      const rawCombined = [rawOut, rawErr].filter(Boolean).join("\n");
+      const rawVerifyBody = res.error
+        ? `spawn error: ${res.error}`
+        : res.timedOut
+          ? rawCombined
+            ? `TIMED OUT\n${rawCombined}`
+            : "TIMED OUT (no output)"
+          : rawCombined || "(no output)";
+      const rawVerifySpill = `Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n${rawVerifyBody}\n`;
+      const reservation = reserveSpill({
+        tool: "apply_edits",
+        rawContent: rawVerifySpill,
+        totalMaxChars: Math.min(maxVerifyChars, DEFAULT_INLINE_MAX_BYTES),
+        totalMaxBytes: DEFAULT_INLINE_MAX_BYTES,
+        availableBodyChars: maxVerifyChars,
+        availableBodyBytes: maxVerifyBodyBytes,
+        minBodyChars: 240,
+        minBodyBytes: 240,
+      });
+      if (reservation) {
+        const footer = reservation.commit();
+        if (footer) {
+          const reduced = renderVerifyResponse(
+            maxVerifyChars - reservation.footerChars,
+            maxVerifyBodyBytes - reservation.footerBytes,
+            DEFAULT_INLINE_MAX_BYTES - reservation.footerBytes,
+          );
+          const withFooter = `${reduced.text}${footer}`;
+          if (Buffer.byteLength(withFooter, "utf8") <= DEFAULT_INLINE_MAX_BYTES) {
+            finalText = withFooter;
+            appliedSection = reduced.appliedSection;
+          }
+        }
+      }
+    }
 
     // Priority: preserve verify diagnostics & applied summary first; only emit compact diff
     // in leftover budget when verify passed and the full applied summary fit without omission.

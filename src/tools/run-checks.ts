@@ -14,7 +14,7 @@ import {
   DEFAULT_INLINE_MAX_BYTES,
   computeWaterFillBudgets,
   fitSectionsToByteBudget,
-  formatCompactCommandOutput,
+  formatCompactCommandOutputWithMeta,
   formatExitFailureLabel,
   normalizeTerminalOutput,
   prepareCompactCommandOutput,
@@ -27,6 +27,7 @@ import {
   truncateWithNotice,
   type PreparedCompactCommandOutput,
 } from "../utils/output-filter.js";
+import { reserveSpill } from "../utils/spill.js";
 
 export interface CheckCommandSpec {
   name?: string;
@@ -262,22 +263,6 @@ export async function runChecks(
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
 
   const separator = "\n\n";
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - separator.length);
-  const bodyByteBudget =
-    maxBytes !== undefined
-      ? Math.max(
-          0,
-          maxBytes -
-            Buffer.byteLength(summaryHeader, "utf8") -
-            Buffer.byteLength(separator, "utf8"),
-        )
-      : bodyBudget;
-  const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
-  const totalSepBytes =
-    Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
-  const availChars = Math.max(0, bodyBudget - totalSepChars);
-  const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
-
   const capCmdDisplay = (cmd: string, maxCmdChars: number, maxCmdBytes: number): string => {
     if (cmd.length <= maxCmdChars && Buffer.byteLength(cmd, "utf8") <= maxCmdBytes) {
       return cmd;
@@ -287,7 +272,7 @@ export async function runChecks(
     return `${sliceUtf8Bytes(sliceSafeChars(cmd, charCap), byteCap)}...`;
   };
 
-  const formatNotRunBlock = (spec: NormalizedCommand): string => {
+  const formatNotRunBlock = (spec: NormalizedCommand, availChars: number): string => {
     const baseHeader = `## [NOT RUN] ${spec.name}`;
     const notRunBudgetTotal =
       failedCount > 0
@@ -338,126 +323,73 @@ export async function runChecks(
     return `${headerLine}\n$ ${displayCmd}\n`;
   };
 
-  let blocks: string[];
-  if (outputMode === "full") {
-    // True water-filling in full mode (short/empty commands donate 100% of unused budget
-    // to rich commands) combined with single-pass Head-Tail folding + header capping.
-    const rawEntries = outcomes.map(({ spec, result, passed }) => {
-      if (!result) {
-        const block = formatNotRunBlock(spec);
-        return {
-          notRun: true as const,
-          block,
-          charSize: block.length,
-          byteSize: Buffer.byteLength(block, "utf8"),
-        };
-      }
-      const badge = result.error
-        ? "ERROR"
-        : result.timedOut
-          ? "TIMEOUT"
-          : passed
-            ? "PASS"
-            : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
-      const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
-      const fullPrefix = `${headerLine}\n$ ${spec.command}\n`;
-      const combined = [
-        normalizeTerminalOutput(result.stdout),
-        normalizeTerminalOutput(result.stderr),
-      ]
-        .filter(Boolean)
-        .join("\n");
-      const rawBody = result.error
-        ? `spawn error: ${result.error}`
-        : combined || "(no output)";
-      const fullBlock = `${fullPrefix}${rawBody}`;
-      return {
-        notRun: false as const,
-        spec,
-        headerLine,
-        fullPrefix,
-        rawBody,
-        fullBlock,
-        charSize: fullBlock.length,
-        byteSize: Buffer.byteLength(fullBlock, "utf8"),
-      };
-    });
+  // Precompute normalized/prepared entries once so optional spill re-budgeting avoids redundant ANSI/folding passes.
+  const fullPreparedEntries =
+    outputMode === "full"
+      ? outcomes.map(({ spec, result, passed }) => {
+          if (!result) {
+            return { notRun: true as const, spec };
+          }
+          const badge = result.error
+            ? "ERROR"
+            : result.timedOut
+              ? "TIMEOUT"
+              : passed
+                ? "PASS"
+                : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
+          const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
+          const fullPrefix = `${headerLine}\n$ ${spec.command}\n`;
+          const combined = [
+            normalizeTerminalOutput(result.stdout),
+            normalizeTerminalOutput(result.stderr),
+          ]
+            .filter(Boolean)
+            .join("\n");
+          const rawBody = result.error
+            ? `spawn error: ${result.error}`
+            : combined || "(no output)";
+          const fullBlock = `${fullPrefix}${rawBody}`;
+          return {
+            notRun: false as const,
+            spec,
+            headerLine,
+            fullPrefix,
+            rawBody,
+            fullBlock,
+            charSize: fullBlock.length,
+            byteSize: Buffer.byteLength(fullBlock, "utf8"),
+          };
+        })
+      : null;
 
-    const fullCharBudgets = computeWaterFillBudgets(
-      rawEntries.map((e) => e.charSize),
-      availChars,
-    );
-    const fullByteBudgets = computeWaterFillBudgets(
-      rawEntries.map((e) => e.byteSize),
-      availBytes,
-    );
+  interface CompactPassEntry {
+    index: number;
+    compactHeader: string;
+    body: string;
+    fullBlock: string;
+    truncated: boolean;
+  }
+  interface CompactFailEntry {
+    index: number;
+    spec: NormalizedCommand;
+    badgeLine: string;
+    header: string;
+    prepared: PreparedCompactCommandOutput;
+    pass1Body: string;
+    pass1Block: string;
+    pass1Truncated: boolean;
+  }
 
-    blocks = rawEntries.map((entry, idx) => {
-      if (entry.notRun) return entry.block;
-      const charShare = fullCharBudgets[idx] ?? 0;
-      const byteShare = fullByteBudgets[idx] ?? 0;
-      if (entry.charSize <= charShare && entry.byteSize <= byteShare) {
-        return entry.fullBlock;
-      }
-      const prefix = formatCmdHeaderPrefix(
-        entry.headerLine,
-        entry.spec.command,
-        charShare,
-        byteShare,
-      );
-      const allowedChars = Math.max(0, charShare - prefix.length);
-      const allowedBytes = Math.max(
-        0,
-        byteShare - Buffer.byteLength(prefix, "utf8"),
-      );
-      let body = entry.rawBody;
-      if (Buffer.byteLength(body, "utf8") > allowedBytes) {
-        body = truncateHeadTailWithByteNotice(body, allowedBytes);
-      }
-      if (body.length > allowedChars) {
-        body = truncateHeadTailWithNotice(body, allowedChars);
-      }
-      return `${prefix}${body}`;
-    });
-  } else {
-    // Tiered budget pool + 2-pass water-filling (zero redundant ANSI/folding passes):
-    // Fixed tier: PASS (concise 1-line summary <= 300 chars; yields budget if starving FAIL) + capped [NOT RUN]
-    // Elastic tier: FAIL / ERROR / TIMEOUT commands water-fill the remaining char & UTF-8 byte budget
-    blocks = new Array<string>(outcomes.length);
-    interface PassEntry {
-      index: number;
-      compactHeader: string;
-      body: string;
-      fullBlock: string;
-    }
-    interface FailEntry {
-      index: number;
-      spec: NormalizedCommand;
-      badgeLine: string;
-      header: string;
-      prepared: PreparedCompactCommandOutput;
-      pass1Body: string;
-      pass1Block: string;
-    }
-    const passEntries: PassEntry[] = [];
-    const failEntries: FailEntry[] = [];
-    let notRunChars = 0;
-    let notRunBytes = 0;
-    let passChars = 0;
-    let passBytes = 0;
-
+  let compactPassPrepared: CompactPassEntry[] | null = null;
+  let compactFailPrepared: CompactFailEntry[] | null = null;
+  if (outputMode !== "full") {
+    compactPassPrepared = [];
+    compactFailPrepared = [];
     for (let i = 0; i < outcomes.length; i++) {
       const { spec, result, passed } = outcomes[i]!;
-      if (!result) {
-        const block = formatNotRunBlock(spec);
-        blocks[i] = block;
-        notRunChars += block.length;
-        notRunBytes += Buffer.byteLength(block, "utf8");
-        continue;
-      }
-
+      if (!result) continue;
       if (passed) {
-        const body = formatCompactCommandOutput({
+        const meta = formatCompactCommandOutputWithMeta({
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.exitCode,
@@ -466,11 +398,14 @@ export async function runChecks(
           maxChars: 300,
         });
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
-        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
-        blocks[i] = fullBlock;
-        passChars += fullBlock.length;
-        passBytes += Buffer.byteLength(fullBlock, "utf8");
-        passEntries.push({ index: i, compactHeader, body, fullBlock });
+        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${meta.text}`;
+        compactPassPrepared.push({
+          index: i,
+          compactHeader,
+          body: meta.text,
+          fullBlock,
+          truncated: meta.truncated,
+        });
         continue;
       }
 
@@ -491,229 +426,398 @@ export async function runChecks(
         timedOut: result.timedOut,
         error: result.error,
       });
-      const pass1Ceiling = Math.max(
-        bodyBudget,
-        prepared.bodyText.length + 256,
-      );
-      const pass1Body = renderPreparedCompactCommandOutput(
-        prepared,
-        pass1Ceiling,
-      ).text;
-      failEntries.push({
+      const pass1Ceiling = Math.max(maxChars, prepared.bodyText.length + 256);
+      const pass1Meta = renderPreparedCompactCommandOutput(prepared, pass1Ceiling);
+      compactFailPrepared.push({
         index: i,
         spec,
         badgeLine,
         header,
         prepared,
-        pass1Body,
-        pass1Block: `${header}${pass1Body}`,
+        pass1Body: pass1Meta.text,
+        pass1Block: `${header}${pass1Meta.text}`,
+        pass1Truncated: pass1Meta.truncated,
       });
     }
+  }
 
-    if (failEntries.length > 0) {
-      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
-      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
+  const renderOutput = (
+    targetMaxChars: number,
+    targetMaxBytes: number,
+  ): { text: string; truncated: boolean; bodyBudget: number; bodyByteBudget: number } => {
+    const bodyBudget = Math.max(0, targetMaxChars - summaryHeader.length - separator.length);
+    const bodyByteBudget = Math.max(
+      0,
+      targetMaxBytes -
+        Buffer.byteLength(summaryHeader, "utf8") -
+        Buffer.byteLength(separator, "utf8"),
+    );
+    const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
+    const totalSepBytes =
+      Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
+    const availChars = Math.max(0, bodyBudget - totalSepChars);
+    const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
 
-      const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
-      const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+    let truncated = false;
+    let blocks: string[];
 
-      // When verbose PASS summaries would starve FAIL output, shrink PASS summaries first
-      // so FAIL blocks ALWAYS keep up to 60% of available pool (never starved by long PASS names).
-      if (passEntries.length > 0) {
-        const totalFailDemandChars = failEntries.reduce(
-          (sum, f) => sum + f.pass1Block.length,
+    if (outputMode === "full" && fullPreparedEntries) {
+      // True water-filling in full mode (short/empty commands donate 100% of unused budget
+      // to rich commands) combined with single-pass Head-Tail folding + header capping.
+      const rawEntries = fullPreparedEntries.map((entry) => {
+        if (entry.notRun) {
+          const block = formatNotRunBlock(entry.spec, availChars);
+          return {
+            notRun: true as const,
+            block,
+            charSize: block.length,
+            byteSize: Buffer.byteLength(block, "utf8"),
+          };
+        }
+        return entry;
+      });
+
+      const fullCharBudgets = computeWaterFillBudgets(
+        rawEntries.map((e) => e.charSize),
+        availChars,
+      );
+      const fullByteBudgets = computeWaterFillBudgets(
+        rawEntries.map((e) => e.byteSize),
+        availBytes,
+      );
+
+      blocks = rawEntries.map((entry, idx) => {
+        if (entry.notRun) return entry.block;
+        const charShare = fullCharBudgets[idx] ?? 0;
+        const byteShare = fullByteBudgets[idx] ?? 0;
+        if (entry.charSize <= charShare && entry.byteSize <= byteShare) {
+          return entry.fullBlock;
+        }
+        truncated = true;
+        const prefix = formatCmdHeaderPrefix(
+          entry.headerLine,
+          entry.spec.command,
+          charShare,
+          byteShare,
+        );
+        const allowedChars = Math.max(0, charShare - prefix.length);
+        const allowedBytes = Math.max(
           0,
+          byteShare - Buffer.byteLength(prefix, "utf8"),
         );
-        const totalFailDemandBytes = failEntries.reduce(
-          (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
-          0,
-        );
-        const maxFailCeilingChars = Math.floor(availAfterNotRunChars * 0.85);
-        const maxFailCeilingBytes = Math.floor(availAfterNotRunBytes * 0.85);
-        const failFloorChars = Math.min(
-          maxFailCeilingChars,
-          Math.max(
-            failEntries.reduce(
-              (sum, f) =>
-                sum + Math.min(f.header.length, 120) + Math.min(f.pass1Body.length, 160),
-              0,
-            ),
-            Math.floor(availAfterNotRunChars * 0.6),
-          ),
-        );
-        const failFloorBytes = Math.min(
-          maxFailCeilingBytes,
-          Math.max(
-            failEntries.reduce(
-              (sum, f) =>
-                sum +
-                Math.min(Buffer.byteLength(f.header, "utf8"), 120) +
-                Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
-              0,
-            ),
-            Math.floor(availAfterNotRunBytes * 0.6),
-          ),
-        );
-        const desiredFailChars = Math.min(totalFailDemandChars, failFloorChars);
-        const desiredFailBytes = Math.min(totalFailDemandBytes, failFloorBytes);
+        let body = entry.rawBody;
+        if (Buffer.byteLength(body, "utf8") > allowedBytes) {
+          body = truncateHeadTailWithByteNotice(body, allowedBytes);
+        }
+        if (body.length > allowedChars) {
+          body = truncateHeadTailWithNotice(body, allowedChars);
+        }
+        return `${prefix}${body}`;
+      });
+    } else {
+      // Tiered budget pool + 2-pass water-filling (zero redundant ANSI/folding passes):
+      // Fixed tier: PASS (concise 1-line summary <= 300 chars; yields budget if starving FAIL) + capped [NOT RUN]
+      // Elastic tier: FAIL / ERROR / TIMEOUT commands water-fill the remaining char & UTF-8 byte budget
+      blocks = new Array<string>(outcomes.length);
+      const passEntries = compactPassPrepared ?? [];
+      const failEntries = compactFailPrepared ?? [];
+      let notRunChars = 0;
+      let notRunBytes = 0;
+      let passChars = 0;
+      let passBytes = 0;
 
-        if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
-          const passPoolChars = Math.max(
-            0,
-            availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars),
-          );
-          const passPoolBytes = Math.max(
-            0,
-            availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes),
-          );
-          const passCharShares = computeWaterFillBudgets(
-            passEntries.map((p) => p.fullBlock.length),
-            passPoolChars,
-          );
-          const passByteShares = computeWaterFillBudgets(
-            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
-            passPoolBytes,
-          );
-
-          passChars = 0;
-          passBytes = 0;
-          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
-            const p = passEntries[pIdx]!;
-            const shareChars = passCharShares[pIdx] ?? 0;
-            const shareBytes = passByteShares[pIdx] ?? 0;
-            let shrunk = p.fullBlock;
-            if (
-              shrunk.length > shareChars ||
-              Buffer.byteLength(shrunk, "utf8") > shareBytes
-            ) {
-              const noCmd = `${p.compactHeader}: ${p.body}`;
-              if (
-                noCmd.length <= shareChars &&
-                Buffer.byteLength(noCmd, "utf8") <= shareBytes
-              ) {
-                shrunk = noCmd;
-              } else {
-                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
-                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
-                const bodyBytesAvail = shareBytes - hdrBytes - 2;
-                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
-                  const trimmedBody = sliceUtf8Bytes(
-                    sliceSafeChars(p.body, bodyCharsAvail - 3),
-                    bodyBytesAvail - 3,
-                  );
-                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
-                } else if (
-                  p.compactHeader.length <= shareChars &&
-                  hdrBytes <= shareBytes
-                ) {
-                  shrunk = p.compactHeader;
-                } else {
-                  shrunk = sliceUtf8Bytes(
-                    sliceSafeChars(p.compactHeader, shareChars),
-                    shareBytes,
-                  );
-                }
-              }
-            }
-            blocks[p.index] = shrunk;
-            passChars += shrunk.length;
-            passBytes += Buffer.byteLength(shrunk, "utf8");
-          }
+      for (let i = 0; i < outcomes.length; i++) {
+        const { spec, result } = outcomes[i]!;
+        if (!result) {
+          const block = formatNotRunBlock(spec, availChars);
+          blocks[i] = block;
+          notRunChars += block.length;
+          notRunBytes += Buffer.byteLength(block, "utf8");
         }
       }
 
-      const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
-      const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+      for (const p of passEntries) {
+        if (p.truncated) truncated = true;
+        blocks[p.index] = p.fullBlock;
+        passChars += p.fullBlock.length;
+        passBytes += Buffer.byteLength(p.fullBlock, "utf8");
+      }
 
-      const charBlockBudgets = computeWaterFillBudgets(
-        failEntries.map((entry) => entry.pass1Block.length),
-        failPoolChars,
-      );
-      const byteBlockBudgets = computeWaterFillBudgets(
-        failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
-        failPoolBytes,
-      );
+      if (failEntries.length > 0) {
+        const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+        const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
 
-      for (let j = 0; j < failEntries.length; j++) {
-        const entry = failEntries[j]!;
-        const blockCharBudget = charBlockBudgets[j] ?? 0;
-        const blockByteBudget = byteBlockBudgets[j] ?? 0;
-        const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
+        const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+        const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
 
-        const effectiveHeader = formatCmdHeaderPrefix(
-          entry.badgeLine,
-          entry.spec.command,
-          blockCharBudget,
-          blockByteBudget,
-        );
-        const headerChars = effectiveHeader.length;
-        const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
-        const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
-        const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
-
-        if (
-          entry.pass1Body.length <= allowedBodyChars &&
-          pass1BodyBytes <= allowedBodyBytes
-        ) {
-          blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
-          continue;
-        }
-
-        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
-        let targetChars = Math.min(
-          allowedBodyChars,
-          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar)),
-        );
-        let compactedBody =
-          targetChars > 0
-            ? renderPreparedCompactCommandOutput(entry.prepared, targetChars).text
-            : "";
-
-        // Converge char cap using actual compactedBody.length so dense CJK tails
-        // converge in 1-2 iterations instead of stalling on diluted average density.
-        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
-          const curBytes = Buffer.byteLength(compactedBody, "utf8");
-          if (curBytes <= allowedBodyBytes) break;
-          const basisChars = Math.min(targetChars, compactedBody.length);
-          if (basisChars <= 1) {
-            targetChars = 1;
-            compactedBody = renderPreparedCompactCommandOutput(entry.prepared, 1).text;
-            break;
-          }
-          targetChars = Math.max(
-            1,
-            Math.min(
-              basisChars - 1,
-              Math.floor(basisChars * (allowedBodyBytes / curBytes) * 0.98),
+        // When verbose PASS summaries would starve FAIL output, shrink PASS summaries first
+        // so FAIL blocks ALWAYS keep up to 60% of available pool (never starved by long PASS names).
+        if (passEntries.length > 0) {
+          const totalFailDemandChars = failEntries.reduce(
+            (sum, f) => sum + f.pass1Block.length,
+            0,
+          );
+          const totalFailDemandBytes = failEntries.reduce(
+            (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
+            0,
+          );
+          const maxFailCeilingChars = Math.floor(availAfterNotRunChars * 0.85);
+          const maxFailCeilingBytes = Math.floor(availAfterNotRunBytes * 0.85);
+          const failFloorChars = Math.min(
+            maxFailCeilingChars,
+            Math.max(
+              failEntries.reduce(
+                (sum, f) =>
+                  sum + Math.min(f.header.length, 120) + Math.min(f.pass1Body.length, 160),
+                0,
+              ),
+              Math.floor(availAfterNotRunChars * 0.6),
             ),
           );
-          compactedBody = renderPreparedCompactCommandOutput(
-            entry.prepared,
-            targetChars,
-          ).text;
+          const failFloorBytes = Math.min(
+            maxFailCeilingBytes,
+            Math.max(
+              failEntries.reduce(
+                (sum, f) =>
+                  sum +
+                  Math.min(Buffer.byteLength(f.header, "utf8"), 120) +
+                  Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
+                0,
+              ),
+              Math.floor(availAfterNotRunBytes * 0.6),
+            ),
+          );
+          const desiredFailChars = Math.min(totalFailDemandChars, failFloorChars);
+          const desiredFailBytes = Math.min(totalFailDemandBytes, failFloorBytes);
+
+          if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
+            const passPoolChars = Math.max(
+              0,
+              availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars),
+            );
+            const passPoolBytes = Math.max(
+              0,
+              availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes),
+            );
+            const passCharShares = computeWaterFillBudgets(
+              passEntries.map((p) => p.fullBlock.length),
+              passPoolChars,
+            );
+            const passByteShares = computeWaterFillBudgets(
+              passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
+              passPoolBytes,
+            );
+
+            passChars = 0;
+            passBytes = 0;
+            for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
+              const p = passEntries[pIdx]!;
+              const shareChars = passCharShares[pIdx] ?? 0;
+              const shareBytes = passByteShares[pIdx] ?? 0;
+              let shrunk = p.fullBlock;
+              if (
+                shrunk.length > shareChars ||
+                Buffer.byteLength(shrunk, "utf8") > shareBytes
+              ) {
+                truncated = true;
+                const noCmd = `${p.compactHeader}: ${p.body}`;
+                if (
+                  noCmd.length <= shareChars &&
+                  Buffer.byteLength(noCmd, "utf8") <= shareBytes
+                ) {
+                  shrunk = noCmd;
+                } else {
+                  const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+                  const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+                  const bodyBytesAvail = shareBytes - hdrBytes - 2;
+                  if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+                    const trimmedBody = sliceUtf8Bytes(
+                      sliceSafeChars(p.body, bodyCharsAvail - 3),
+                      bodyBytesAvail - 3,
+                    );
+                    shrunk = `${p.compactHeader}: ${trimmedBody}...`;
+                  } else if (
+                    p.compactHeader.length <= shareChars &&
+                    hdrBytes <= shareBytes
+                  ) {
+                    shrunk = p.compactHeader;
+                  } else {
+                    shrunk = sliceUtf8Bytes(
+                      sliceSafeChars(p.compactHeader, shareChars),
+                      shareBytes,
+                    );
+                  }
+                }
+              }
+              blocks[p.index] = shrunk;
+              passChars += shrunk.length;
+              passBytes += Buffer.byteLength(shrunk, "utf8");
+            }
+          }
         }
 
-        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+        const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+
+        const charBlockBudgets = computeWaterFillBudgets(
+          failEntries.map((entry) => entry.pass1Block.length),
+          failPoolChars,
+        );
+        const byteBlockBudgets = computeWaterFillBudgets(
+          failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
+          failPoolBytes,
+        );
+
+        for (let j = 0; j < failEntries.length; j++) {
+          const entry = failEntries[j]!;
+          if (entry.pass1Truncated) truncated = true;
+          const blockCharBudget = charBlockBudgets[j] ?? 0;
+          const blockByteBudget = byteBlockBudgets[j] ?? 0;
+          const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
+
+          const effectiveHeader = formatCmdHeaderPrefix(
+            entry.badgeLine,
+            entry.spec.command,
+            blockCharBudget,
+            blockByteBudget,
+          );
+          const headerChars = effectiveHeader.length;
+          const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
+          const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
+          const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
+
+          if (
+            entry.pass1Body.length <= allowedBodyChars &&
+            pass1BodyBytes <= allowedBodyBytes
+          ) {
+            blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
+            continue;
+          }
+
+          truncated = true;
+          const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+          let targetChars = Math.min(
+            allowedBodyChars,
+            Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar)),
+          );
+          let compactedBody =
+            targetChars > 0
+              ? renderPreparedCompactCommandOutput(entry.prepared, targetChars).text
+              : "";
+
+          // Converge char cap using actual compactedBody.length so dense CJK tails
+          // converge in 1-2 iterations instead of stalling on diluted average density.
+          for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+            const curBytes = Buffer.byteLength(compactedBody, "utf8");
+            if (curBytes <= allowedBodyBytes) break;
+            const basisChars = Math.min(targetChars, compactedBody.length);
+            if (basisChars <= 1) {
+              targetChars = 1;
+              compactedBody = renderPreparedCompactCommandOutput(entry.prepared, 1).text;
+              break;
+            }
+            targetChars = Math.max(
+              1,
+              Math.min(
+                basisChars - 1,
+                Math.floor(basisChars * (allowedBodyBytes / curBytes) * 0.98),
+              ),
+            );
+            compactedBody = renderPreparedCompactCommandOutput(
+              entry.prepared,
+              targetChars,
+            ).text;
+          }
+
+          blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        }
+      }
+    }
+
+    const nonEmptyBlocks = blocks.filter((b) => b.length > 0);
+    const rawJoined = nonEmptyBlocks.join(separator);
+    const fittedBlocks = fitSectionsToByteBudget(
+      nonEmptyBlocks,
+      bodyBudget,
+      bodyByteBudget,
+      separator,
+      "head-tail",
+    );
+    if (fittedBlocks !== rawJoined) truncated = true;
+    const assembled = `${summaryHeader}${separator}${fittedBlocks}`;
+    let text = truncateWithNotice(assembled, targetMaxChars);
+    if (text !== assembled) truncated = true;
+    const byteCapped = truncateWithByteNotice(text, targetMaxBytes);
+    if (byteCapped !== text) truncated = true;
+    text = byteCapped;
+    return { text, truncated, bodyBudget, bodyByteBudget };
+  };
+
+  const initial = renderOutput(maxChars, maxBytes);
+  if (initial.truncated) {
+    const spillContent = buildRunChecksSpillContent(summaryHeader, outcomes);
+    const reservation = reserveSpill({
+      tool: "run_checks",
+      rawContent: spillContent,
+      totalMaxChars: maxChars,
+      totalMaxBytes: maxBytes,
+      availableBodyChars: initial.bodyBudget,
+      availableBodyBytes: initial.bodyByteBudget,
+    });
+    if (reservation) {
+      const footer = reservation.commit();
+      if (footer) {
+        const reduced = renderOutput(
+          maxChars - reservation.footerChars,
+          maxBytes - reservation.footerBytes,
+        );
+        const withFooter = `${reduced.text}${footer}`;
+        if (
+          withFooter.length <= maxChars &&
+          Buffer.byteLength(withFooter, "utf8") <= maxBytes
+        ) {
+          return { text: withFooter, isError: false };
+        }
       }
     }
   }
 
-  const nonEmptyBlocks = blocks.filter((b) => b.length > 0);
-  const fittedBlocks = fitSectionsToByteBudget(
-    nonEmptyBlocks,
-    bodyBudget,
-    bodyByteBudget,
-    separator,
-    "head-tail",
-  );
-  let text = truncateWithNotice(
-    `${summaryHeader}${separator}${fittedBlocks}`,
-    maxChars,
-  );
-  if (maxBytes !== undefined) {
-    text = truncateWithByteNotice(text, maxBytes);
+  return { text: initial.text, isError: false };
+}
+
+function buildRunChecksSpillContent(
+  summaryHeader: string,
+  outcomes: CheckRunOutcome[],
+): string {
+  const sections: string[] = [summaryHeader];
+  for (const { spec, result, passed } of outcomes) {
+    if (!result) {
+      sections.push(`## [NOT RUN] ${spec.name}\n$ ${spec.command}`);
+      continue;
+    }
+    const badge = result.error
+      ? "ERROR"
+      : result.timedOut
+        ? "TIMEOUT"
+        : passed
+          ? "PASS"
+          : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
+    const headerLine = `## [${badge} ${result.durationMs}ms] ${spec.name}\n$ ${spec.command}`;
+    if (result.error) {
+      sections.push(`${headerLine}\nspawn error: ${result.error}`);
+      continue;
+    }
+    const out = normalizeTerminalOutput(result.stdout);
+    const err = normalizeTerminalOutput(result.stderr);
+    const combined = [out, err].filter(Boolean).join("\n");
+    const body = result.timedOut
+      ? combined
+        ? `TIMED OUT\n${combined}`
+        : "TIMED OUT (no output)"
+      : combined || "(no output)";
+    sections.push(`${headerLine}\n${body}`);
   }
-  return { text, isError: false };
+  return `${sections.join("\n\n")}\n`;
 }
 
 function clampInt(val: unknown, min: number, max: number, fallback: number): number {
