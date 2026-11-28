@@ -94,6 +94,16 @@ describe("agy-fast --cli direct runner", () => {
     assert.match(sliceRes.stdout, /return a \+ b/);
     assert.match(sliceRes.stdout, /\[function\] greet/);
 
+    // 3b. Slice with symbol positional (`path::sym1,sym2`) and `--symbol path#sym`
+    const symCliRes = await runCliSubprocess(
+      ["slice", "src/math.ts::add,multiply", "--symbol", "src/greet.ts#greet"],
+      { cwd: tmpDir },
+    );
+    assert.equal(symCliRes.code, 0, symCliRes.stderr);
+    assert.match(symCliRes.stdout, /--- \[function\] add L1-L3/);
+    assert.match(symCliRes.stdout, /--- \[function\] multiply L5-L7/);
+    assert.match(symCliRes.stdout, /--- \[function\] greet L1-L3/);
+
     // 4. Search via shorthand flags (multiple queries in one call)
     const searchFlagsRes = await runCliSubprocess(
       ["search", "--text", "multiply", "--glob", "src/*.ts"],

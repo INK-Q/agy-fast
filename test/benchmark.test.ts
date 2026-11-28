@@ -2635,5 +2635,47 @@ describe("benchmark analyzer & CLI", () => {
     );
     assert.equal(out.sessions, 4);
     assert.equal(out.totalOutputTokens, 100);
+
+    // --cli slice --symbol / positional path::sym ops counting and MCP symbols ops counting
+    const sliceSymDir = path.join(tmpDir, "slice-symbol-ops");
+    await fs.mkdir(sliceSymDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sliceSymDir, "session.jsonl"),
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T05:00:00Z",
+          content: "<USER_REQUEST>Inspect symbols</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T05:00:01Z",
+          input_tokens: 4_000,
+          cache_read_tokens: 10_000,
+          output_tokens: 150,
+          tool_calls: [
+            {
+              name: "mcp_agy-fast_fast_read_slices",
+              args: { symbols: ["src/a.ts::foo,bar"] },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "agy-fast-mcp --cli slice --symbol src/a.ts::foo,bar src/b.ts#baz src/c.ts:1-10",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T05:00:02Z", content: "ok" }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-26T05:00:03Z", content: "ok" }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const symReport = await analyzePathsByUsage([sliceSymDir]);
+    // MCP call packs 2 ops (foo, bar); CLI slice packs 2 (--symbol) + 1 (#baz) + 1 (lineRange) = 4 ops -> total 6
+    assert.equal(symReport.overall.agyFastLogicalOps, 6);
+    assert.equal(symReport.overall.agyCliCalls, 1);
+    assert.equal(symReport.overall.agyFastToolCalls.read_slices, 2);
   });
 });

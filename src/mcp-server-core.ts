@@ -619,7 +619,7 @@ export function createAgyFastServer(
     applySchemaCompat({
       name: "read_slices",
       description:
-        "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40), symbol bodies, + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). symbols: 'path::sym1,Cls.m'; lineRanges: 'path:start-end,s2-e2'; slices: 1-based [start,end]. maxChars 8500; 8800B cap.",
       inputSchema: {
         type: "object",
         properties: {
@@ -627,6 +627,11 @@ export function createAgyFastServer(
           outlines: {
             type: "array",
             maxItems: 40,
+            items: { type: "string" },
+          },
+          symbols: {
+            type: "array",
+            maxItems: 30,
             items: { type: "string" },
           },
           slices: {

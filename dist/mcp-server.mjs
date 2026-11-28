@@ -89,6 +89,7 @@ var TOOL_VALIDATION_EXAMPLES = {
   apply_edits: '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
   read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
   read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_symbols: '{"symbols":["src/app.ts::main,MyClass.run"]}',
   quick_outline: '{"paths":["src/app.ts"]}',
   run_checks: '{"commands":[{"name":"test","command":"npm test"}]}'
 };
@@ -6739,6 +6740,7 @@ function extractPythonSymbols(lines) {
     const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
     raw.push({ indent, kind, name: m[3], defIdx: i });
   }
+  const indentStack = [];
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx];
     let startIdx = item.defIdx;
@@ -6767,12 +6769,19 @@ function extractPythonSymbols(lines) {
       }
       endIdx--;
     }
+    const startLine = startIdx + 1;
+    const endLine = endIdx + 1;
+    while (indentStack.length > 0 && (indentStack[indentStack.length - 1].endLine < startLine || indentStack[indentStack.length - 1].indent >= item.indent)) {
+      indentStack.pop();
+    }
+    const depth = indentStack.length;
+    indentStack.push({ indent: item.indent, endLine });
     symbols.push({
       kind: item.kind,
       name: item.name,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: item.indent > 0 ? 1 : 0
+      startLine,
+      endLine,
+      depth
     });
   }
   return symbols;
@@ -8553,6 +8562,159 @@ async function runReadSlices(input) {
       }
     }
   }
+  const symbolRequests = [];
+  const parseSymbolShorthand = (raw, label) => {
+    const trimmed = raw.trim();
+    const sepIdx = trimmed.indexOf("::");
+    const hashIdx = sepIdx === -1 ? trimmed.lastIndexOf("#") : -1;
+    const splitAt = sepIdx !== -1 ? sepIdx : hashIdx;
+    const sepLen = sepIdx !== -1 ? 2 : 1;
+    if (splitAt <= 0) {
+      if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must use 'path::sym1,sym2' or 'path#sym' format (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+      return null;
+    }
+    const filePath = trimmed.slice(0, splitAt).trim();
+    const names = trimmed.slice(splitAt + sepLen).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!filePath || names.length === 0) {
+      if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must provide both file path and symbol name(s) (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+      return null;
+    }
+    return { path: filePath, names };
+  };
+  if (input?.symbols !== void 0) {
+    const parsedSymbols = parseMaybeStringOrJsonArray(input.symbols);
+    if (!parsedSymbols.ok) {
+      if (parsedSymbols.kind === "corrupted_literal" || input.symbols === null || typeof input.symbols === "boolean") {
+        corruptedItems.push({
+          label: "symbols",
+          value: parsedSymbols.kind === "corrupted_literal" ? parsedSymbols.value : input.symbols,
+          expected: "an array of 'path::sym1,sym2' strings or { path, names } objects"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'symbols' must be an array of 'path::sym1,sym2' strings or { path, names } objects (${parsedSymbols.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+        );
+      }
+    } else {
+      const normalizedSymReqs = [];
+      for (let i = 0; i < parsedSymbols.value.length; i++) {
+        const item = parsedSymbols.value[i];
+        if (item === null || typeof item === "boolean") {
+          corruptedItems.push({
+            label: `symbols[${i}]`,
+            value: item,
+            expected: "a 'path::sym1,sym2' string or { path, names } object"
+          });
+          continue;
+        }
+        if (typeof item === "string") {
+          if (!item.trim()) {
+            if (sliceFormatError === null) {
+              sliceFormatError = withValidationExample(
+                `Error: symbols[${i}] must be a non-empty 'path::sym1,sym2' or 'path#sym' string.`,
+                TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+              );
+            }
+            continue;
+          }
+          const parsed = parseSymbolShorthand(item, `symbols[${i}]`);
+          if (parsed) normalizedSymReqs.push(parsed);
+          continue;
+        }
+        if (!isPlainObject(item)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}] must be a 'path::sym1,sym2' string or { path, names } object.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          continue;
+        }
+        let itemValid = true;
+        if (item.path === null || typeof item.path === "boolean") {
+          corruptedItems.push({
+            label: `symbols[${i}].path`,
+            value: item.path,
+            expected: "a non-empty file path string"
+          });
+          itemValid = false;
+        } else if (typeof item.path !== "string" || !item.path.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}].path must be a non-empty file path string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          itemValid = false;
+        }
+        const parsedNames = parseMaybeStringOrJsonArray(item.names);
+        const validNames = [];
+        if (!parsedNames.ok) {
+          if (parsedNames.kind === "corrupted_literal" || item.names === null || typeof item.names === "boolean") {
+            corruptedItems.push({
+              label: `symbols[${i}].names`,
+              value: parsedNames.kind === "corrupted_literal" ? parsedNames.value : item.names,
+              expected: "a non-empty array of symbol name strings"
+            });
+          } else if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: symbols[${i}].names must be a non-empty array of symbol name strings (${parsedNames.detail}).`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+            );
+          }
+          itemValid = false;
+        } else {
+          for (let j = 0; j < parsedNames.value.length; j++) {
+            const nameItem = parsedNames.value[j];
+            if (nameItem === null || typeof nameItem === "boolean") {
+              corruptedItems.push({
+                label: `symbols[${i}].names[${j}]`,
+                value: nameItem,
+                expected: "a non-empty symbol name string"
+              });
+              itemValid = false;
+            } else if (typeof nameItem !== "string" || !nameItem.trim()) {
+              if (sliceFormatError === null) {
+                sliceFormatError = withValidationExample(
+                  `Error: symbols[${i}].names[${j}] must be a non-empty symbol name string.`,
+                  TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+                );
+              }
+              itemValid = false;
+            } else {
+              validNames.push(nameItem.trim());
+            }
+          }
+          if (itemValid && validNames.length === 0) {
+            if (sliceFormatError === null) {
+              sliceFormatError = withValidationExample(
+                `Error: symbols[${i}].names must contain at least one symbol name.`,
+                TOOL_VALIDATION_EXAMPLES.read_slices_symbols
+              );
+            }
+            itemValid = false;
+          }
+        }
+        if (itemValid && typeof item.path === "string") {
+          normalizedSymReqs.push({ path: item.path.trim(), names: validNames });
+        }
+      }
+      if (corruptedItems.length === 0) {
+        symbolRequests.push(...normalizedSymReqs);
+      }
+    }
+  }
   if (corruptedItems.length > 0) {
     return {
       text: formatCorruptedArrayError({
@@ -8567,18 +8729,18 @@ async function runReadSlices(input) {
   if (sliceFormatError !== null) {
     return { text: sliceFormatError, isError: true };
   }
-  if (outlines.length === 0 && slices.length === 0) {
+  if (outlines.length === 0 && slices.length === 0 && symbolRequests.length === 0) {
     return {
       text: withValidationExample(
-        "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+        "Error: provide at least one entry in 'outlines', 'slices', 'lineRanges', or 'symbols'.",
         TOOL_VALIDATION_EXAMPLES.read_slices
       ),
       isError: true
     };
   }
-  if (outlines.length > MAX_OUTLINES || slices.length > MAX_SLICE_FILES) {
+  if (outlines.length > MAX_OUTLINES || slices.length + symbolRequests.length > MAX_SLICE_FILES) {
     return {
-      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice files per call).`,
+      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice/symbol files per call).`,
       isError: true
     };
   }
@@ -8703,6 +8865,147 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
     );
     sectionEntries.push(...sliceResults);
   }
+  const normalizeContainerName = (kind, rawName) => {
+    let name = rawName.trim();
+    if (kind === "impl") {
+      if (name.startsWith("<")) {
+        let angle = 0;
+        for (let k = 0; k < name.length; k++) {
+          if (name[k] === "<") angle++;
+          else if (name[k] === ">") {
+            angle--;
+            if (angle === 0) {
+              name = name.slice(k + 1).trim();
+              break;
+            }
+          }
+        }
+      }
+      const forMatch = /\s+for\s+([\s\S]+)$/.exec(name);
+      if (forMatch?.[1]) {
+        name = forMatch[1].trim();
+      }
+    }
+    const ltIdx = name.indexOf("<");
+    if (ltIdx > 0) {
+      name = name.slice(0, ltIdx).trim();
+    }
+    return name;
+  };
+  const normalizeQualifiedSep = (name) => name.replace(/::/g, ".");
+  const CONTAINER_SYMBOL_KINDS = /* @__PURE__ */ new Set([
+    "class",
+    "interface",
+    "struct",
+    "impl",
+    "trait",
+    "mod",
+    "namespace",
+    "module"
+  ]);
+  if (symbolRequests.length > 0) {
+    const symbolResults = await Promise.all(
+      symbolRequests.map(async (req) => {
+        const absPath = resolvePath(req.path, baseCwd);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
+        try {
+          const { lines } = await loadLines(absPath);
+          const totalLines = lines.length;
+          const allSymbols = extractSymbolsFromLines(absPath, lines);
+          const qualified = [];
+          const containerStack = [];
+          for (const sym of allSymbols) {
+            while (containerStack.length > 0 && (containerStack[containerStack.length - 1].endLine < sym.startLine || containerStack[containerStack.length - 1].depth >= sym.depth)) {
+              containerStack.pop();
+            }
+            const immediateParent = containerStack.length > 0 ? containerStack[containerStack.length - 1].name : "";
+            const fullChain = containerStack.map((c) => c.name).join(".");
+            const alreadyPrefixed = immediateParent.length > 0 && (sym.name.startsWith(`${immediateParent}.`) || sym.name.startsWith(`${immediateParent}::`));
+            const qualifiedName = alreadyPrefixed ? sym.name : fullChain ? `${fullChain}.${sym.name}` : sym.name;
+            const immediateName = alreadyPrefixed ? sym.name : immediateParent ? `${immediateParent}.${sym.name}` : sym.name;
+            qualified.push({
+              sym,
+              qualifiedName,
+              immediateName,
+              qualifiedNorm: normalizeQualifiedSep(qualifiedName),
+              immediateNorm: normalizeQualifiedSep(immediateName),
+              rawNorm: normalizeQualifiedSep(sym.name)
+            });
+            if (CONTAINER_SYMBOL_KINDS.has(sym.kind)) {
+              const containerName = normalizeContainerName(sym.kind, sym.name);
+              if (containerName) {
+                containerStack.push({
+                  name: containerName,
+                  endLine: sym.endLine,
+                  depth: sym.depth
+                });
+              }
+            }
+          }
+          const blocks = [];
+          for (const rawQuery of req.names) {
+            const q = rawQuery.trim();
+            const qNorm = normalizeQualifiedSep(q);
+            const qLower = q.toLowerCase();
+            const qNormLower = qNorm.toLowerCase();
+            let hits = qualified.filter(
+              (item) => item.qualifiedName === q || item.immediateName === q || item.sym.name === q || item.qualifiedNorm === qNorm || item.immediateNorm === qNorm || item.rawNorm === qNorm
+            );
+            if (hits.length === 0) {
+              hits = qualified.filter(
+                (item) => item.qualifiedName.toLowerCase() === qLower || item.immediateName.toLowerCase() === qLower || item.sym.name.toLowerCase() === qLower || item.qualifiedNorm.toLowerCase() === qNormLower || item.immediateNorm.toLowerCase() === qNormLower || item.rawNorm.toLowerCase() === qNormLower
+              );
+            }
+            if (hits.length === 0) {
+              hits = qualified.filter(
+                (item) => item.sym.detail && item.sym.detail.toLowerCase().includes(qLower)
+              );
+            }
+            if (hits.length === 0) {
+              const sample = qualified.slice(0, 12).map((x) => `${x.qualifiedName}(L${x.sym.startLine})`).join(", ");
+              blocks.push(
+                `--- Symbol '${q}' NOT FOUND ---
+Available symbols: ${sample || "(none)"}`
+              );
+              continue;
+            }
+            const shownHits = hits.slice(0, 3);
+            for (const hit of shownHits) {
+              const start = Math.max(1, hit.sym.startLine);
+              const end = Math.min(totalLines, hit.sym.endLine);
+              const width = String(end).length;
+              const detailTag = hit.sym.detail ? ` ${hit.sym.detail}` : "";
+              const snippet = [
+                `--- [${hit.sym.kind}] ${hit.qualifiedName}${detailTag} L${start}-L${end} (of ${totalLines}) ---`
+              ];
+              for (let ln = start; ln <= end; ln++) {
+                const num = String(ln).padStart(width, " ");
+                snippet.push(`${num}: ${lines[ln - 1] ?? ""}`);
+              }
+              blocks.push(snippet.join("\n"));
+            }
+            if (hits.length > shownHits.length) {
+              blocks.push(
+                `... (+${hits.length - shownHits.length} more matches for '${q}')`
+              );
+            }
+          }
+          return {
+            kind: "static",
+            fullText: `## Symbols: ${relPath} (${totalLines} lines)
+${blocks.join("\n")}`
+          };
+        } catch (err) {
+          return {
+            kind: "static",
+            fullText: `## Symbols: ${relPath}
+ERROR: ${err instanceof Error ? err.message : String(err)}`
+          };
+        }
+      })
+    );
+    sectionEntries.push(...symbolResults);
+  }
   const separator = "\n\n";
   const sepChars = separator.length * Math.max(0, sectionEntries.length - 1);
   const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, sectionEntries.length - 1);
@@ -8719,7 +9022,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
       isError: false
     };
   }
-  const activeTip = slices.length > 0 ? SLICE_TRUNCATION_TIP : outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
+  const activeTip = slices.length > 0 || symbolRequests.length > 0 ? SLICE_TRUNCATION_TIP : outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
   const applyTip = activeTip !== null && maxChars > activeTip.length + 200;
   const tipChars = applyTip ? activeTip.length : 0;
   const tipBytes = applyTip ? Buffer.byteLength(activeTip, "utf8") : 0;
@@ -9416,7 +9719,7 @@ function formatCliUsage() {
     "",
     "Commands (aliases):",
     "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
-    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  slice   | read_slices   <path:start-end | path::sym1,sym2...> [--outline <file>] [--symbol <path::sym>] [--cwd <dir>]",
     "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
     "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
@@ -9589,6 +9892,7 @@ var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--context",
   "--max-results",
   "--outline",
+  "--symbol",
   "--concurrency",
   "--timeout",
   "--verify",
@@ -9603,7 +9907,8 @@ function parseToolFlags(tool, rawArgs) {
     searchQueries: [],
     implicitTypeQueryIndices: /* @__PURE__ */ new Set(),
     trailingSearchMods: {},
-    outlineFiles: []
+    outlineFiles: [],
+    symbolSpecs: []
   };
   let pendingMods = {};
   let pendingType;
@@ -9760,6 +10065,10 @@ function parseToolFlags(tool, rawArgs) {
         opts.outlineFiles.push(consumeValue());
         continue;
       }
+      if (arg === "--symbol" || arg === "-s") {
+        opts.symbolSpecs.push(consumeValue());
+        continue;
+      }
     } else if (tool === "run_checks") {
       if (arg === "--compact") {
         opts.outputMode = "compact";
@@ -9858,7 +10167,7 @@ async function runAgyFastCli(argv, io = {}) {
 `);
     return 0;
   }
-  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0 || opts.symbolSpecs.length > 0;
   let jsonInput = null;
   try {
     if (opts.jsonRaw !== void 0) {
@@ -9937,16 +10246,26 @@ async function runAgyFastCli(argv, io = {}) {
         ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
       };
     } else {
-      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+      const autoSymbols = [...opts.symbolSpecs];
+      const lineRanges = [];
+      for (const pos of opts.positionals) {
+        if (pos.includes("::") || pos.includes("#") && !/:\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pos)) {
+          autoSymbols.push(pos);
+        } else {
+          lineRanges.push(pos);
+        }
+      }
+      if (lineRanges.length === 0 && opts.outlineFiles.length === 0 && autoSymbols.length === 0) {
         stderr.write(
-          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n"
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), symbol specs (e.g. src/a.ts::fn), --outline <file>, --symbol <path::sym>, or JSON input.\n"
         );
         return 1;
       }
       payload = {
         cwd: effectiveCwd,
         ...opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {},
-        ...opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {},
+        ...autoSymbols.length > 0 ? { symbols: autoSymbols } : {},
+        ...lineRanges.length > 0 ? { lineRanges } : {},
         ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
       };
     }
@@ -11502,7 +11821,7 @@ function createAgyFastServer(options = {}) {
     server.registerTool(
       applySchemaCompat({
         name: "read_slices",
-        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40), symbol bodies, + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). symbols: 'path::sym1,Cls.m'; lineRanges: 'path:start-end,s2-e2'; slices: 1-based [start,end]. maxChars 8500; 8800B cap.",
         inputSchema: {
           type: "object",
           properties: {
@@ -11510,6 +11829,11 @@ function createAgyFastServer(options = {}) {
             outlines: {
               type: "array",
               maxItems: 40,
+              items: { type: "string" }
+            },
+            symbols: {
+              type: "array",
+              maxItems: 30,
               items: { type: "string" }
             },
             slices: {

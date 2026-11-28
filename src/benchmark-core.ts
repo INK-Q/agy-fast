@@ -1327,6 +1327,25 @@ function countLineRangeSpecOps(spec: string): number {
   return Math.max(1, parts.length);
 }
 
+function isCliSymbolShorthand(spec: string): boolean {
+  return (
+    spec.includes("::") ||
+    (spec.includes("#") && !/:\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(spec))
+  );
+}
+
+function countSymbolSpecOps(spec: string): number {
+  const trimmed = spec.trim();
+  if (!trimmed) return 0;
+  const sepIdx = trimmed.indexOf("::");
+  const splitAt = sepIdx !== -1 ? sepIdx : trimmed.lastIndexOf("#");
+  const sepLen = sepIdx !== -1 ? 2 : 1;
+  if (splitAt <= 0) return 1;
+  const namesPart = trimmed.slice(splitAt + sepLen);
+  const parts = namesPart.split(",").filter((p) => p.trim().length > 0);
+  return Math.max(1, parts.length);
+}
+
 function countApplyEditsOps(
   inner: Record<string, unknown>,
   cliVerify?: string,
@@ -1375,6 +1394,25 @@ function countReadSlicesOps(inner: Record<string, unknown>): number {
     }
   } else if (typeof lineRanges === "string" && lineRanges.trim().length > 0) {
     ops += countLineRangeSpecOps(lineRanges);
+  }
+  const symbols = maybeParseJsonValue(inner.symbols);
+  if (Array.isArray(symbols)) {
+    for (const item of symbols) {
+      if (typeof item === "string") {
+        ops += countSymbolSpecOps(item);
+      } else if (isPlainRecord(item)) {
+        const names = maybeParseJsonValue(item.names);
+        if (Array.isArray(names) && names.length > 0) {
+          ops += names.length;
+        } else if (typeof names === "string" && names.trim().length > 0) {
+          ops += 1;
+        } else {
+          ops += 1;
+        }
+      }
+    }
+  } else if (typeof symbols === "string" && symbols.trim().length > 0) {
+    ops += countSymbolSpecOps(symbols);
   }
   return Math.max(1, ops);
 }
@@ -1606,6 +1644,8 @@ const CLI_SLICE_VALUE_FLAGS = new Set([
   "--json",
   "--outline",
   "-o",
+  "--symbol",
+  "-s",
 ]);
 
 const CLI_OUTLINE_VALUE_FLAGS = new Set(["--cwd", "--max-chars", "--json"]);
@@ -1730,7 +1770,9 @@ function countCliLogicalOps(
     for (let i = 0; i < args.length; i++) {
       const raw = args[i]!;
       if (afterDoubleDash) {
-        ops += countLineRangeSpecOps(raw);
+        ops += isCliSymbolShorthand(raw)
+          ? countSymbolSpecOps(raw)
+          : countLineRangeSpecOps(raw);
         continue;
       }
       if (raw === "--") {
@@ -1749,12 +1791,19 @@ function countCliLogicalOps(
         ops += 1;
         continue;
       }
+      if (flag === "--symbol" || flag === "-s") {
+        const val = consumeVal();
+        ops += val !== undefined ? countSymbolSpecOps(val) : 1;
+        continue;
+      }
       if (CLI_SLICE_VALUE_FLAGS.has(flag)) {
         consumeVal();
         continue;
       }
       if (flag.startsWith("-")) continue;
-      ops += countLineRangeSpecOps(raw);
+      ops += isCliSymbolShorthand(raw)
+        ? countSymbolSpecOps(raw)
+        : countLineRangeSpecOps(raw);
     }
     if (jsonRaw !== undefined) {
       try {
