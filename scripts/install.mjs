@@ -24,6 +24,12 @@ const SUPPORTED_MCP_CONFIG_HOSTS = [
   "antigravity",
 ];
 const MAX_LOCAL_RULE_BYTES = 256 * 1024;
+const BIN_SHIM_MARKER = "agy-fast-bin-shim";
+const MAX_BIN_SHIM_WRAPPER_BYTES = 8 * 1024;
+const BIN_SHIM_SPECS = [
+  { name: "agy-fast", relTarget: path.join("scripts", "install.mjs") },
+  { name: "agy-fast-mcp", relTarget: path.join("dist", "mcp-server.mjs") },
+];
 
 const RUNTIME_FILES = [
   "plugin.json",
@@ -163,6 +169,8 @@ function parseArgs(argv) {
   let mcpToolsRaw = null;
   let schemaCompat = "";
   let printRules = false;
+  let binShim = false;
+  let binShimDir = "";
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -276,6 +284,18 @@ function parseArgs(argv) {
       schemaCompat = normalizedCompat;
     } else if (a === "--rules") {
       printRules = true;
+    } else if (a === "--bin-shim") {
+      binShim = true;
+    } else if (a === "--bin-shim-dir" || a.startsWith("--bin-shim-dir=")) {
+      const next = a.startsWith("--bin-shim-dir=")
+        ? a.slice("--bin-shim-dir=".length)
+        : args[i + 1];
+      if (!next || !next.trim() || (!a.startsWith("--bin-shim-dir=") && next.startsWith("-"))) {
+        throw new Error("Missing directory path after --bin-shim-dir");
+      }
+      if (!a.startsWith("--bin-shim-dir=")) i++;
+      binShimDir = path.resolve(expandHomePrefix(next.trim()));
+      binShim = true;
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -336,6 +356,8 @@ function parseArgs(argv) {
     mcpToolsRaw,
     schemaCompat,
     printRules,
+    binShim,
+    binShimDir,
   };
 }
 
@@ -359,6 +381,8 @@ Options:
   --project [dir]               Install/update <dir>/.agents/plugins/agy-fast
   --target <dir>                Use a custom plugin directory
   --link                        Create a symlink to this repository (dev mode)
+  --bin-shim                    (install) Expose agy-fast & agy-fast-mcp in an existing user PATH dir (e.g. ~/.local/bin)
+  --bin-shim-dir <dir>          Install, inspect, or remove bin shims in <dir> (implies --bin-shim on install)
   --no-enable                   Skip running 'agy plugin enable agy-fast'
   --no-acp                      Skip syncing isolated T3 Code ACP / GEMINI_HOME profiles
   --check                       (update) Check for newer versions without applying
@@ -450,6 +474,504 @@ async function lstatSafe(p) {
     }
     throw err;
   }
+}
+
+async function statSafe(p) {
+  try {
+    return await fs.stat(p);
+  } catch (err) {
+    if (err?.code === "ENOENT" || err?.code === "ENOTDIR") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+function expandHomePrefix(rawPath) {
+  const trimmed = String(rawPath || "").trim();
+  if (!trimmed) return "";
+  const home = getHomeDir();
+  if (trimmed === "~") return home;
+  if (
+    trimmed.startsWith("~/") ||
+    (process.platform === "win32" && trimmed.startsWith("~\\"))
+  ) {
+    return path.join(home, trimmed.slice(2));
+  }
+  return trimmed;
+}
+
+function getDefaultBinShimDirs() {
+  const home = getHomeDir();
+  if (process.platform === "win32") {
+    return [path.join(home, ".local", "bin"), path.join(home, "bin")];
+  }
+  return [path.join(home, ".local", "bin")];
+}
+
+async function parsePathEntries() {
+  const rawPath =
+    process.env.PATH || (process.platform === "win32" ? process.env.Path || "" : "");
+  const compareSet = new Set();
+  for (const raw of rawPath.split(path.delimiter)) {
+    let entry = raw.trim();
+    if (!entry) continue;
+    if (
+      process.platform === "win32" &&
+      entry.startsWith('"') &&
+      entry.endsWith('"') &&
+      entry.length >= 2
+    ) {
+      entry = entry.slice(1, -1).trim();
+    }
+    entry = expandHomePrefix(entry);
+    if (!entry || !path.isAbsolute(entry)) continue;
+    compareSet.add(toComparePath(await canonicalizeExistingPath(entry)));
+  }
+  return compareSet;
+}
+
+async function isDirOnPath(dirPath, pathCompareSet) {
+  const compare = toComparePath(await canonicalizeExistingPath(dirPath));
+  return pathCompareSet.has(compare);
+}
+
+function getBinShimFileName(baseName) {
+  return process.platform === "win32" ? `${baseName}.cmd` : baseName;
+}
+
+function escapePosixSingleQuoted(str) {
+  return String(str).replace(/'/g, "'\\''");
+}
+
+function renderPosixShimWrapper(targetScriptPath) {
+  const quotedTarget = `'${escapePosixSingleQuoted(targetScriptPath)}'`;
+  return [
+    "#!/usr/bin/env sh",
+    `# ${BIN_SHIM_MARKER}`,
+    `# agy-fast-target: ${JSON.stringify(targetScriptPath)}`,
+    `exec node ${quotedTarget} "$@"`,
+    "",
+  ].join("\n");
+}
+
+function renderWindowsCmdShim(targetScriptPath) {
+  const raw = String(targetScriptPath);
+  if (/[\r\n\0"]/.test(raw)) {
+    throw new Error(`Unsafe character in Windows shim target path: ${raw}`);
+  }
+  const escaped = raw.replace(/%/g, "%%");
+  return `@rem ${BIN_SHIM_MARKER}\r\n@node "${escaped}" %*\r\n`;
+}
+
+function parseShimWrapper(content) {
+  const lines = content.split(/\r?\n/).map((l) => l.trim());
+  const hasMarker = lines.some(
+    (l) =>
+      /^#[ \t]*agy-fast-bin-shim$/i.test(l) ||
+      /^@?rem[ \t]+agy-fast-bin-shim$/i.test(l),
+  );
+  if (!hasMarker) {
+    return { hasMarker: false, targetPath: null };
+  }
+  for (const line of lines) {
+    if (line.startsWith("# agy-fast-target:")) {
+      const rawJson = line.slice("# agy-fast-target:".length).trim();
+      try {
+        const parsed = JSON.parse(rawJson);
+        if (typeof parsed === "string" && parsed) {
+          return { hasMarker: true, targetPath: parsed };
+        }
+      } catch {
+        // Ignore malformed metadata line and continue checking command line
+      }
+    }
+    const cmdMatch = /^@?node[ \t]+"([^"]+)"[ \t]+%\*$/.exec(line);
+    if (cmdMatch) {
+      return { hasMarker: true, targetPath: cmdMatch[1].replace(/%%/g, "%") };
+    }
+    if (line.startsWith("exec node '") && line.endsWith("' \"$@\"")) {
+      const inner = line.slice("exec node '".length, -"' \"$@\"".length);
+      return { hasMarker: true, targetPath: inner.replace(/'\\''/g, "'") };
+    }
+  }
+  return { hasMarker: true, targetPath: null };
+}
+
+function toCompareSegment(seg) {
+  return process.platform === "win32" || process.platform === "darwin"
+    ? seg.toLowerCase()
+    : seg;
+}
+
+function pathMatchesRelTarget(candidatePath, relTarget) {
+  const parts = relTarget.split(/[\\/]/);
+  if (parts.length !== 2) return false;
+  const fileName = path.basename(candidatePath);
+  const parentDir = path.dirname(candidatePath);
+  if (parentDir === candidatePath) return false;
+  const parentName = path.basename(parentDir);
+  return (
+    toCompareSegment(parentName) === toCompareSegment(parts[0]) &&
+    toCompareSegment(fileName) === toCompareSegment(parts[1])
+  );
+}
+
+async function inspectPluginDirOwnership(pluginRoot) {
+  const manifest = await readJsonSafe(path.join(pluginRoot, "plugin.json"));
+  if (manifest && typeof manifest.name === "string") {
+    return manifest.name === PLUGIN_NAME ? "agy-fast" : "other";
+  }
+  const pkg = await readJsonSafe(path.join(pluginRoot, "package.json"));
+  if (pkg && typeof pkg.name === "string") {
+    return pkg.name === PLUGIN_NAME ? "agy-fast" : "other";
+  }
+  return (await isDirSafe(pluginRoot)) ? "unknown-dir" : "missing";
+}
+
+async function inspectBinShim(binDir, spec) {
+  const fileName = getBinShimFileName(spec.name);
+  const shimPath = path.join(binDir, fileName);
+  const stat = await lstatSafe(shimPath);
+  if (!stat) {
+    return {
+      spec,
+      fileName,
+      shimPath,
+      status: "absent",
+      owned: false,
+      kind: null,
+      targetPath: null,
+      pluginDir: null,
+    };
+  }
+
+  if (stat.isSymbolicLink()) {
+    let linkTarget;
+    try {
+      linkTarget = await fs.readlink(shimPath);
+    } catch {
+      return {
+        spec,
+        fileName,
+        shimPath,
+        status: "foreign",
+        owned: false,
+        kind: "symlink",
+        targetPath: null,
+        pluginDir: null,
+      };
+    }
+    const resolvedTarget = path.resolve(path.dirname(shimPath), linkTarget);
+    if (!pathMatchesRelTarget(resolvedTarget, spec.relTarget)) {
+      return {
+        spec,
+        fileName,
+        shimPath,
+        status: "foreign",
+        owned: false,
+        kind: "symlink",
+        targetPath: resolvedTarget,
+        pluginDir: null,
+      };
+    }
+    const pluginDir = path.dirname(path.dirname(resolvedTarget));
+    const ownership = await inspectPluginDirOwnership(pluginDir);
+    if (ownership === "other" || ownership === "unknown-dir") {
+      return {
+        spec,
+        fileName,
+        shimPath,
+        status: "foreign",
+        owned: false,
+        kind: "symlink",
+        targetPath: resolvedTarget,
+        pluginDir: null,
+      };
+    }
+    const targetStat = await statSafe(resolvedTarget);
+    const isExecutable =
+      process.platform === "win32" ||
+      Boolean(targetStat && (targetStat.mode & 0o111) !== 0);
+    const ok = ownership === "agy-fast" && Boolean(targetStat?.isFile()) && isExecutable;
+    return {
+      spec,
+      fileName,
+      shimPath,
+      status: ok ? "ok" : "broken",
+      owned: true,
+      kind: "symlink",
+      targetPath: resolvedTarget,
+      pluginDir,
+    };
+  }
+
+  if (stat.isFile() && stat.size <= MAX_BIN_SHIM_WRAPPER_BYTES) {
+    let content = "";
+    try {
+      content = await fs.readFile(shimPath, "utf8");
+    } catch {
+      content = "";
+    }
+    const parsed = parseShimWrapper(content);
+    if (parsed.hasMarker) {
+      const targetPath = parsed.targetPath ? path.resolve(parsed.targetPath) : null;
+      const pluginDir =
+        targetPath && pathMatchesRelTarget(targetPath, spec.relTarget)
+          ? path.dirname(path.dirname(targetPath))
+          : null;
+      const targetStat = targetPath ? await statSafe(targetPath) : null;
+      const isWrapperExec =
+        process.platform === "win32" || (stat.mode & 0o111) !== 0;
+      const ok = Boolean(pluginDir && targetStat?.isFile() && isWrapperExec);
+      return {
+        spec,
+        fileName,
+        shimPath,
+        status: ok ? "ok" : "broken",
+        owned: true,
+        kind: "wrapper",
+        targetPath,
+        pluginDir,
+      };
+    }
+  }
+
+  return {
+    spec,
+    fileName,
+    shimPath,
+    status: "foreign",
+    owned: false,
+    kind: stat.isFile() ? "file" : "other",
+    targetPath: null,
+    pluginDir: null,
+  };
+}
+
+async function writeFileAtomically(filePath, content, mode = null) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const tmpPath = path.join(
+    dir,
+    `.${base}.agy-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  try {
+    await fs.writeFile(tmpPath, content, "utf8");
+    if (mode !== null && process.platform !== "win32") {
+      await fs.chmod(tmpPath, mode);
+    }
+    try {
+      await fs.rename(tmpPath, filePath);
+    } catch {
+      await fs.copyFile(tmpPath, filePath);
+      if (mode !== null && process.platform !== "win32") {
+        await fs.chmod(filePath, mode);
+      }
+    }
+  } finally {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+  }
+}
+
+async function createPosixSymlinkAtomically(targetPath, linkPath) {
+  const dir = path.dirname(linkPath);
+  const base = path.basename(linkPath);
+  const tmpLink = path.join(
+    dir,
+    `.${base}.agy-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  try {
+    await fs.symlink(targetPath, tmpLink);
+    await fs.rename(tmpLink, linkPath);
+  } finally {
+    await fs.rm(tmpLink, { force: true }).catch(() => {});
+  }
+}
+
+async function installBinShims(resolvedPluginDir, opts) {
+  if (opts.isProject && !opts.binShimDir) {
+    if (!opts.quiet) {
+      console.log(
+        "Note: skipped --bin-shim for --project install (pass --bin-shim-dir <dir> to install shims for a project-local plugin).",
+      );
+    }
+    return { attempted: false, binDir: null, installed: [], skipped: [] };
+  }
+
+  const pathCompareSet = await parsePathEntries();
+  let binDir = opts.binShimDir;
+  let onPath = false;
+  if (binDir) {
+    await fs.mkdir(binDir, { recursive: true });
+    onPath = await isDirOnPath(binDir, pathCompareSet);
+  } else {
+    const candidates = getDefaultBinShimDirs();
+    for (const candidate of candidates) {
+      if ((await isDirSafe(candidate)) && (await isDirOnPath(candidate, pathCompareSet))) {
+        binDir = candidate;
+        onPath = true;
+        break;
+      }
+    }
+    if (!binDir) {
+      if (!opts.quiet) {
+        const primaryDefault = candidates[0];
+        if (await isDirSafe(primaryDefault)) {
+          console.log(
+            `Note: skipped --bin-shim because ${primaryDefault} is not on PATH.`,
+          );
+          console.log(
+            `      Add ${primaryDefault} to PATH and re-run with --bin-shim, or pass --bin-shim-dir <dir>.`,
+          );
+        } else {
+          console.log(
+            `Note: skipped --bin-shim because no existing user bin directory on PATH was found (checked: ${candidates.join(", ")}).`,
+          );
+          console.log(
+            `      Create ${primaryDefault} and add it to PATH, or pass --bin-shim-dir <dir>.`,
+          );
+        }
+      }
+      return { attempted: false, binDir: null, installed: [], skipped: [] };
+    }
+  }
+
+  const installed = [];
+  const skipped = [];
+  const targetPluginCompare = await canonicalizeEntryComparePath(resolvedPluginDir);
+  for (const spec of BIN_SHIM_SPECS) {
+    const targetScriptPath = path.join(resolvedPluginDir, spec.relTarget);
+    if (!(await pathExists(targetScriptPath))) {
+      throw new Error(`Cannot create bin shim '${spec.name}': missing ${targetScriptPath}`);
+    }
+    const existing = await inspectBinShim(binDir, spec);
+    if (existing.status !== "absent" && !existing.owned) {
+      skipped.push(existing);
+      if (!opts.quiet) {
+        console.warn(
+          `Warning: skipped bin shim ${existing.shimPath}: existing file or symlink is not managed by ${PLUGIN_NAME}.`,
+        );
+      }
+      continue;
+    }
+
+    if (process.platform === "win32") {
+      await writeFileAtomically(existing.shimPath, renderWindowsCmdShim(targetScriptPath));
+      installed.push({ name: existing.fileName, path: existing.shimPath, mode: "cmd" });
+    } else {
+      await fs.chmod(targetScriptPath, 0o755);
+      const alreadyMatchingSymlink =
+        existing.kind === "symlink" &&
+        existing.status === "ok" &&
+        existing.pluginDir &&
+        (await canonicalizeEntryComparePath(existing.pluginDir)) === targetPluginCompare;
+      if (alreadyMatchingSymlink) {
+        installed.push({ name: existing.fileName, path: existing.shimPath, mode: "symlink" });
+        continue;
+      }
+      let shimMode = "symlink";
+      try {
+        await createPosixSymlinkAtomically(targetScriptPath, existing.shimPath);
+      } catch (err) {
+        const code = err?.code;
+        if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
+          await writeFileAtomically(
+            existing.shimPath,
+            renderPosixShimWrapper(targetScriptPath),
+            0o755,
+          );
+          shimMode = "wrapper";
+        } else {
+          throw err;
+        }
+      }
+      installed.push({ name: existing.fileName, path: existing.shimPath, mode: shimMode });
+    }
+  }
+
+  if (!opts.quiet) {
+    if (installed.length > 0) {
+      console.log(
+        `Installed bin shim(s) in ${binDir}: ${installed.map((i) => i.name).join(", ")}`,
+      );
+    }
+    if (opts.binShimDir && !onPath) {
+      console.log(
+        `Note: ${binDir} is not currently on PATH; add it to PATH or invoke ${path.join(binDir, getBinShimFileName("agy-fast"))} directly.`,
+      );
+    }
+  }
+  return { attempted: true, binDir, onPath, installed, skipped };
+}
+
+async function collectBinShimStatuses(targetDir, binShimDir = "") {
+  const dirs = binShimDir ? [binShimDir] : getDefaultBinShimDirs();
+  const targetCompare = await canonicalizeEntryComparePath(targetDir);
+  const dirReports = [];
+
+  for (const dir of dirs) {
+    const dirExists = await isDirSafe(dir);
+    if (!dirExists && !binShimDir) continue;
+    const entries = [];
+    if (dirExists) {
+      for (const spec of BIN_SHIM_SPECS) {
+        const info = await inspectBinShim(dir, spec);
+        const pluginCompare = info.pluginDir
+          ? await canonicalizeEntryComparePath(info.pluginDir)
+          : null;
+        entries.push({ ...info, pluginCompare });
+      }
+    }
+    const owned = entries.filter((e) => e.owned);
+    const foreign = entries.filter((e) => e.status === "foreign");
+    if (owned.length === 0 && !binShimDir) {
+      continue;
+    }
+    const broken = owned.filter((e) => e.status === "broken");
+    const okEntries = owned.filter((e) => e.status === "ok");
+    const otherTargets = [
+      ...new Set(
+        okEntries
+          .filter((e) => e.pluginCompare && e.pluginCompare !== targetCompare)
+          .map((e) => e.pluginDir),
+      ),
+    ];
+    let status = "none";
+    if (broken.length > 0) {
+      status = "broken";
+    } else if (okEntries.length > 0) {
+      status = "ok";
+    }
+    dirReports.push({
+      binDir: dir,
+      dirExists,
+      status,
+      owned,
+      okEntries,
+      broken,
+      foreign,
+      otherTargets,
+    });
+  }
+  return dirReports;
+}
+
+async function findMatchingBinShims(targetPluginDir, binShimDir = "") {
+  const dirs = binShimDir ? [binShimDir] : getDefaultBinShimDirs();
+  const targetCompare = await canonicalizeEntryComparePath(targetPluginDir);
+  const matches = [];
+  for (const dir of dirs) {
+    if (!(await isDirSafe(dir))) continue;
+    for (const spec of BIN_SHIM_SPECS) {
+      const info = await inspectBinShim(dir, spec);
+      if (!info.owned || !info.pluginDir) continue;
+      if ((await canonicalizeEntryComparePath(info.pluginDir)) === targetCompare) {
+        matches.push({ ...info, binDir: dir });
+      }
+    }
+  }
+  return matches;
 }
 
 function toComparePath(p) {
@@ -1253,6 +1775,11 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     : [];
   report.isolatedProfiles = isolatedProfiles;
 
+  const binShims = doctorOpts.skipBinShims
+    ? []
+    : await collectBinShimStatuses(targetDir, doctorOpts.binShimDir || "");
+  report.binShims = binShims;
+
   const missingTools = EXPECTED_MCP_TOOLS.filter((t) => !mcpCheck.tools.includes(t));
   const hasAllExpectedTools = missingTools.length === 0;
   const hasLocalRules =
@@ -1357,13 +1884,50 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
               : `MISSING (${iso.pluginDir} — run 'install' to sync)`;
       console.log(`  - ${iso.label}: ${desc}`);
     }
+    for (const shimDirReport of binShims) {
+      if (shimDirReport.status === "none") {
+        const foreignNote =
+          shimDirReport.foreign.length > 0
+            ? ` (non-agy-fast present: ${shimDirReport.foreign.map((f) => f.fileName).join(", ")})`
+            : "";
+        console.log(`  - Bin shims   : none in ${shimDirReport.binDir}${foreignNote}`);
+        continue;
+      }
+      if (shimDirReport.status === "broken") {
+        const brokenNames = shimDirReport.broken.map((e) => e.fileName).join(", ");
+        const okPart =
+          shimDirReport.okEntries.length > 0
+            ? `; OK: ${shimDirReport.okEntries.map((e) => e.fileName).join(", ")}`
+            : "";
+        console.log(
+          `  - Bin shims   : BROKEN (${brokenNames} in ${shimDirReport.binDir}${okPart})`,
+        );
+        continue;
+      }
+      const okNames = shimDirReport.okEntries.map((e) => e.fileName).join(", ");
+      const targetSuffix =
+        shimDirReport.otherTargets.length > 0
+          ? ` -> ${shimDirReport.otherTargets.join(", ")}`
+          : "";
+      const foreignSuffix =
+        shimDirReport.foreign.length > 0
+          ? `; non-agy-fast skipped: ${shimDirReport.foreign.map((f) => f.fileName).join(", ")}`
+          : "";
+      console.log(
+        `  - Bin shims   : OK (${okNames} in ${shimDirReport.binDir}${targetSuffix}${foreignSuffix})`,
+      );
+    }
   }
 
   const hasBrokenIsolated = isolatedProfiles.some((iso) => iso.status === "broken");
+  const hasBrokenBinShims =
+    Boolean(doctorOpts.checkBinShims) &&
+    binShims.some((b) => b.status === "broken");
   const ok =
     hasAllExpectedTools &&
     hookCheck.bytes > 0 &&
     !hasBrokenIsolated &&
+    !hasBrokenBinShims &&
     (report.agyValidated === null || report.agyValidated === true);
   return { ok, report };
 }
@@ -1514,7 +2078,18 @@ async function runInstall(opts) {
     await writeUpdaterConfigFile(patch);
   }
 
-  const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
+  let shimInstallRes = null;
+  if (opts.binShim || opts.binShimDir) {
+    shimInstallRes = await installBinShims(resolvedDst, opts);
+  }
+
+  const checkBinShims = Boolean(shimInstallRes?.attempted);
+  const { ok } = await runDoctor(resolvedDst, opts.quiet, {
+    checkIsolated: syncIsolated,
+    binShimDir: opts.binShimDir,
+    checkBinShims,
+    skipBinShims: Boolean(opts.isProject && !opts.binShimDir),
+  });
   if (!ok) {
     throw new Error("Post-install health check failed.");
   }
@@ -1808,7 +2383,17 @@ async function runUpdate(opts) {
   }
 
   if (parsed.status === "updated") {
-    const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
+    let shimInstallRes = null;
+    if (opts.binShim || opts.binShimDir) {
+      shimInstallRes = await installBinShims(resolvedDst, opts);
+    }
+
+    const checkBinShims = Boolean(shimInstallRes?.attempted || opts.binShimDir);
+    const { ok } = await runDoctor(resolvedDst, opts.quiet, {
+      checkIsolated: syncIsolated,
+      binShimDir: opts.binShimDir,
+      checkBinShims,
+    });
     if (!ok) {
       throw new Error("Post-update health check failed.");
     }
@@ -1833,7 +2418,9 @@ async function runUninstall(opts) {
     }
   }
 
-  if (!dstStat && existingIsolated.length === 0) {
+  const matchingShims = await findMatchingBinShims(resolvedDst, opts.binShimDir);
+
+  if (!dstStat && existingIsolated.length === 0 && matchingShims.length === 0) {
     if (!opts.quiet) {
       console.log(`Nothing to remove (${resolvedDst} does not exist).`);
     }
@@ -1900,6 +2487,27 @@ async function runUninstall(opts) {
     }
     if (!opts.quiet) {
       console.log(`Removed agy-fast from ${resolvedDst}`);
+    }
+  }
+
+  if (matchingShims.length > 0) {
+    const removedByDir = new Map();
+    for (const shim of matchingShims) {
+      try {
+        await fs.unlink(shim.shimPath);
+        const list = removedByDir.get(shim.binDir) || [];
+        list.push(shim.fileName);
+        removedByDir.set(shim.binDir, list);
+      } catch (err) {
+        if (err?.code !== "ENOENT") {
+          throw err;
+        }
+      }
+    }
+    if (!opts.quiet) {
+      for (const [dir, names] of removedByDir) {
+        console.log(`Removed bin shim(s) from ${dir}: ${names.join(", ")}`);
+      }
     }
   }
 }
@@ -2124,6 +2732,15 @@ async function main() {
     );
   }
 
+  if (
+    (opts.binShim || opts.binShimDir) &&
+    !["install", "update", "status", "doctor", "uninstall"].includes(opts.command)
+  ) {
+    throw new Error(
+      "--bin-shim and --bin-shim-dir are only supported with install, update, status, doctor, and uninstall.",
+    );
+  }
+
   switch (opts.command) {
     case "install":
       await runInstall(opts);
@@ -2143,7 +2760,11 @@ async function main() {
     case "status":
     case "doctor": {
       const checkIsolated = !opts.isProject && !opts.isCustomTarget && !opts.skipAcp;
-      const { ok } = await runDoctor(opts.targetDir, opts.quiet, { checkIsolated });
+      const { ok } = await runDoctor(opts.targetDir, opts.quiet, {
+        checkIsolated,
+        binShimDir: opts.binShimDir,
+        checkBinShims: true,
+      });
       if (!ok) process.exitCode = 1;
       break;
     }
