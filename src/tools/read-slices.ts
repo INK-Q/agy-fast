@@ -41,6 +41,7 @@ export interface SymbolEntry {
   startLine: number;
   endLine: number;
   depth: number;
+  detail?: string;
 }
 
 type BraceLang = "js" | "c" | "go" | "rust" | "shell" | "json";
@@ -801,6 +802,292 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
     raw.push({ indent, kind, name: m[3]!, defIdx: i });
   }
 
+  /**
+   * Decode a single-line plain/raw Python string literal, returning null for
+   * non-literals, concatenation expressions, or triple-quoted blocks.
+   */
+  const extractPythonStringLiteral = (expr: string): string | null => {
+    const s = expr.trim();
+    let idx = 0;
+    if (
+      s.length >= 2 &&
+      (s[0] === "r" || s[0] === "R" || s[0] === "u" || s[0] === "U") &&
+      (s[1] === "'" || s[1] === '"')
+    ) {
+      idx = 1;
+    }
+    const q = s[idx];
+    if (q !== "'" && q !== '"') return null;
+    if (s.startsWith(q.repeat(3), idx)) return null;
+    idx++;
+    let out = "";
+    while (idx < s.length) {
+      const ch = s[idx]!;
+      if (ch === "\\" && idx + 1 < s.length) {
+        out += ch + s[idx + 1]!;
+        idx += 2;
+        continue;
+      }
+      if (ch === q) {
+        return idx === s.length - 1 ? out : null;
+      }
+      if (ch === "\n" || ch === "\r") return null;
+      out += ch;
+      idx++;
+    }
+    return null;
+  };
+
+  /**
+   * Split a Python argument list on top-level commas while respecting quotes,
+   * backslash escapes, and nested `(...)` / `[...]` / `{...}`.
+   */
+  const splitTopLevelPythonArgs = (argsText: string): string[] => {
+    const parts: string[] = [];
+    let quote: "'" | '"' | "'''" | '"""' | null = null;
+    let depth = 0;
+    let start = 0;
+    for (let k = 0; k < argsText.length; k++) {
+      const ch = argsText[k]!;
+      if (quote) {
+        if (ch === "\\" && k + 1 < argsText.length) {
+          k++;
+          continue;
+        }
+        if (quote.length === 3) {
+          if (argsText.startsWith(quote, k)) {
+            quote = null;
+            k += 2;
+          }
+        } else if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (argsText.startsWith("'''", k)) {
+        quote = "'''";
+        k += 2;
+      } else if (argsText.startsWith('"""', k)) {
+        quote = '"""';
+        k += 2;
+      } else if (ch === "'" || ch === '"') {
+        quote = ch;
+      } else if (ch === "(" || ch === "[" || ch === "{") {
+        depth++;
+      } else if (ch === ")" || ch === "]" || ch === "}") {
+        depth = Math.max(0, depth - 1);
+      } else if (ch === "," && depth === 0) {
+        const seg = argsText.slice(start, k).trim();
+        if (seg) parts.push(seg);
+        start = k + 1;
+      }
+    }
+    const tail = argsText.slice(start).trim();
+    if (tail) parts.push(tail);
+    return parts;
+  };
+
+  /**
+   * Lex line-start Python decorators cleanly: preserves newlines so inline `#`
+   * comments terminate at EOL and ignores `@` tokens inside strings/comments.
+   */
+  const parsePythonDecorators = (
+    rawBlock: string,
+  ): Array<{ name: string; args?: string }> => {
+    const parsed: Array<{ name: string; args?: string }> = [];
+    let i = 0;
+    let atLineStart = true;
+
+    const skipToLineEnd = () => {
+      while (i < rawBlock.length && rawBlock[i] !== "\n") i++;
+      if (rawBlock[i] === "\n") i++;
+      atLineStart = true;
+    };
+
+    while (i < rawBlock.length) {
+      const ch = rawBlock[i]!;
+      if (ch === "\n" || ch === "\r") {
+        i++;
+        atLineStart = true;
+        continue;
+      }
+      if (ch === " " || ch === "\t") {
+        i++;
+        continue;
+      }
+      if (ch === "#") {
+        skipToLineEnd();
+        continue;
+      }
+      if (!atLineStart || ch !== "@") {
+        atLineStart = false;
+        skipToLineEnd();
+        continue;
+      }
+
+      i++; // skip '@'
+      while (i < rawBlock.length && (rawBlock[i] === " " || rawBlock[i] === "\t")) i++;
+      const nameStart = i;
+      while (i < rawBlock.length && /[A-Za-z0-9_.\s]/.test(rawBlock[i]!) && rawBlock[i] !== "\n" && rawBlock[i] !== "\r") {
+        if (rawBlock[i] === "(" || rawBlock[i] === "#") break;
+        i++;
+      }
+      const compactName = rawBlock.slice(nameStart, i).replace(/\s+/g, "");
+      if (!/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/.test(compactName)) {
+        skipToLineEnd();
+        continue;
+      }
+
+      while (i < rawBlock.length && (rawBlock[i] === " " || rawBlock[i] === "\t")) i++;
+      if (rawBlock[i] !== "(") {
+        parsed.push({ name: compactName });
+        skipToLineEnd();
+        continue;
+      }
+
+      i++; // skip '('
+      let parenDepth = 1;
+      let quote: "'" | '"' | "'''" | '"""' | null = null;
+      const argChunks: string[] = [];
+      let segStart = i;
+      let closed = false;
+
+      while (i < rawBlock.length && parenDepth > 0) {
+        const cur = rawBlock[i]!;
+        if (quote) {
+          if (cur === "\\" && i + 1 < rawBlock.length) {
+            i += 2;
+            continue;
+          }
+          if (quote.length === 3) {
+            if (rawBlock.startsWith(quote, i)) {
+              quote = null;
+              i += 3;
+              continue;
+            }
+          } else if (cur === quote) {
+            quote = null;
+            i++;
+            continue;
+          }
+          i++;
+          continue;
+        }
+        if (cur === "#") {
+          argChunks.push(rawBlock.slice(segStart, i));
+          while (i < rawBlock.length && rawBlock[i] !== "\n") i++;
+          if (rawBlock[i] === "\n") {
+            argChunks.push("\n");
+            i++;
+          }
+          segStart = i;
+          continue;
+        }
+        if (rawBlock.startsWith("'''", i)) {
+          quote = "'''";
+          i += 3;
+          continue;
+        }
+        if (rawBlock.startsWith('"""', i)) {
+          quote = '"""';
+          i += 3;
+          continue;
+        }
+        if (cur === "'" || cur === '"') {
+          quote = cur;
+          i++;
+          continue;
+        }
+        if (cur === "(") {
+          parenDepth++;
+        } else if (cur === ")") {
+          parenDepth--;
+          if (parenDepth === 0) {
+            argChunks.push(rawBlock.slice(segStart, i));
+            i++;
+            closed = true;
+            break;
+          }
+        }
+        i++;
+      }
+
+      if (closed) {
+        parsed.push({ name: compactName, args: argChunks.join("") });
+      }
+      skipToLineEnd();
+    }
+
+    return parsed;
+  };
+
+  /**
+   * Extract route metadata from Flask/FastAPI decorators or `@dataclass` /
+   * `@pytest.fixture` tags on lines above a Python function or class.
+   */
+  const extractPythonDecoratorDetail = (fromIdx: number, toIdx: number): string | undefined => {
+    if (fromIdx >= toIdx) return undefined;
+    const decorators = parsePythonDecorators(lines.slice(fromIdx, toIdx).join("\n"));
+    if (decorators.length === 0) return undefined;
+
+    const tags: string[] = [];
+    for (const dec of decorators) {
+      const routeMatch = /\.(route|api_route|get|post|put|delete|patch|options|head)$/i.exec(
+        dec.name,
+      );
+      if (!routeMatch || dec.args === undefined) continue;
+
+      const topArgs = splitTopLevelPythonArgs(dec.args);
+      let routePath: string | null = null;
+      let kwMethodsExpr: string | null = null;
+
+      for (const arg of topArgs) {
+        const pathKw = /^(?:path|rule)\s*=\s*([\s\S]+)$/.exec(arg);
+        if (pathKw && routePath === null) {
+          routePath = extractPythonStringLiteral(pathKw[1]!);
+        }
+        const methodsKw = /^methods\s*=\s*([\[\(\{][\s\S]*[\]\)\}])$/.exec(arg);
+        if (methodsKw && kwMethodsExpr === null) {
+          kwMethodsExpr = methodsKw[1]!;
+        }
+      }
+      if (routePath === null && topArgs[0] && !/^[A-Za-z_]\w*\s*=/.test(topArgs[0])) {
+        routePath = extractPythonStringLiteral(topArgs[0]);
+      }
+      if (!routePath) continue;
+
+      const verb = routeMatch[1]!.toLowerCase();
+      let methodLabel = verb === "route" || verb === "api_route" ? "" : verb.toUpperCase();
+      if (!methodLabel && kwMethodsExpr) {
+        const inner = kwMethodsExpr.slice(1, -1);
+        const methods = splitTopLevelPythonArgs(inner)
+          .map((item) => extractPythonStringLiteral(item))
+          .filter((val): val is string => val !== null && /^[A-Za-z]+$/.test(val))
+          .map((val) => val.toUpperCase());
+        if (methods.length > 0) {
+          methodLabel = methods.join("|");
+        }
+      }
+      tags.push(methodLabel ? `route ${methodLabel} ${routePath}` : `route ${routePath}`);
+      if (tags.length >= 2) break;
+    }
+
+    if (tags.length === 0) {
+      for (const dec of decorators) {
+        if (dec.name === "dataclass" || dec.name === "dataclasses.dataclass") {
+          tags.push("@dataclass");
+          break;
+        }
+        if (dec.name === "pytest.fixture") {
+          tags.push("@pytest.fixture");
+          break;
+        }
+      }
+    }
+
+    return tags.length > 0 ? `(${tags.join("; ")})` : undefined;
+  };
+
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx]!;
     // Decorators directly above the def belong to the symbol.
@@ -839,12 +1126,14 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
       }
       endIdx--;
     }
+    const detail = extractPythonDecoratorDetail(startIdx, item.defIdx);
     symbols.push({
       kind: item.kind,
       name: item.name,
       startLine: startIdx + 1,
       endLine: endIdx + 1,
       depth: item.indent > 0 ? 1 : 0,
+      ...(detail ? { detail } : {}),
     });
   }
 
@@ -2566,7 +2855,8 @@ function formatSymbolLine(s: SymbolEntry): string {
   const indent = "  ".repeat(s.depth);
   const span =
     s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
-  return `${indent}${span} [${s.kind}] ${s.name}`;
+  const detail = s.detail ? ` ${s.detail}` : "";
+  return `${indent}${span} [${s.kind}] ${s.name}${detail}`;
 }
 
 function formatNestedOmissionFooter(omittedNested: number, compact = false): string {
