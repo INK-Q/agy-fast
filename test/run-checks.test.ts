@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -1115,73 +1116,88 @@ describe("run_checks", () => {
   it("extracts node --test pass summary in compact mode and shrinks all-PASS multibyte batches cleanly <= 8800B", async () => {
     const loneSurrogateRe =
       /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-
-    // 1. End-to-end node --test + SGR spinner + npm banner in compact mode
-    // (dynamic string construction ensures banned tokens never appear inside the echoed command string)
-    const nodeTestScript = [
-      "const pkg = 'my-pkg' + '@1.0.0';",
-      "const spin = 'Run' + 'ning...';",
-      "const st = 'sui' + 'tes';",
-      "process.stdout.write('> ' + pkg + ' test\\n> node --test\\n');",
-      "process.stdout.write('⠋ ' + spin + '\\r\\x1B[0m\\x1B[K\\n');",
-      "process.stdout.write('✔ handles 0 errors (1.1ms)\\n');",
-      "process.stdout.write('ℹ tests 48\\nℹ ' + st + ' 0\\nℹ pass 48\\nℹ fail 0\\nℹ cancelled 0\\nℹ skipped 0\\nℹ todo 0\\nℹ duration_ms 95.4\\n');",
-    ].join(" ");
-    const passSummaryRes = await runChecks({
-      outputMode: "compact",
-      commands: [{ name: "unit-tests", command: `${nodeBin} -e ${JSON.stringify(nodeTestScript)}` }],
-    });
-    assert.equal(passSummaryRes.isError, false);
-    assert.match(passSummaryRes.text, /\[PASS \d+ms\] unit-tests.*tests 48 \| pass 48 \| fail 0/);
-    assert.doesNotMatch(passSummaryRes.text, /suites 0|my-pkg@1\.0\.0|Running\.\.\./);
-
-    // 2. All-PASS batch exceeding 8800 UTF-8 bytes with CJK/emoji + long commands shrinks cleanly to 1-line summaries
-    const cjkPassScript = [
-      "console.log('构建校验通过: ' + '中文测试🚀'.repeat(40) + ' passed');",
-    ].join(" ");
-    const allPassOverflow = await runChecks({
-      outputMode: "compact",
-      maxChars: 8000,
-      concurrency: 4,
-      commands: Array.from({ length: 12 }, (_, i) => ({
-        name: `套件-${String(i + 1).padStart(2, "0")}`,
-        command: `${nodeBin} -e ${JSON.stringify(cjkPassScript)} /* ${"pad_".repeat(120)} */`,
-      })),
-    });
-    assert.equal(allPassOverflow.isError, false);
-    assert.ok(allPassOverflow.text.length <= 8000);
-    assert.ok(
-      Buffer.byteLength(allPassOverflow.text, "utf8") <= 8_800,
-      `Expected <= 8800B, got ${Buffer.byteLength(allPassOverflow.text, "utf8")}B`,
-    );
-    assert.doesNotMatch(allPassOverflow.text, /\[truncated: folded \d+ middle/);
-    assert.equal(loneSurrogateRe.test(allPassOverflow.text), false);
-    assert.doesNotMatch(allPassOverflow.text, /\uFFFD/);
-    for (let i = 1; i <= 12; i++) {
-      assert.match(
-        allPassOverflow.text,
-        new RegExp(`^- \\[PASS \\d+ms\\] 套件-${String(i).padStart(2, "0")}`, "m"),
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-run-checks-"));
+    try {
+      // 1. End-to-end node --test + SGR spinner + npm banner in compact mode
+      // Use temp .mjs fixtures so Windows cmd.exe never alters backslash escapes or non-ASCII argv literals.
+      const nodeTestScriptPath = path.join(tmpDir, "node-test-sim.mjs");
+      await fs.writeFile(
+        nodeTestScriptPath,
+        [
+          "process.stdout.write('> my-pkg@1.0.0 test\\n> node --test\\n');",
+          "process.stdout.write('⠋ Running...\\r\\x1B[0m\\x1B[K\\n');",
+          "process.stdout.write('✔ handles 0 errors (1.1ms)\\n');",
+          "process.stdout.write('ℹ tests 48\\nℹ suites 0\\nℹ pass 48\\nℹ fail 0\\nℹ cancelled 0\\nℹ skipped 0\\nℹ todo 0\\nℹ duration_ms 95.4\\n');",
+        ].join("\n"),
+        "utf8",
       );
-    }
+      const passSummaryRes = await runChecks({
+        outputMode: "compact",
+        commands: [{ name: "unit-tests", command: `${nodeBin} ${JSON.stringify(nodeTestScriptPath)}` }],
+      });
+      assert.equal(passSummaryRes.isError, false);
+      assert.match(passSummaryRes.text, /\[PASS \d+ms\] unit-tests.*tests 48 \| pass 48 \| fail 0/);
+      assert.doesNotMatch(passSummaryRes.text, /suites 0|my-pkg@1\.0\.0|Running\.\.\./);
 
-    // 3. Adversarial failure with dense 4-byte emoji tail respects hard <= 8800B UTF-8 clamp
-    const emojiFailScript = [
-      "for (let i = 0; i < 60; i++) console.log('ascii neutral log ' + i + ' ' + 'a'.repeat(40));",
-      "console.error('Error: ' + '🚀'.repeat(4000) + ' TAIL_END');",
-      "process.exitCode = 1;",
-    ].join(" ");
-    const emojiFailRes = await runChecks({
-      outputMode: "compact",
-      maxChars: 8000,
-      commands: [{ name: "emoji-fail", command: `${nodeBin} -e ${JSON.stringify(emojiFailScript)}` }],
-    });
-    assert.equal(emojiFailRes.isError, false);
-    assert.ok(emojiFailRes.text.length <= 8000);
-    assert.ok(
-      Buffer.byteLength(emojiFailRes.text, "utf8") <= 8_800,
-      `Expected <= 8800B, got ${Buffer.byteLength(emojiFailRes.text, "utf8")}B`,
-    );
-    assert.equal(loneSurrogateRe.test(emojiFailRes.text), false);
-    assert.doesNotMatch(emojiFailRes.text, /\uFFFD/);
+      // 2. All-PASS batch exceeding 8800 UTF-8 bytes with CJK/emoji + long commands shrinks cleanly to 1-line summaries
+      const cjkPassScriptPath = path.join(tmpDir, "cjk-pass.mjs");
+      await fs.writeFile(
+        cjkPassScriptPath,
+        "console.log('构建校验通过: ' + '中文测试🚀'.repeat(40) + ' passed');\n",
+        "utf8",
+      );
+      const cmdPad = "pad_".repeat(120);
+      const allPassOverflow = await runChecks({
+        outputMode: "compact",
+        maxChars: 8000,
+        concurrency: 4,
+        commands: Array.from({ length: 12 }, (_, i) => ({
+          name: `套件-${String(i + 1).padStart(2, "0")}`,
+          command: `${nodeBin} ${JSON.stringify(cjkPassScriptPath)} ${cmdPad}`,
+        })),
+      });
+      assert.equal(allPassOverflow.isError, false);
+      assert.ok(allPassOverflow.text.length <= 8000);
+      assert.ok(
+        Buffer.byteLength(allPassOverflow.text, "utf8") <= 8_800,
+        `Expected <= 8800B, got ${Buffer.byteLength(allPassOverflow.text, "utf8")}B`,
+      );
+      assert.doesNotMatch(allPassOverflow.text, /\[truncated: folded \d+ middle/);
+      assert.equal(loneSurrogateRe.test(allPassOverflow.text), false);
+      assert.doesNotMatch(allPassOverflow.text, /\uFFFD/);
+      for (let i = 1; i <= 12; i++) {
+        assert.match(
+          allPassOverflow.text,
+          new RegExp(`^- \\[PASS \\d+ms\\] 套件-${String(i).padStart(2, "0")}`, "m"),
+        );
+      }
+
+      // 3. Adversarial failure with dense 4-byte emoji tail respects hard <= 8800B UTF-8 clamp
+      const emojiFailScriptPath = path.join(tmpDir, "emoji-fail.mjs");
+      await fs.writeFile(
+        emojiFailScriptPath,
+        [
+          "for (let i = 0; i < 60; i++) console.log('ascii neutral log ' + i + ' ' + 'a'.repeat(40));",
+          "console.error('Error: ' + '🚀'.repeat(4000) + ' TAIL_END');",
+          "process.exitCode = 1;",
+        ].join("\n"),
+        "utf8",
+      );
+      const emojiFailRes = await runChecks({
+        outputMode: "compact",
+        maxChars: 8000,
+        commands: [{ name: "emoji-fail", command: `${nodeBin} ${JSON.stringify(emojiFailScriptPath)}` }],
+      });
+      assert.equal(emojiFailRes.isError, false);
+      assert.ok(emojiFailRes.text.length <= 8000);
+      assert.ok(
+        Buffer.byteLength(emojiFailRes.text, "utf8") <= 8_800,
+        `Expected <= 8800B, got ${Buffer.byteLength(emojiFailRes.text, "utf8")}B`,
+      );
+      assert.equal(loneSurrogateRe.test(emojiFailRes.text), false);
+      assert.doesNotMatch(emojiFailRes.text, /\uFFFD/);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });
