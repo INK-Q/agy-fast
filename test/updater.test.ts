@@ -14,6 +14,7 @@ import {
   extractGithubSlug,
   fetchLatestRemoteVersion,
   getHomeDir,
+  getUpdaterPaths,
   pickLatestSemverTag,
   readInstalledVersion,
   readUpdateState,
@@ -1137,5 +1138,146 @@ rl.on("line", (line) => {
     await fs.mkdir(path.dirname(linkedPluginDir), { recursive: true });
     await fs.symlink(outsideWithSrc, linkedPluginDir, process.platform === "win32" ? "junction" : "dir");
     assert.equal(await detectInstallKind(linkedPluginDir), "symlink");
+  });
+
+  it("isolates update-state and locks per pluginDir across primary, GEMINI_HOME, and --target installs without splitting config.json", async () => {
+    const fakeHome = path.join(rootTmp, "home-multi-install");
+    const primaryPluginDir = path.join(fakeHome, ".gemini", "config", "plugins", "agy-fast");
+    const isoGeminiHome = path.join(rootTmp, "isolated-gemini-home");
+    const isoPluginDir = path.join(isoGeminiHome, "config", "plugins", "agy-fast");
+    const projectPluginDir = path.join(rootTmp, "proj-repo", ".agents", "plugins", "agy-fast");
+    const sharedCacheDir = path.join(fakeHome, ".gemini", "cache", "agy-fast");
+
+    await copyRuntimeFixture(primaryPluginDir, "0.2.0", "release-0.2.0");
+    await copyRuntimeFixture(isoPluginDir, "0.2.0", "release-0.2.0");
+    await copyRuntimeFixture(projectPluginDir, "0.2.0", "release-0.2.0");
+
+    // Deliberately omit AGY_FAST_CACHE_DIR to exercise default multi-install cache isolation
+    const envBase: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: fakeHome,
+      USERPROFILE: fakeHome,
+      GEMINI_HOME: isoGeminiHome,
+      AGY_FAST_REPO: originRepoUrl,
+      AGY_FAST_AUTO_UPDATE: "auto",
+    };
+    delete envBase.AGY_FAST_CACHE_DIR;
+
+    // 1. Primary install resolves to root update-state.json; non-default installs resolve to distinct installs/<hash>/ files; config.json stays shared
+    const primaryPaths = getUpdaterPaths(envBase, primaryPluginDir);
+    const isoPaths = getUpdaterPaths(envBase, isoPluginDir);
+    const projPaths = getUpdaterPaths(envBase, projectPluginDir);
+    assert.equal(primaryPaths.stateFile, path.join(sharedCacheDir, "update-state.json"));
+    assert.equal(primaryPaths.configFile, isoPaths.configFile);
+    assert.equal(isoPaths.configFile, projPaths.configFile);
+    assert.notEqual(isoPaths.stateFile, primaryPaths.stateFile);
+    assert.notEqual(projPaths.stateFile, primaryPaths.stateFile);
+    assert.notEqual(isoPaths.stateFile, projPaths.stateFile);
+    assert.notEqual(isoPaths.lockFile, primaryPaths.lockFile);
+
+    // 2. Updating isolated GEMINI_HOME install must NOT mark primary as checked/notified or block primary auto-update
+    const isoUpd = await runPluginUpdate({ pluginDir: isoPluginDir, background: true, env: envBase });
+    assert.equal(isoUpd.status, "updated");
+    assert.equal(await readInstalledVersion(isoPluginDir), "0.3.0");
+    assert.equal(await readInstalledVersion(primaryPluginDir), "0.2.0");
+    const primaryStateBefore = await readUpdateState(envBase, primaryPluginDir);
+    assert.deepEqual(primaryStateBefore, {});
+    assert.equal(shouldTriggerBackgroundCheck(primaryStateBefore, Date.now(), 24 * 3600 * 1000), true);
+
+    // Active lock on isolated install must NOT block updating primary
+    await fs.mkdir(path.dirname(isoPaths.lockFile), { recursive: true });
+    await fs.writeFile(
+      isoPaths.lockFile,
+      JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+      "utf8",
+    );
+    const primaryUpd = await runPluginUpdate({ pluginDir: primaryPluginDir, background: true, env: envBase });
+    assert.equal(primaryUpd.status, "updated");
+    assert.equal(await readInstalledVersion(primaryPluginDir), "0.3.0");
+    await fs.rm(isoPaths.lockFile, { force: true });
+
+    // Both isolated AND primary installs independently emit their own one-shot SessionStart auto-updated notice
+    const isoHook1 = await runSessionStartHook(
+      path.join(isoPluginDir, "dist", "session-start.mjs"),
+      REPO_ROOT,
+      { ...envBase, AGY_FAST_UPDATE_INTERVAL_HOURS: "24" },
+    );
+    assert.equal(isoHook1.code, 0);
+    assert.match(
+      JSON.parse(isoHook1.stdout).injectSteps[0].systemMessage.systemMessage as string,
+      /Auto-updated v0\.2\.0 -> v0\.3\.0/,
+    );
+    const primaryHook1 = await runSessionStartHook(
+      path.join(primaryPluginDir, "dist", "session-start.mjs"),
+      REPO_ROOT,
+      { ...envBase, AGY_FAST_UPDATE_INTERVAL_HOURS: "24" },
+    );
+    assert.equal(primaryHook1.code, 0);
+    assert.match(
+      JSON.parse(primaryHook1.stdout).injectSteps[0].systemMessage.systemMessage as string,
+      /Auto-updated v0\.2\.0 -> v0\.3\.0/,
+    );
+    // Neither emits the notice a second time
+    const primaryHook2 = await runSessionStartHook(
+      path.join(primaryPluginDir, "dist", "session-start.mjs"),
+      REPO_ROOT,
+      { ...envBase, AGY_FAST_UPDATE_INTERVAL_HOURS: "24" },
+    );
+    assert.doesNotMatch(
+      JSON.parse(primaryHook2.stdout).injectSteps[0].systemMessage.systemMessage as string,
+      /Auto-updated v0\.2\.0 -> v0\.3\.0/,
+    );
+
+    // 3. Skipping v0.3.0 on project --target install via updater CLI/install.mjs only affects project install, and doctor --target reads its isolated state
+    execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--skip-version", "0.3.0", "--target", projectPluginDir],
+      { env: envBase, encoding: "utf8" },
+    );
+    assert.equal((await readUpdateState(envBase, projectPluginDir)).skippedVersion, "0.3.0");
+    assert.equal((await readUpdateState(envBase, primaryPluginDir)).skippedVersion, undefined);
+    const projDoctorOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", projectPluginDir],
+      { env: envBase, encoding: "utf8" },
+    );
+    assert.match(projDoctorOut, /skipped: v0\.3\.0/);
+    const primaryDoctorOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", primaryPluginDir],
+      { env: envBase, encoding: "utf8" },
+    );
+    assert.doesNotMatch(primaryDoctorOut, /skipped: v0\.3\.0/);
+    const isoDoctorOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", isoPluginDir],
+      { env: envBase, encoding: "utf8" },
+    );
+    assert.doesNotMatch(isoDoctorOut, /skipped: v0\.3\.0/);
+    assert.doesNotMatch(isoDoctorOut, /not checked yet/);
+
+    // 4. Symlinked isolated GEMINI_HOME profile pointing to primary shares primary's canonical stateFile
+    const linkedGeminiPluginDir = path.join(rootTmp, "linked-gemini-home", "config", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(linkedGeminiPluginDir), { recursive: true });
+    await fs.symlink(
+      primaryPluginDir,
+      linkedGeminiPluginDir,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    assert.equal(getUpdaterPaths(envBase, linkedGeminiPluginDir).stateFile, primaryPaths.stateFile);
+
+    // 5. Symlinked parent directory with non-existent leaf resolves to the same state key as its canonical path
+    const realParent = path.join(rootTmp, "real-parent-for-key");
+    const linkParent = path.join(rootTmp, "link-parent-for-key");
+    await fs.mkdir(realParent, { recursive: true });
+    await fs.symlink(
+      realParent,
+      linkParent,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    assert.equal(
+      getUpdaterPaths(envBase, path.join(linkParent, "future-plugin")).stateFile,
+      getUpdaterPaths(envBase, path.join(realParent, "future-plugin")).stateFile,
+    );
   });
 });

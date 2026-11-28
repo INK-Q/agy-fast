@@ -1750,8 +1750,9 @@ async function resolveSessionWorkspaceDir(payload, scriptPluginRoot, env = proce
 }
 
 // src/utils/updater-core.ts
+import crypto from "node:crypto";
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs3 } from "node:fs";
+import { promises as fs3, realpathSync } from "node:fs";
 import os4 from "node:os";
 import path5 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
@@ -1769,14 +1770,58 @@ function getHomeDir(env = process.env, platform = process.platform) {
   }
   return env.HOME?.trim() || env.USERPROFILE?.trim() || os4.homedir();
 }
-function getUpdaterPaths(env = process.env) {
+function canonicalizePathForStateKey(targetPath, platform = process.platform) {
+  const resolved = path5.resolve(targetPath);
+  const tail = [];
+  let cur = resolved;
+  let canonical = resolved;
+  while (true) {
+    try {
+      const real = typeof realpathSync.native === "function" ? realpathSync.native(cur) : realpathSync(cur);
+      canonical = tail.length > 0 ? path5.join(real, ...tail.reverse()) : real;
+      break;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        canonical = resolved;
+        break;
+      }
+      const parent = path5.dirname(cur);
+      if (parent === cur) {
+        canonical = resolved;
+        break;
+      }
+      tail.push(path5.basename(cur));
+      cur = parent;
+    }
+  }
+  const normalized = path5.resolve(canonical);
+  return platform === "win32" || platform === "darwin" ? normalized.toLowerCase() : normalized;
+}
+function getUpdaterPaths(env = process.env, pluginDir) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
   const cacheDir = custom ? path5.resolve(custom) : path5.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  let stateDir = cacheDir;
+  if (!custom && pluginDir && pluginDir.trim()) {
+    const defaultGlobalPluginDir = path5.join(
+      getHomeDir(env),
+      ".gemini",
+      "config",
+      "plugins",
+      "agy-fast"
+    );
+    const canonPlugin = canonicalizePathForStateKey(pluginDir);
+    const canonDefault = canonicalizePathForStateKey(defaultGlobalPluginDir);
+    if (canonPlugin !== canonDefault) {
+      const installKey = crypto.createHash("sha256").update(canonPlugin).digest("hex").slice(0, 16);
+      stateDir = path5.join(cacheDir, "installs", installKey);
+    }
+  }
   return {
     cacheDir,
-    stateFile: path5.join(cacheDir, "update-state.json"),
+    stateFile: path5.join(stateDir, "update-state.json"),
     configFile: path5.join(cacheDir, "config.json"),
-    lockFile: path5.join(cacheDir, "update.lock")
+    lockFile: path5.join(stateDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -1850,12 +1895,12 @@ async function readUpdaterConfig(env = process.env) {
   const paths = getUpdaterPaths(env);
   return await readJsonFile(paths.configFile) ?? {};
 }
-async function readUpdateState(env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function readUpdateState(env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   return await readJsonFile(paths.stateFile) ?? {};
 }
-async function writeUpdateState(patch, env = process.env) {
-  const paths = getUpdaterPaths(env);
+async function writeUpdateState(patch, env = process.env, pluginDir) {
+  const paths = getUpdaterPaths(env, pluginDir);
   const existing = await readJsonFile(paths.stateFile) ?? {};
   const merged = { ...existing, ...patch };
   await writeJsonAtomically(paths.stateFile, merged);
@@ -1912,9 +1957,9 @@ function shouldTriggerBackgroundCheck(state, nowMs, intervalMs) {
   return true;
 }
 async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = process.env) {
-  const state = await readUpdateState(env);
+  const state = await readUpdateState(env, pluginDir);
   if (state.lastAppliedVersion && state.lastAppliedVersion === currentVersion && state.lastAppliedFrom && state.lastAppliedFrom !== currentVersion && state.notifiedAppliedVersion !== currentVersion) {
-    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env).catch(
+    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env, pluginDir).catch(
       () => {
       }
     );
@@ -1928,7 +1973,8 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     }
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
-      env
+      env,
+      pluginDir
     ).catch(() => {
     });
     const ver = state.availableVersion;
@@ -1942,7 +1988,8 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
   if (!state.availableVersion && state.availableCommit && state.availableCommit !== state.lastAppliedCommit && state.notifiedAvailableCommit !== state.availableCommit) {
     await writeUpdateState(
       { notifiedAvailableCommit: state.availableCommit },
-      env
+      env,
+      pluginDir
     ).catch(() => {
     });
     const refLabel = state.availableRef || "main";
@@ -2107,19 +2154,24 @@ async function main() {
       if (settings.mode !== "off") {
         const [currentVersion, state] = await Promise.all([
           readInstalledVersion(pluginDir),
-          readUpdateState()
+          readUpdateState(process.env, pluginDir)
         ]);
         updateNotice = await consumeSnapshotUpdateNotice(
           pluginDir,
-          currentVersion
+          currentVersion,
+          process.env
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
           const updaterPath = path6.join(pluginDir, "dist", "updater.mjs");
           const hasUpdater = await fs4.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
-            await writeUpdateState({
-              lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
-            }).catch(() => {
+            await writeUpdateState(
+              {
+                lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
+              },
+              process.env,
+              pluginDir
+            ).catch(() => {
             });
             spawnBackgroundUpdateCheck(pluginDir);
           }
