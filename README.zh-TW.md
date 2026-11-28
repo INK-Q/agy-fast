@@ -218,6 +218,11 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | 同輪多處/跨檔案編輯，或「編輯 + 驗證」 | **`apply_edits`** | 原子或 `bestEffort` 寫入檔案 + 可選內聯 `verify` |
 | 執行 ≥2 條獨立建置、檢查、測試或診斷指令 | **`run_checks`** | 受控並行執行，頭尾折疊擷取核心報錯與測試彙總 |
 
+> [!NOTE]
+> **Antigravity 急載入：** Antigravity 是一等外掛目標——`agy-fast` 為其提供 `hooks.json` 鉤子、`rules/AGENTS.md` 規則、安裝腳本與零延遲自動更新器。急載入模式下，宿主會為每次 `mcp_agy-fast_fast_*` 呼叫注入必填參數 `toolSummary`（詳見 [`rules/AGENTS.md` Quick Schemas](rules/AGENTS.md)）；該注入是 Antigravity 急載入行為——懶載入 `call_mcp_tool` 呼叫與獨立 MCP 宿主不受影響。請附帶該參數（一段簡短的呼叫目的說明），否則首輪呼叫會直接報 `missing property 'toolSummary'`。
+>
+> **標準 MCP 宿主（Codex、Claude Code 等）：** 透過 `npx -y agy-fast mcp`（或 `node <外掛目錄>/scripts/install.mjs mcp`）自助掛載同一服務，並透過 `npx -y agy-fast mcp-config --rules` 輸出宿主無關的路由規則（或參見 Quick Start 的獨立 MCP 小節）——無需手動接線 `dist/mcp-server.mjs`——並可選傳 `--tools`（工具子集）與/或 `--schema-compat=minimal`（配合嚴格 JSON Schema 子集宿主；執行期校驗不受影響）。
+
 ### 1. `batch_search` — 並行程式碼檢索、模糊路徑與唯讀 Git 查詢
 - **單次最多 20 條混合查詢**：支援 `text`、`regex`、`glob`、`fuzzy` 與唯讀 `git`（`status`、`diff`、`log`、`show`、`branch`、`rev-parse`、`ls-files`、`blame`、`shortlog`、`describe`、`tag --list`、`remote -v`），並支援按條傳入 `path` 跨目錄/跨儲存庫查詢。
 - **精細控制**：支援 `fileType`（如 `typescript`、`python`、`gdscript`）與 `glob` 過濾、`outputMode`（`content` | `files_with_matches` | `count`）、跨行匹配 `multiline: true`（此時 `count` 統計各檔案的匹配次數）、`type: "fuzzy"` 忽略大小寫模糊路徑查詢以及 `glob` 的 `sortBy: "mtime"` 最新修改優先排序。
