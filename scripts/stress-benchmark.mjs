@@ -1409,10 +1409,18 @@ async function main() {
   await fs.mkdir(monoDir, { recursive: true });
 
   const client = new McpTestClient({ framing: "ndjson" });
-  // Empty PATH forces Node.js fallback (no rg binary discoverable)
+  // Empty PATH forces Node.js fallback (no rg binary discoverable); delete all
+  // case-insensitive PATH keys (e.g. Windows `Path`) so `rg.exe` cannot leak.
+  const nodeFallbackEnv = { ...process.env };
+  for (const key of Object.keys(nodeFallbackEnv)) {
+    if (key.toUpperCase() === "PATH") {
+      delete nodeFallbackEnv[key];
+    }
+  }
+  nodeFallbackEnv.PATH = "";
   const nodeFallbackClient = new McpTestClient({
     framing: "ndjson",
-    env: { ...process.env, PATH: "" },
+    env: nodeFallbackEnv,
   });
 
   try {

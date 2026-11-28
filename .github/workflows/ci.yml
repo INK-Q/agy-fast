@@ -57,6 +57,21 @@ jobs:
         if: runner.os != 'Windows'
         run: sh -n install.sh
 
+      - name: Validate Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $scriptPath = (Resolve-Path -LiteralPath "install.ps1").Path
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+            foreach ($err in $errors) {
+              [Console]::Error.WriteLine($err.ToString())
+            }
+            exit 1
+          }
+
       - name: Run test suite
         run: npm test
 

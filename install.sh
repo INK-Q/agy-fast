@@ -12,7 +12,11 @@ set -eu
 
 PLUGIN_NAME="agy-fast"
 DEFAULT_REPO="https://github.com/INK-Q/agy-fast.git"
-DEFAULT_TARGET="${HOME}/.gemini/config/plugins/${PLUGIN_NAME}"
+if [ -n "${HOME:-}" ]; then
+  DEFAULT_TARGET="${HOME}/.gemini/config/plugins/${PLUGIN_NAME}"
+else
+  DEFAULT_TARGET=""
+fi
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: Node.js >= 20 is required. Install Node.js first: https://nodejs.org/" >&2
@@ -27,7 +31,7 @@ fi
 
 HAS_SUBCMD=0
 case "${1:-}" in
-  install|update|config|uninstall|status|doctor|-h|--help)
+  install|update|config|mcp|mcp-config|uninstall|status|doctor|-h|--help)
     HAS_SUBCMD=1
     ;;
 esac
@@ -62,7 +66,7 @@ if [ -n "$SCRIPT_DIR" ] &&
 fi
 
 # Allow running doctor/status/uninstall directly against an existing install
-if [ "${HAS_SUBCMD}" -eq 1 ] && [ "${1:-}" != "install" ] && [ -f "${DEFAULT_TARGET}/scripts/install.mjs" ]; then
+if [ "${HAS_SUBCMD}" -eq 1 ] && [ "${1:-}" != "install" ] && [ -n "${DEFAULT_TARGET}" ] && [ -f "${DEFAULT_TARGET}/scripts/install.mjs" ]; then
   exec node "${DEFAULT_TARGET}/scripts/install.mjs" "$@"
 fi
 
