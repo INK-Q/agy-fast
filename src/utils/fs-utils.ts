@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -310,6 +310,7 @@ export async function walkFiles(
 
   const files: string[] = [];
   let truncated = false;
+  let filesTruncated = false;
   let timedOut = false;
   let dirsTruncated = false;
   let visitedDirs = 0;
@@ -317,6 +318,7 @@ export async function walkFiles(
   // Global concurrency semaphore caps simultaneous fs.readdir calls across all
   // recursion depths to prevent EMFILE FD exhaustion on nested workspaces.
   const MAX_CONCURRENT_READDIRS = 16;
+  const DEFAULT_BATCH_SIZE = 8;
   let activeReaddirs = 0;
   const waitQueue: Array<() => void> = [];
   const drainWaiters = (): void => {
@@ -329,7 +331,7 @@ export async function walkFiles(
     truncated = true;
     drainWaiters();
   };
-  const withinBudget = (): boolean => {
+  const canStartRead = (): boolean => {
     if (truncated) return false;
     if (deadline !== null && Date.now() >= deadline) {
       timedOut = true;
@@ -338,34 +340,70 @@ export async function walkFiles(
     }
     return true;
   };
+  const stoppedStatus = (): "dirs_limit" | "timed_out" | "stopped" => {
+    if (filesTruncated) return "stopped";
+    if (timedOut) return "timed_out";
+    if (dirsTruncated) return "dirs_limit";
+    return "stopped";
+  };
+  // Taper sibling prefetch width as remaining maxDirs budget shrinks so later
+  // siblings do not consume directory quota ahead of earlier siblings' subtrees
+  // while keeping full 8-way concurrency when budget is plentiful.
+  const computeBatchSize = (): number => {
+    if (maxDirs === null) return DEFAULT_BATCH_SIZE;
+    const remaining = maxDirs - visitedDirs - waitQueue.length;
+    return Math.min(
+      DEFAULT_BATCH_SIZE,
+      Math.max(1, Math.floor(remaining / DEFAULT_BATCH_SIZE)),
+    );
+  };
   const timeoutTimer =
     timeoutMs !== null
       ? setTimeout(() => {
-          timedOut = true;
-          markTruncated();
+          if (!truncated) {
+            timedOut = true;
+            markTruncated();
+          }
         }, timeoutMs)
       : null;
   timeoutTimer?.unref();
 
-  const readDirBounded = async (dir: string) => {
-    if (!withinBudget()) return null;
+  type ReadDirOutcome =
+    | { status: "scanned"; entries: Dirent[] }
+    | { status: "error" }
+    | { status: "dirs_limit" }
+    | { status: "timed_out" }
+    | { status: "stopped" };
+
+  const readDirBounded = async (dir: string): Promise<ReadDirOutcome> => {
+    if (!canStartRead()) return { status: stoppedStatus() };
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      return { status: "dirs_limit" };
+    }
     while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
       await new Promise<void>((resolve) => waitQueue.push(resolve));
-      if (!withinBudget()) return null;
+      if (!canStartRead()) return { status: stoppedStatus() };
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        return { status: "dirs_limit" };
+      }
     }
-    if (!withinBudget()) return null;
+    if (!canStartRead()) return { status: stoppedStatus() };
     if (maxDirs !== null && visitedDirs >= maxDirs) {
-      dirsTruncated = true;
-      markTruncated();
-      return null;
+      return { status: "dirs_limit" };
     }
     visitedDirs++;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      drainWaiters();
+    }
     activeReaddirs++;
     try {
-      return await fs.readdir(dir, { withFileTypes: true });
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      return { status: "scanned", entries };
+    } catch {
+      return { status: "error" };
     } finally {
       activeReaddirs--;
-      if (truncated) {
+      if (truncated || (maxDirs !== null && visitedDirs >= maxDirs)) {
         drainWaiters();
       } else {
         const next = waitQueue.shift();
@@ -375,19 +413,20 @@ export async function walkFiles(
   };
 
   interface DirScanResult {
+    status: "scanned" | "error" | "dirs_limit" | "timed_out" | "stopped";
     localFiles: string[];
     subdirs: Array<{ abs: string; rel: string }>;
   }
 
   const scanDir = async (dir: string, relDir: string): Promise<DirScanResult> => {
-    if (!withinBudget()) return { localFiles: [], subdirs: [] };
-    let entries;
-    try {
-      entries = await readDirBounded(dir);
-    } catch {
-      return { localFiles: [], subdirs: [] };
+    const readRes = await readDirBounded(dir);
+    if (readRes.status !== "scanned") {
+      return { status: readRes.status, localFiles: [], subdirs: [] };
     }
-    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
+    if (filesTruncated) {
+      return { status: "stopped", localFiles: [], subdirs: [] };
+    }
+    const entries = readRes.entries;
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     const localFiles: string[] = [];
@@ -408,48 +447,95 @@ export async function walkFiles(
         localFiles.push(relPosix);
       }
     }
-    return { localFiles, subdirs };
+    return { status: "scanned", localFiles, subdirs };
   };
 
   // Prefetch sibling directories concurrently in bounded batches while emitting
   // matched files in deterministic lexicographical DFS order and only marking
   // `truncated` when a (maxFiles + 1)-th matching file or scan budget is hit.
+  // Returns true iff this directory and its entire reachable subtree completed
+  // without truncation, so callers preserve already-scanned sibling results up
+  // to the exact DFS truncation boundary without introducing DFS holes.
   async function visit(
     dir: string,
     relDir: string,
     depth: number,
     prefetched?: Promise<DirScanResult>,
-  ): Promise<void> {
-    if (!withinBudget() || depth > maxDepth) return;
-    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
-    if (!withinBudget()) return;
-
-    for (const relPosix of localFiles) {
-      if (files.length >= maxFiles) {
+  ): Promise<boolean> {
+    if (depth > maxDepth) return true;
+    if (!prefetched) {
+      if (!canStartRead()) return false;
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        dirsTruncated = true;
         markTruncated();
-        return;
+        return false;
+      }
+    }
+    const res = await (prefetched ?? scanDir(dir, relDir));
+    if (res.status === "dirs_limit") {
+      dirsTruncated = true;
+      markTruncated();
+      return false;
+    }
+    if (res.status === "timed_out") {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    if (res.status === "stopped") {
+      return false;
+    }
+    if (res.status === "error") {
+      return true;
+    }
+
+    for (const relPosix of res.localFiles) {
+      if (files.length >= maxFiles) {
+        filesTruncated = true;
+        markTruncated();
+        return false;
       }
       files.push(relPosix);
     }
 
-    if (depth >= maxDepth || subdirs.length === 0) return;
+    if (depth >= maxDepth || res.subdirs.length === 0) return true;
 
-    const batchSize = 8;
-    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
-      const slice = subdirs.slice(i, i + batchSize);
+    for (let i = 0; i < res.subdirs.length; ) {
+      if (!canStartRead()) return false;
+      if (maxDirs !== null && visitedDirs >= maxDirs) {
+        dirsTruncated = true;
+        markTruncated();
+        return false;
+      }
+      const batchSize = computeBatchSize();
+      const slice = res.subdirs.slice(i, i + batchSize);
+      i += slice.length;
       const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      let completedInSlice = 0;
       try {
-        for (let j = 0; j < slice.length && withinBudget(); j++) {
-          await visit(slice[j]!.abs, slice[j]!.rel, depth + 1, prefetches[j]);
+        for (let j = 0; j < slice.length; j++) {
+          if (filesTruncated) return false;
+          const completed = await visit(
+            slice[j]!.abs,
+            slice[j]!.rel,
+            depth + 1,
+            prefetches[j],
+          );
+          if (!completed) return false;
+          completedInSlice = j + 1;
         }
+      } catch (err) {
+        markTruncated();
+        throw err;
       } finally {
-        // Ensure no sibling prefetches remain in flight after early truncation
+        // Ensure no sibling prefetches remain in flight after early truncation or error
         // (avoids dangling directory handles / EBUSY on Windows temp cleanup).
-        if (truncated) {
+        if (completedInSlice < prefetches.length) {
           await Promise.allSettled(prefetches);
         }
       }
     }
+    return true;
   }
 
   try {
