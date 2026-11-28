@@ -465,7 +465,17 @@ const ERROR_LINE_PATTERN =
   /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×]\s+\S|●\s+(?!Console\s*$|\((?:SSG|Static|Dynamic|ISR)\)(?:\s|$))\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 
 const ROOT_CAUSE_HEADER_PATTERN =
-  /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
+  /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error|^={3,}\s*(?:FAILURES|ERRORS)\s*={3,}\s*$)/i;
+
+const PYTEST_ROOT_CAUSE_LINE_PATTERN =
+  /^E\s{2,}(?:assert\b|[A-Za-z_][\w.]*(?:Error|Exception)\b)/;
+
+function isRootCauseHeaderLine(line: string): boolean {
+  return (
+    ROOT_CAUSE_HEADER_PATTERN.test(line) ||
+    PYTEST_ROOT_CAUSE_LINE_PATTERN.test(line)
+  );
+}
 
 // Strict superset of ERROR_LINE_PATTERN plus warnings, crashes, and localized failure terms
 const FOLD_DANGER_TOKEN_PATTERN =
@@ -508,6 +518,12 @@ const SUMMARY_LINE_PATTERN =
 const MONOREPO_PREFIX_PATTERN =
   /^(?:@[\w.-]+\/)?[\w./-]+(?::[A-Za-z][\w.-]*|\s+[A-Za-z][\w.-]*):\s+/;
 
+// Pytest verbose passing node lines (including spaced/single-nested `[...]` params)
+// and per-file passing dot-progress lines (no `F`/`E`/`x`/`s` failure markers)
+const PYTEST_VERBOSE_PASS_PATTERN =
+  /^\S+\.py::[^\s\[]+(?:\[(?:[^\[\]\r\n]|\[[^\[\]\r\n]*\])+\])?\s+PASSED(?:\s+\[\s*\d+%\])?$/;
+const PYTEST_DOT_PASS_PATTERN = /^\S+\.py\s+\.+(?:\s+\[\s*\d+%\])?$/;
+
 const GREEN_BUILD_OR_PASS_PATTERNS: RegExp[] = [
   // Vite / Rollup / esbuild / Webpack / bundler banners & asset size lines
   /^(?:vite|rollup|esbuild|webpack|rspack|parcel|tsup|rolldown)\s+v?\d[\w.-]*\b/i,
@@ -529,7 +545,7 @@ const GREEN_BUILD_OR_PASS_PATTERNS: RegExp[] = [
   /^cache hit,\s+replaying logs\b/i,
   /^Time:\s+\d+(?:\.\d+)?\s*(?:ms|s|m)\b/i,
   /^(?:yarn run v\d|•\s+Packages in scope:|•\s+Running\s+\S+\s+in\s+\d+\s+packages)/i,
-  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP)
+  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP / pytest)
   /^[✓✔]\s+\S/,
   /^PASS\s+\S/,
   /^(?:---\s+PASS:\s*|===\s+(?:RUN|PAUSE|CONT)\s+)\S/,
@@ -538,6 +554,8 @@ const GREEN_BUILD_OR_PASS_PATTERNS: RegExp[] = [
   /^ok\s+\d+\s+-\s+\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\b/,
   /^running\s+\d+\s+tests?$/i,
+  PYTEST_VERBOSE_PASS_PATTERN,
+  PYTEST_DOT_PASS_PATTERN,
   /^(?:Test Files|Tests|Suites|Snapshots|Start at|Duration|test result:\s{0,4}ok\.)\s.*(?:\bpassed\b|\btotal\b|\b\d+(?:\.\d+)?(?:ms|s)\b|\bok\.)/i,
   // Rust / Go / Gradle / Maven progress (strictly scoped [INFO] whitelist)
   /^(?:Compiling|Checking|Downloading|Downloaded|Updating|Fresh|Locking|Packaging|Documenting|Finished)\s+\S/,
@@ -555,6 +573,8 @@ const UNAMBIGUOUS_TEST_PASS_PATTERNS: RegExp[] = [
   /^ok\t\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
   /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/,
+  PYTEST_VERBOSE_PASS_PATTERN,
+  PYTEST_DOT_PASS_PATTERN,
 ];
 
 function isUnambiguousTestPassLine(trimmed: string): boolean {
@@ -809,7 +829,7 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
     ) {
       continue;
     }
-    if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
+    if (isRootCauseHeaderLine(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);

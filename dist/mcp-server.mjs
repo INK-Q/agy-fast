@@ -1654,7 +1654,11 @@ function stripBenignZeroCounts(line) {
   return afterLeading.replace(BENIGN_ZERO_COUNT_TRAILING_RE, " ");
 }
 var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×]\s+\S|●\s+(?!Console\s*$|\((?:SSG|Static|Dynamic|ISR)\)(?:\s|$))\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
-var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
+var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error|^={3,}\s*(?:FAILURES|ERRORS)\s*={3,}\s*$)/i;
+var PYTEST_ROOT_CAUSE_LINE_PATTERN = /^E\s{2,}(?:assert\b|[A-Za-z_][\w.]*(?:Error|Exception)\b)/;
+function isRootCauseHeaderLine(line) {
+  return ROOT_CAUSE_HEADER_PATTERN.test(line) || PYTEST_ROOT_CAUSE_LINE_PATTERN.test(line);
+}
 var FOLD_DANGER_TOKEN_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✕✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
 function isErrorLine(line) {
   return ERROR_LINE_PATTERN.test(stripBenignZeroCounts(line));
@@ -1683,6 +1687,8 @@ function isFailureNoiseLine(line) {
 }
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
 var MONOREPO_PREFIX_PATTERN = /^(?:@[\w.-]+\/)?[\w./-]+(?::[A-Za-z][\w.-]*|\s+[A-Za-z][\w.-]*):\s+/;
+var PYTEST_VERBOSE_PASS_PATTERN = /^\S+\.py::[^\s\[]+(?:\[(?:[^\[\]\r\n]|\[[^\[\]\r\n]*\])+\])?\s+PASSED(?:\s+\[\s*\d+%\])?$/;
+var PYTEST_DOT_PASS_PATTERN = /^\S+\.py\s+\.+(?:\s+\[\s*\d+%\])?$/;
 var GREEN_BUILD_OR_PASS_PATTERNS = [
   // Vite / Rollup / esbuild / Webpack / bundler banners & asset size lines
   /^(?:vite|rollup|esbuild|webpack|rspack|parcel|tsup|rolldown)\s+v?\d[\w.-]*\b/i,
@@ -1704,7 +1710,7 @@ var GREEN_BUILD_OR_PASS_PATTERNS = [
   /^cache hit,\s+replaying logs\b/i,
   /^Time:\s+\d+(?:\.\d+)?\s*(?:ms|s|m)\b/i,
   /^(?:yarn run v\d|•\s+Packages in scope:|•\s+Running\s+\S+\s+in\s+\d+\s+packages)/i,
-  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP)
+  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP / pytest)
   /^[✓✔]\s+\S/,
   /^PASS\s+\S/,
   /^(?:---\s+PASS:\s*|===\s+(?:RUN|PAUSE|CONT)\s+)\S/,
@@ -1713,6 +1719,8 @@ var GREEN_BUILD_OR_PASS_PATTERNS = [
   /^ok\s+\d+\s+-\s+\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\b/,
   /^running\s+\d+\s+tests?$/i,
+  PYTEST_VERBOSE_PASS_PATTERN,
+  PYTEST_DOT_PASS_PATTERN,
   /^(?:Test Files|Tests|Suites|Snapshots|Start at|Duration|test result:\s{0,4}ok\.)\s.*(?:\bpassed\b|\btotal\b|\b\d+(?:\.\d+)?(?:ms|s)\b|\bok\.)/i,
   // Rust / Go / Gradle / Maven progress (strictly scoped [INFO] whitelist)
   /^(?:Compiling|Checking|Downloading|Downloaded|Updating|Fresh|Locking|Packaging|Documenting|Finished)\s+\S/,
@@ -1726,7 +1734,9 @@ var UNAMBIGUOUS_TEST_PASS_PATTERNS = [
   /^ok\s+\d+\s+-\s+\S/,
   /^ok\t\S/,
   /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
-  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/
+  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/,
+  PYTEST_VERBOSE_PASS_PATTERN,
+  PYTEST_DOT_PASS_PATTERN
 ];
 function isUnambiguousTestPassLine(trimmed) {
   if (!trimmed || /[✖✕✘✗×]/.test(trimmed)) return false;
@@ -1918,7 +1928,7 @@ function compactLongFailureLines(lines, maxChars) {
     if (isUnambiguousTestPassLine(trimmed) || monoInner.length > 0 && isUnambiguousTestPassLine(monoInner)) {
       continue;
     }
-    if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
+    if (isRootCauseHeaderLine(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
