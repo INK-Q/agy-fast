@@ -734,4 +734,205 @@ describe("output-filter", () => {
     assert.equal(crossFoldMeta.collapsedLines, 0);
     assert.match(crossFoldMeta.text, /PASS src\/a0\.test\.ts ✕ note/);
   });
+
+  it("extracts crisp 1-line pass summaries across test/build runners, strips SGR-prefixed line erases, and stays linear-time", () => {
+    // 1. SGR / cursor-prefixed \x1B[K spinner cleanup (\r\x1B[0m\x1B[K) vs plain SGR overwrite
+    const sgrSpinnerRaw =
+      "\x1B[33m⠋ Compiling...\x1B[0m\r\x1B[0m\x1B[K\n" +
+      "⠙ Linking...\r\x1B[?25h\x1B[1;32m\x1B[0K\n" +
+      "progress 10%\r\x1B[0m\x1B[Kprogress 100%\n" +
+      "keep-me\r\x1B[0m";
+    assert.equal(normalizeTerminalOutput(sgrSpinnerRaw), "progress 100%\nkeep-me");
+
+    // 2. node --test spec reporter: drops npm banners, individual checks, suites 0; keeps tests/pass/fail
+    const nodeTestOut = [
+      "> @app/core@1.0.0 test",
+      "> node --test dist/*.test.mjs",
+      "",
+      "✔ handles 0 errors and ok payload (1.4ms)",
+      "✔ parses passed token cleanly (0.6ms)",
+      "ℹ tests 267",
+      "ℹ suites 0",
+      "ℹ pass 267",
+      "ℹ fail 0",
+      "ℹ cancelled 0",
+      "ℹ skipped 0",
+      "ℹ todo 0",
+      "ℹ duration_ms 1423.456",
+    ].join("\n");
+    assert.equal(
+      formatCompactCommandOutput({
+        stdout: nodeTestOut,
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        maxChars: 500,
+      }),
+      "tests 267 | pass 267 | fail 0",
+    );
+
+    // node --test TAP reporter with non-zero skipped count
+    const nodeTapOut = [
+      "$ node --test --test-reporter=tap",
+      "ok 1 - parses manifest",
+      "# tests 12",
+      "# suites 2",
+      "# pass 10",
+      "# fail 0",
+      "# cancelled 0",
+      "# skipped 2",
+      "# todo 0",
+      "# duration_ms 42.1",
+    ].join("\n");
+    assert.equal(
+      formatCompactCommandOutput({
+        stdout: nodeTapOut,
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        maxChars: 500,
+      }),
+      "tests 12 | pass 10 | fail 0 | skipped 2",
+    );
+
+    // 3. Vitest, Jest, Pytest, Cargo test, Go test, Mocha, and build tools
+    const runnerCases: Array<{ name: string; stdout: string; expected: RegExp; absent?: RegExp }> = [
+      {
+        name: "vitest",
+        stdout: [
+          "> web@1.0.0 test",
+          "> vitest run",
+          " ✓ test/auth.test.ts (12) 45ms",
+          " Test Files  2 passed (2)",
+          "      Tests  42 passed (42)",
+          "   Start at  10:15:22",
+          "   Duration  1.84s",
+        ].join("\n"),
+        expected: /^Test Files  2 passed \(2\) \| Tests  42 passed \(42\)$/,
+      },
+      {
+        name: "jest",
+        stdout: [
+          "PASS src/a.test.ts",
+          "Test Suites: 3 passed, 3 total",
+          "Tests:       42 passed, 42 total",
+          "Snapshots:   0 total",
+          "Time:        1.234 s",
+          "Ran all test suites.",
+        ].join("\n"),
+        expected: /^Test Suites: 3 passed, 3 total \| Tests:\s+42 passed, 42 total$/,
+        absent: /Ran all test suites/,
+      },
+      {
+        name: "pytest",
+        stdout: [
+          "tests/test-passed.py ....                                       [100%]",
+          "============================== 42 passed in 1.2s ===============================",
+        ].join("\n"),
+        expected: /^42 passed in 1\.2s$/,
+        absent: /test-passed\.py/,
+      },
+      {
+        name: "cargo test",
+        stdout: [
+          "   Compiling app v0.1.0 (/repo)",
+          "running 42 tests",
+          "test auth::ok_case ... ok",
+          "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s",
+        ].join("\n"),
+        expected: /^test result: ok\. 42 passed; 0 failed/,
+        absent: /ok_case|running 42 tests/,
+      },
+      {
+        name: "go test",
+        stdout: [
+          "=== RUN   TestRouter",
+          "--- PASS: TestRouter (0.00s)",
+          "PASS",
+          "ok  \tgithub.com/org/repo/pkg\t0.12s",
+        ].join("\n"),
+        expected: /^ok\s+github\.com\/org\/repo\/pkg\s+0\.12s$/,
+        absent: /TestRouter/,
+      },
+      {
+        name: "mocha",
+        stdout: [
+          "  ✓ handles errors cleanly (2ms)",
+          "  42 passing (156ms)",
+        ].join("\n"),
+        expected: /^42 passing \(156ms\)$/,
+        absent: /handles errors cleanly/,
+      },
+      {
+        name: "succeeded",
+        stdout: [
+          "> app@1.0.0 build",
+          "> custom-bundler",
+          "Bundling assets...",
+          "Build succeeded in 0.8s",
+        ].join("\n"),
+        expected: /^Build succeeded in 0\.8s$/,
+        absent: /app@1\.0\.0/,
+      },
+      {
+        name: "esbuild",
+        stdout: [
+          "> app@1.0.0 build",
+          "> node scripts/build.mjs",
+          "Built dist/mcp-server.mjs (402.3 KB)",
+        ].join("\n"),
+        expected: /^Built dist\/mcp-server\.mjs \(402\.3 KB\)$/,
+        absent: /app@1\.0\.0/,
+      },
+    ];
+    for (const c of runnerCases) {
+      const out = formatCompactCommandOutput({
+        stdout: c.stdout,
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        maxChars: 500,
+      });
+      assert.match(out, c.expected, `${c.name}: got ${JSON.stringify(out)}`);
+      if (c.absent) {
+        assert.doesNotMatch(out, c.absent, `${c.name}: unexpected noise in ${JSON.stringify(out)}`);
+      }
+      assert.ok(!out.includes("\n"), `${c.name}: expected 1 line, got ${JSON.stringify(out)}`);
+    }
+
+    // 4. Oversized pass summary remains strictly 1 line <= 320 chars
+    const longPass = formatCompactCommandOutput({
+      stdout: `PASS_SUMMARY: ${"x".repeat(450)} passed`,
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      maxChars: 500,
+    });
+    assert.ok(longPass.length <= 320);
+    assert.ok(!longPass.includes("\n"));
+    assert.ok(longPass.endsWith("..."));
+
+    // 5. Adversarial 60K inputs stay strictly linear O(N)
+    const advStart = performance.now();
+    const sgrAdv = `spinner\r${"\x1B[0m".repeat(15_000)}done`;
+    assert.equal(normalizeTerminalOutput(sgrAdv), "done");
+    const summaryAdv = [
+      "=".repeat(60_000) + "x",
+      `tests${" ".repeat(60_000)}x`,
+      `${"a.py".repeat(15_000)}x`,
+      "42 passed in 0.1s",
+    ].join("\n");
+    assert.equal(
+      formatCompactCommandOutput({
+        stdout: summaryAdv,
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        maxChars: 500,
+      }),
+      "42 passed in 0.1s",
+    );
+    const advElapsed = performance.now() - advStart;
+    assert.ok(advElapsed < 300, `Expected linear-time < 300ms, took ${advElapsed.toFixed(1)}ms`);
+  });
 });

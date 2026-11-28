@@ -10,7 +10,8 @@ export function stripAnsi(text: string): string {
 // eslint-disable-next-line no-control-regex
 const LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
 // eslint-disable-next-line no-control-regex
-const LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
+const LEADING_CLEAR_TO_EOL_RE =
+  /^(?:\x1B\[(?:[0-9;]*m|[01]?G|\?[0-9;]*[hl]))*\x1B\[0?K/;
 
 /**
  * Clean terminal carriage-return progress overwrites and ANSI line-erase sequences
@@ -502,8 +503,25 @@ function isFailureNoiseLine(line: string): boolean {
   return false;
 }
 
+const INVOCATION_BANNER_LINE_PATTERN =
+  /^(?:>\s+\S|\$\s+\S|yarn run v\d|(?:@[\w.-]+\/)?[\w./-]+\s+[A-Za-z][\w.-]*\$\s+\S|•\s+(?:Packages in scope:|Running\s+\S))/i;
+
+const INDIVIDUAL_TEST_LINE_PATTERN =
+  /^(?:test\s+\S+\s+\.\.\.\s+ok\b|---\s+PASS:\s+\S|ok\s+\d+\s+-\s+\S|running\s+\d+\s+tests?$|Ran all test suites\.?$)/i;
+
+const INDIVIDUAL_CHECKMARK_PREFIX_PATTERN =
+  /^[✓✔]\s+(?!built\b|done\b|all\b|\d+\s+(?:tests?|specs?|suites?|files?|modules?|checks?)\b)/i;
+
+const TRAILING_TIMING_PAREN_PATTERN = /^\(\d+(?:\.\d+)?\s*(?:ms|s)\)$/i;
+
+const SOURCE_FILE_PROGRESS_PATTERN =
+  /^\S+\.(?:py|[cm]?[jt]sx?|go|rs|rb|java|kt)\s/;
+
+const NODE_TEST_SUMMARY_LINE_PATTERN =
+  /^(?:ℹ|#)\s+(tests|suites|pass|fail|cancelled|skipped|todo|files|duration_ms)\s+(\S.*)$/;
+
 const SUMMARY_LINE_PATTERN =
-  /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
+  /(?:^(?:\[INFO\]\s*)?(?:ok(?:\s+\S|$)|built\b|build success(?:ful)?\b)|\b(?:passed|passing|succeeded|successful|compiled|done in|finished|built in)\b|\b(?:0|no)\s+(?:warnings?|errors?|failures?|failed)\b|\b\d+\s+(?:warnings?|errors?|tests?|specs?|suites?|pass|fail|skipped)\b|\b(?:warnings?|errors?|tests?|specs?|suites?|pass|fail|skipped)[\s:=]+\d+)/i;
 
 const MONOREPO_PREFIX_PATTERN =
   /^(?:@[\w.-]+\/)?[\w./-]+(?::[A-Za-z][\w.-]*|\s+[A-Za-z][\w.-]*):\s+/;
@@ -1084,6 +1102,159 @@ export interface PreparedCompactCommandOutput {
   rawChars: number;
 }
 
+interface PassSummaryCandidate {
+  text: string;
+  isNodeTestSummary: boolean;
+}
+
+function isInvocationBannerLine(line: string): boolean {
+  if (INVOCATION_BANNER_LINE_PATTERN.test(line)) return true;
+  const monoMatch = MONOREPO_PREFIX_PATTERN.exec(line);
+  if (!monoMatch) return false;
+  const inner = line.slice(monoMatch[0].length).trim();
+  return inner.length > 0 && INVOCATION_BANNER_LINE_PATTERN.test(inner);
+}
+
+function isIndividualTestCaseLine(line: string): boolean {
+  if (INDIVIDUAL_TEST_LINE_PATTERN.test(line)) return true;
+  if (SOURCE_FILE_PROGRESS_PATTERN.test(line)) return true;
+  if (INDIVIDUAL_CHECKMARK_PREFIX_PATTERN.test(line)) {
+    const lastParen = line.lastIndexOf("(");
+    if (
+      lastParen !== -1 &&
+      TRAILING_TIMING_PAREN_PATTERN.test(line.slice(lastParen))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function formatNodeTestSummaryFields(fields: Map<string, string>): string {
+  const parts: string[] = [];
+  for (const key of ["tests", "pass", "fail"] as const) {
+    const val = fields.get(key);
+    if (val !== undefined) parts.push(`${key} ${val}`);
+  }
+  for (const key of ["skipped", "cancelled", "todo"] as const) {
+    const val = fields.get(key);
+    if (val !== undefined && val !== "0") {
+      parts.push(`${key} ${val}`);
+    }
+  }
+  return parts.join(" | ");
+}
+
+function collapseNodeTestSummaryBlocks(lines: string[]): PassSummaryCandidate[] {
+  const out: PassSummaryCandidate[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(line);
+    const prefix = monoMatch ? monoMatch[0] : "";
+    const inner = prefix ? line.slice(prefix.length).trim() : line;
+    const firstMatch = NODE_TEST_SUMMARY_LINE_PATTERN.exec(inner);
+    if (!firstMatch) {
+      out.push({ text: line, isNodeTestSummary: false });
+      i++;
+      continue;
+    }
+
+    const blockStart = i;
+    const fields = new Map<string, string>();
+    while (i < lines.length) {
+      const cur = lines[i]!;
+      const curInner = prefix
+        ? cur.startsWith(prefix)
+          ? cur.slice(prefix.length).trim()
+          : ""
+        : cur;
+      const m = curInner ? NODE_TEST_SUMMARY_LINE_PATTERN.exec(curInner) : null;
+      if (!m) break;
+      const key = m[1]!;
+      if (fields.has(key)) break;
+      fields.set(key, m[2]!.trim());
+      i++;
+    }
+
+    if (fields.has("tests") && (fields.has("pass") || fields.has("fail"))) {
+      const formatted = formatNodeTestSummaryFields(fields);
+      out.push({
+        text: prefix ? `${prefix}${formatted}` : formatted,
+        isNodeTestSummary: true,
+      });
+    } else {
+      for (let j = blockStart; j < i; j++) {
+        out.push({ text: lines[j]!, isNodeTestSummary: false });
+      }
+    }
+  }
+
+  return out;
+}
+
+function cleanPassSummaryLine(line: string): string {
+  let start = 0;
+  while (start < line.length && line.charCodeAt(start) === 61) start++;
+  let end = line.length;
+  while (end > start && line.charCodeAt(end - 1) === 61) end--;
+  if (start < 3) start = 0;
+  if (line.length - end < 3) end = line.length;
+  const trimmed = line.slice(start, end).trim();
+  return trimmed || line;
+}
+
+function summarizePassingOutput(combined: string): {
+  kind: "pass-empty" | "pass-summary";
+  bodyText: string;
+} {
+  const lines = combined
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return { kind: "pass-empty", bodyText: "OK" };
+  }
+
+  const nonBannerLines = lines.filter((l) => !isInvocationBannerLine(l));
+  if (nonBannerLines.length === 0) {
+    const picked = lines.length <= 2 ? lines : [lines[lines.length - 1]!];
+    return { kind: "pass-summary", bodyText: picked.join(" | ") };
+  }
+
+  const candidates = collapseNodeTestSummaryBlocks(nonBannerLines);
+  const summaryEntries = candidates.filter(
+    (c) =>
+      c.isNodeTestSummary ||
+      (!isIndividualTestCaseLine(c.text) && SUMMARY_LINE_PATTERN.test(c.text)),
+  );
+
+  if (summaryEntries.length > 0) {
+    const last = summaryEntries[summaryEntries.length - 1]!;
+    if (last.isNodeTestSummary) {
+      const prev =
+        summaryEntries.length >= 2
+          ? summaryEntries[summaryEntries.length - 2]!
+          : null;
+      const picked =
+        prev && prev.isNodeTestSummary ? [prev.text, last.text] : [last.text];
+      return { kind: "pass-summary", bodyText: picked.join(" | ") };
+    }
+    const picked = summaryEntries
+      .slice(-2)
+      .map((entry) => cleanPassSummaryLine(entry.text));
+    return { kind: "pass-summary", bodyText: picked.join(" | ") };
+  }
+
+  const fallbackLines = candidates.map((c) => c.text);
+  const picked =
+    fallbackLines.length <= 2
+      ? fallbackLines
+      : [fallbackLines[fallbackLines.length - 1]!];
+  return { kind: "pass-summary", bodyText: picked.join(" | ") };
+}
+
 export function prepareCompactCommandOutput(
   params: Omit<FormatCompactCommandOutputParams, "maxChars">,
 ): PreparedCompactCommandOutput {
@@ -1124,20 +1295,10 @@ export function prepareCompactCommandOutput(
         rawChars: 0,
       };
     }
-    const lines = combined
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-    const summaryLines = lines.filter((l) => SUMMARY_LINE_PATTERN.test(l));
-    const picked =
-      summaryLines.length > 0
-        ? summaryLines.slice(-2)
-        : lines.length <= 2
-          ? lines
-          : [lines[lines.length - 1]!];
+    const summarized = summarizePassingOutput(combined);
     return {
-      kind: "pass-summary",
-      bodyText: picked.join(" | "),
+      kind: summarized.kind,
+      bodyText: summarized.bodyText,
       collapsedLines: 0,
       rawLines,
       rawChars,
@@ -1214,11 +1375,23 @@ export function renderPreparedCompactCommandOutput(
 
   if (prepared.kind === "pass-summary") {
     const cap = Math.min(maxChars, 320);
-    const text = truncateWithNotice(prepared.bodyText, cap);
+    if (prepared.bodyText.length <= cap) {
+      return {
+        text: prepared.bodyText,
+        collapsedLines: 0,
+        truncated: false,
+        rawLines: prepared.rawLines,
+        rawChars: prepared.rawChars,
+      };
+    }
+    const text =
+      cap <= 3
+        ? sliceSafeChars(prepared.bodyText, cap)
+        : `${sliceSafeChars(prepared.bodyText, cap - 3)}...`;
     return {
       text,
       collapsedLines: 0,
-      truncated: text !== prepared.bodyText,
+      truncated: true,
       rawLines: prepared.rawLines,
       rawChars: prepared.rawChars,
     };
