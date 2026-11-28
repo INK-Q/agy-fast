@@ -725,6 +725,41 @@ describe("apply_edits", () => {
     assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
+  it("reports incomplete rollback and identifies files that could not be restored", async () => {
+    const dir = path.join(tmpDir, "phase2-rollback-fail");
+    await fs.mkdir(dir, { recursive: true });
+    const firstFile = path.join(await fs.realpath(dir), "first.txt");
+    await fs.writeFile(firstFile, "first orig\n");
+    await fs.writeFile(path.join(dir, "second.txt"), "second orig\n");
+    const origWriteFile = fs.writeFile;
+    fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
+      const p = String(args[0]);
+      if (path.basename(p).startsWith(".agy-tmp-") && String(args[1]).includes("second mod")) {
+        throw makeErrnoError("ENOSPC", "write failed");
+      }
+      if (p === firstFile) {
+        throw makeErrnoError("EIO", "restore failed");
+      }
+      return origWriteFile(...args);
+    }) as typeof fs.writeFile;
+    try {
+      const res = await runApplyEdits({
+        cwd: dir,
+        edits: [
+          { path: "first.txt", hunks: [{ target: "first orig", replacement: "first mod" }] },
+          { path: "second.txt", hunks: [{ target: "second orig", replacement: "second mod" }] },
+        ],
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.text, /rollback incomplete/);
+      assert.match(res.text, /first\.txt: restore failed/);
+      assert.doesNotMatch(res.text, /changes rolled back/);
+    } finally {
+      fs.writeFile = origWriteFile;
+    }
+    assert.equal(await fs.readFile(firstFile, "utf8"), "first mod\n");
+  });
+
   it("fails fast on non-ENOENT errors in create without overwriting or deleting existing files", async () => {
     const subDir = path.join(tmpDir, "create-non-enoent");
     await fs.mkdir(subDir, { recursive: true });

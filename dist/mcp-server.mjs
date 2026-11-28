@@ -2798,6 +2798,7 @@ async function commitPlannedWrites(plans) {
       }
     }
   } catch (err) {
+    const rollbackFailures = [];
     for (let i = written.length - 1; i >= 0; i--) {
       const item = written[i];
       const target = item.writeTargetPath;
@@ -2812,9 +2813,12 @@ async function commitPlannedWrites(plans) {
             await fs2.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs2.unlink(target);
+          await fs2.unlink(target).catch((unlinkErr) => {
+            if (unlinkErr.code !== "ENOENT") throw unlinkErr;
+          });
         }
-      } catch {
+      } catch (rollbackErr) {
+        rollbackFailures.push(`${item.relPath}: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
       }
     }
     for (let i = createdDirs.length - 1; i >= 0; i--) {
@@ -2823,7 +2827,11 @@ async function commitPlannedWrites(plans) {
       } catch {
       }
     }
-    throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (rollbackFailures.length > 0) {
+      throw new Error(`Write failed (rollback incomplete; inspect affected files before retrying): ${message}\n${rollbackFailures.join("\n")}`);
+    }
+    throw new Error(`Write failed (changes rolled back): ${message}`);
   }
 }
 function corruptedEditsError(items) {
@@ -3820,7 +3828,7 @@ Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
       await commitPlannedWrites(plans);
     } catch (err) {
       return {
-        text: `Write failed (changes rolled back): ${err instanceof Error ? err.message : String(err)}`,
+        text: err instanceof Error ? err.message : String(err),
         isError: true
       };
     }

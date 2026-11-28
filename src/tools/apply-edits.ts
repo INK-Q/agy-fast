@@ -793,6 +793,7 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
       }
     }
   } catch (err) {
+    const rollbackFailures: string[] = [];
     // Rollback all previously written files
     for (let i = written.length - 1; i >= 0; i--) {
       const item = written[i]!;
@@ -807,10 +808,12 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
             await fs.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs.unlink(target);
+          await fs.unlink(target).catch((unlinkErr: NodeJS.ErrnoException) => {
+            if (unlinkErr.code !== "ENOENT") throw unlinkErr;
+          });
         }
-      } catch {
-        // Best-effort rollback
+      } catch (rollbackErr) {
+        rollbackFailures.push(`${item.relPath}: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
       }
     }
     // Best-effort remove newly created parent directories deepest-first (rmdir never removes non-empty dirs)
@@ -821,7 +824,11 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
         // Ignore ENOENT / ENOTEMPTY / permission errors
       }
     }
-    throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (rollbackFailures.length > 0) {
+      throw new Error(`Write failed (rollback incomplete; inspect affected files before retrying): ${message}\n${rollbackFailures.join("\n")}`);
+    }
+    throw new Error(`Write failed (changes rolled back): ${message}`);
   }
 }
 
@@ -2053,7 +2060,7 @@ export async function runApplyEdits(
       await commitPlannedWrites(plans);
     } catch (err) {
       return {
-        text: `Write failed (changes rolled back): ${err instanceof Error ? err.message : String(err)}`,
+        text: err instanceof Error ? err.message : String(err),
         isError: true,
       };
     }
