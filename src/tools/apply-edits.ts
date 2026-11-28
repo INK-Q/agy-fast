@@ -725,7 +725,46 @@ async function findMissingAncestorDirs(dir: string): Promise<string[]> {
   return missing;
 }
 
+let pendingEditCommit = Promise.resolve();
+
 async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
+  const previous = pendingEditCommit;
+  let release!: () => void;
+  pendingEditCommit = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    // Validate snapshots before writing any file. A queued edit may have been
+    // planned against content that an earlier request has since changed.
+    for (const plan of plans) {
+      if (plan.isNoOp) continue;
+      const target = plan.writeTargetPath;
+      const current = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return null;
+        throw err;
+      });
+      let matches = false;
+      if (plan.originalSymlinkTarget !== null && plan.originalSymlinkTarget !== undefined) {
+        matches = current?.isSymbolicLink() === true &&
+          await fs.readlink(target) === plan.originalSymlinkTarget;
+      } else if (!plan.existed) {
+        matches = current === null;
+      } else if (current?.isFile() && plan.originalBuffer !== null) {
+        matches = current.size === plan.originalBuffer.length &&
+          (await fs.readFile(target)).equals(plan.originalBuffer);
+      }
+      if (!matches) {
+        throw new Error(`Edit conflict: ${plan.relPath} changed after planning; re-read and retry`);
+      }
+    }
+    await writePlannedFiles(plans);
+  } finally {
+    release();
+  }
+}
+
+async function writePlannedFiles(plans: PlannedWrite[]): Promise<void> {
   const written: PlannedWrite[] = [];
   const createdDirs: string[] = [];
   const createdDirSet = new Set<string>();

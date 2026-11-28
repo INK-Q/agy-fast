@@ -2738,7 +2738,40 @@ async function findMissingAncestorDirs(dir) {
   }
   return missing;
 }
+var pendingEditCommit = Promise.resolve();
 async function commitPlannedWrites(plans) {
+  const previous = pendingEditCommit;
+  let release;
+  pendingEditCommit = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    for (const plan of plans) {
+      if (plan.isNoOp) continue;
+      const target = plan.writeTargetPath;
+      const current = await fs2.lstat(target).catch((err) => {
+        if (err.code === "ENOENT") return null;
+        throw err;
+      });
+      let matches = false;
+      if (plan.originalSymlinkTarget !== null && plan.originalSymlinkTarget !== void 0) {
+        matches = current?.isSymbolicLink() === true && await fs2.readlink(target) === plan.originalSymlinkTarget;
+      } else if (!plan.existed) {
+        matches = current === null;
+      } else if (current?.isFile() && plan.originalBuffer !== null) {
+        matches = current.size === plan.originalBuffer.length && (await fs2.readFile(target)).equals(plan.originalBuffer);
+      }
+      if (!matches) {
+        throw new Error(`Edit conflict: ${plan.relPath} changed after planning; re-read and retry`);
+      }
+    }
+    await writePlannedFiles(plans);
+  } finally {
+    release();
+  }
+}
+async function writePlannedFiles(plans) {
   const written = [];
   const createdDirs = [];
   const createdDirSet = /* @__PURE__ */ new Set();

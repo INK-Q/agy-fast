@@ -725,6 +725,39 @@ describe("apply_edits", () => {
     assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
+  it("rejects a stale concurrent edit instead of overwriting a successful edit", async () => {
+    const dir = await fs.mkdtemp(path.join(tmpDir, "concurrent-"));
+    const target = path.join(await fs.realpath(dir), "shared.txt");
+    await fs.writeFile(target, "alpha\nbeta\n");
+    const originalRead = fs.readFile;
+    let snapshotReads = 0;
+    let unblock!: () => void;
+    const bothRead = new Promise<void>((resolve) => { unblock = resolve; });
+    fs.readFile = (async (...args: Parameters<typeof originalRead>) => {
+      const content = await originalRead(...args);
+      if (String(args[0]) === target && snapshotReads < 2) {
+        snapshotReads++;
+        if (snapshotReads === 2) unblock();
+        await bothRead;
+      }
+      return content;
+    }) as typeof fs.readFile;
+    const alpha = { cwd: dir, edits: [{ path: "shared.txt", hunks: [{ target: "alpha", replacement: "ALPHA" }] }] };
+    const beta = { cwd: dir, edits: [{ path: "shared.txt", hunks: [{ target: "beta", replacement: "BETA" }] }] };
+    let results;
+    try {
+      results = await Promise.all([runApplyEdits(alpha), runApplyEdits(beta)]);
+    } finally {
+      fs.readFile = originalRead;
+    }
+    assert.equal(results.filter((result) => !result.isError).length, 1);
+    const failed = results.findIndex((result) => result.isError);
+    assert.match(results[failed]!.text, /Edit conflict/);
+    const retry = await runApplyEdits(failed === 0 ? alpha : beta);
+    assert.equal(retry.isError, false);
+    assert.equal(await fs.readFile(target, "utf8"), "ALPHA\nBETA\n");
+  });
+
   it("fails fast on non-ENOENT errors in create without overwriting or deleting existing files", async () => {
     const subDir = path.join(tmpDir, "create-non-enoent");
     await fs.mkdir(subDir, { recursive: true });
