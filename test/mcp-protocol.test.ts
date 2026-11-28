@@ -385,6 +385,8 @@ describe("MCP Stdio Server end-to-end", () => {
         );
       }
       const applyTool = tools.find((t) => t.name === "apply_edits")!;
+      assert.match(applyTool.description, /One edits entry per file/);
+      assert.match(applyTool.description, /Omit line bounds for a unique target/);
       assert.deepEqual(
         (applyTool.inputSchema as { properties?: Record<string, unknown> }).properties?.diff,
         { type: "boolean" },

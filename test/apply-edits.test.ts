@@ -83,8 +83,72 @@ describe("apply_edits", () => {
 
     assert.equal(res.isError, true);
     assert.match(res.text, /0 files modified/);
+    assert.match(res.text, /Retry the full corrected batch/);
+    assert.match(res.text, /Re-read the file and copy the exact current target/);
     assert.equal(await fs.readFile(goodFile, "utf8"), "original good\n");
     assert.equal(await fs.readFile(badFile, "utf8"), "original bad\n");
+  });
+
+  it("identifies misgrouped hunks by path and real file length, then accepts the corrected batch", async () => {
+    const short = path.join(tmpDir, "short.txt");
+    const other = path.join(tmpDir, "other.txt");
+    await fs.writeFile(short, "TODO\n", "utf8");
+    await fs.writeFile(other, "other header\nTODO\nkeep\n", "utf8");
+
+    const res = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      edits: [{
+        path: "short.txt",
+        hunks: [
+          { target: "TODO", replacement: "done in other", startLine: 1255, endLine: 1259 },
+          { target: "other header", replacement: "updated header", startLine: 2 },
+          { target: "TODO\n", replacement: "done in short\n" },
+        ],
+      }],
+    });
+
+    assert.equal(res.isError, true);
+    assert.match(res.text, /short\.txt hunk #1: startLine 1255 exceeds file length \(1 line\)/);
+    assert.match(res.text, /short\.txt hunk #2: startLine 2 exceeds file length \(1 line\)/);
+    assert.match(res.text, /check 'path' and refresh the line bounds/i);
+    assert.match(res.text, /Retry the full corrected batch/);
+    assert.doesNotMatch(res.text, /Nearby lines/);
+    assert.equal(await fs.readFile(short, "utf8"), "TODO\n");
+
+    const retry = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      edits: [
+        {
+          path: "other.txt",
+          hunks: [
+            { target: "TODO", replacement: "done in other" },
+            { target: "other header", replacement: "updated header" },
+          ],
+        },
+        { path: "short.txt", hunks: [{ target: "TODO\n", replacement: "done in short\n" }] },
+      ],
+    });
+    assert.equal(retry.isError, false);
+    assert.equal(await fs.readFile(short, "utf8"), "done in short\n");
+    assert.equal(await fs.readFile(other, "utf8"), "updated header\ndone in other\nkeep\n");
+  });
+
+  it("reports a reversed line range even when the start is past the end of the file", async () => {
+    const file = path.join(tmpDir, "reversed.txt");
+    await fs.writeFile(file, "alpha\n", "utf8");
+
+    const res = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [{
+        path: "reversed.txt",
+        hunks: [{ target: "alpha", replacement: "beta", startLine: 20, endLine: 1 }],
+      }],
+    });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /reversed\.txt hunk #1: Invalid line range: startLine \(20\) > endLine \(1\)/);
+    assert.equal(await fs.readFile(file, "utf8"), "alpha\n");
   });
 
   it("uses startLine/endLine to disambiguate duplicate text and rejects ambiguous matches", async () => {
@@ -400,6 +464,7 @@ describe("apply_edits", () => {
         {
           path: "be-miss.java",
           hunks: [
+            { target: "class ShopIncome", replacement: "class ShopIncomeUpdated" },
             {
               target: '    return switch (source) {\n      case "ERP" -> "WRONG";\n    };',
               replacement: "    return source;",
@@ -410,12 +475,30 @@ describe("apply_edits", () => {
     });
     assert.equal(partial.isError, true);
     assert.match(partial.text, /Partial edit applied \(1\/2 file\(s\) written; 1 file\(s\) failed/);
+    assert.match(partial.text, /retry all intended edits for these failed files/);
     assert.match(partial.text, /be-ok\.java: updated/);
     assert.match(partial.text, /Closest match near line 3/);
     assert.match(partial.text, /Verify skipped/);
     assert.doesNotMatch(partial.text, /SHOULD_NOT_RUN/);
     assert.equal(await fs.readFile(okFile, "utf8"), "public class Ok {\n  int value = 2;\n}\n");
     assert.match(await fs.readFile(missFile, "utf8"), /case "ERP" -> "实付"/);
+    assert.doesNotMatch(await fs.readFile(missFile, "utf8"), /class ShopIncomeUpdated/);
+
+    const retry = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      edits: [{
+        path: "be-miss.java",
+        hunks: [
+          { target: "class ShopIncome", replacement: "class ShopIncomeUpdated" },
+          { target: 'case "ERP" -> "实付"', replacement: 'case "ERP" -> "已支付"' },
+        ],
+      }],
+    });
+    assert.equal(retry.isError, false);
+    const retriedContent = await fs.readFile(missFile, "utf8");
+    assert.match(retriedContent, /class ShopIncomeUpdated/);
+    assert.match(retriedContent, /case "ERP" -> "已支付"/);
   });
 
   it("detects line-drifted exact matches, bounds wide-range failure snippets, and filters Spring/Pino verify noise", async () => {
@@ -448,6 +531,7 @@ describe("apply_edits", () => {
     });
     assert.equal(driftRes.isError, true);
     assert.match(driftRes.text, /Exact match found outside range at L86-L87/);
+    assert.match(driftRes.text, /use startLine: 86, endLine: 87 or omit both bounds/i);
 
     // 2. Wide range (>26 lines) mismatch uses closest-region snippet instead of dumping 85 lines
     const wideRes = await runApplyEdits({
@@ -517,6 +601,7 @@ describe("apply_edits", () => {
     assert.match(boolRes.text, /edits\[0\]: received boolean \(false\)/);
     assert.match(boolRes.text, /edits\[1\]: received boolean \(true\)/);
     assert.match(boolRes.text, /Do NOT retry the same apply_edits payload/);
+    assert.match(boolRes.text, /Use apply_edits again for the next batch/);
     assert.match(boolRes.text, /edit_file/);
 
     const nullRes = await runApplyEdits({
@@ -1151,13 +1236,13 @@ describe("apply_edits", () => {
       `Expected <= 8800 bytes, got ${Buffer.byteLength(res.text, "utf8")}`,
     );
     assert.match(res.text, /Partial edit applied \(48\/49 file\(s\) written; 1 file\(s\) failed/);
-    assert.match(res.text, /Failed \(retry ONLY these failed file\(s\); do NOT re-send applied files\):/);
+    assert.match(res.text, /Failed \(retry all intended edits for these failed files; skip applied files\):/);
     assert.match(res.text, /Exact match found outside range at L31-L34/);
     assert.match(res.text, /\.\.\. \(\+\d+ more applied file\(s\) omitted; total 48 written\)/);
     assert.match(res.text, /Verify skipped/);
     assert.doesNotMatch(res.text, /SHOULD_NOT_RUN/);
 
-    const failedIdx = res.text.indexOf("Failed (retry ONLY these failed file(s)");
+    const failedIdx = res.text.indexOf("Failed (retry all intended edits");
     const appliedIdx = res.text.indexOf("\nApplied:");
     assert.ok(failedIdx > 0, "Expected Failed section");
     assert.ok(appliedIdx > failedIdx, `Expected Failed (${failedIdx}) before Applied (${appliedIdx})`);
